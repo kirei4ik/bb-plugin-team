@@ -298,7 +298,11 @@ roles:
 `;
 
 function makeHost(
-  opts: { configYaml?: string | null; settings?: Record<string, unknown> } = {},
+  opts: {
+    configYaml?: string | null;
+    settings?: Record<string, unknown>;
+    spawnFailures?: number;
+  } = {},
 ) {
   let configYaml: string | null =
     opts.configYaml === undefined ? FAKE_CONFIG_YAML : opts.configYaml;
@@ -425,6 +429,9 @@ function makeHost(
         }),
         spawn: async () => {
           threadNo += 1;
+          if (threadNo <= (opts.spawnFailures ?? 0)) {
+            throw new Error("HTTP 500: Internal server error");
+          }
           return makeThreadResponse({ id: `thr_gen${threadNo}`, providerId: "pi" });
         },
         send: async () => ({ ok: true, delivery: "sent" }),
@@ -601,6 +608,25 @@ describe("bb team CLI (поведение)", () => {
       cwd: "/ws/demo",
     });
     expect((JSON.parse(json.stdout) as { gitignored: boolean }).gitignored).toBe(true);
+  });
+
+  it("spawn: одиночный сбой спавна автоматически повторяется", async () => {
+    const { bb, harness } = makeHost({ spawnFailures: 1 });
+    await plugin(bb);
+    const result = await harness.behavior.runCli(["create", "--project", "demo"]);
+    expect(result.exitCode).toBe(0);
+    // первый вызов lead упал, повтор создал, tester — сразу: 3 вызова
+    expect(harness.inspection.sdk.callsTo("threads.spawn")).toHaveLength(3);
+    expect(result.stdout).toContain("[created] lead");
+    expect(result.stdout).toContain("[created] tester");
+  });
+
+  it("spawn: два сбоя подряд — понятная ошибка", async () => {
+    const { bb, harness } = makeHost({ spawnFailures: 2 });
+    await plugin(bb);
+    const result = await harness.behavior.runCli(["create", "--project", "demo"]);
+    expect(result.exitCode).not.toBe(0);
+    expect(result.stderr).toContain("Re-run bb team create");
   });
 
   it("status --json: машина-читаемый ответ", async () => {

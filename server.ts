@@ -107,6 +107,7 @@ interface Strings {
   providerDisabled: (ids: string, avail: string, first: string) => { message: string; hint: string };
   providerUnknown: (ids: string, avail: string) => { message: string; hint: string };
   threadNotFound: (role: string, id: string) => string;
+  spawnFailed: (role: string, error: string) => { message: string; hint: string };
   threadWrongProject: (role: string, id: string) => string;
   threadArchived: (role: string, id: string) => { message: string; hint: string };
   leadStub: string;
@@ -205,6 +206,10 @@ const STRINGS: Record<Language, Strings> = {
       hint: `Available: ${avail}. Model list: bb provider models`,
     }),
     threadNotFound: (role, id) => `role "${role}": thread ${id} not found`,
+    spawnFailed: (role: string, error: string) => ({
+      message: `role "${role}": thread spawn failed — ${error}`,
+      hint: "Re-run bb team create: it skips finished roles and completes the rest.",
+    }),
     threadWrongProject: (role, id) =>
       `role "${role}": thread ${id} belongs to another project`,
     threadArchived: (role, id) => ({
@@ -323,6 +328,10 @@ const STRINGS: Record<Language, Strings> = {
       hint: `Доступны: ${avail}. Список моделей: bb provider models`,
     }),
     threadNotFound: (role, id) => `роль "${role}": тред ${id} не найден`,
+    spawnFailed: (role: string, error: string) => ({
+      message: `роль "${role}": не удалось создать тред — ${error}`,
+      hint: "Повторите bb team create: готовые роли пропускаются, остальное дозасоздастся.",
+    }),
     threadWrongProject: (role, id) =>
       `роль "${role}": тред ${id} принадлежит другому проекту`,
     threadArchived: (role, id) => ({
@@ -1370,7 +1379,7 @@ export default async function plugin(bb: BbPluginApi) {
                 { workspace, leadThreadId, roleThreads },
                 t,
               );
-              const thread = await bb.sdk.threads.spawn({
+              const spawnArgs = {
                 projectId: workspace.projectId,
                 title: entry.role.title ?? entry.role.name,
                 providerId: entry.role.provider,
@@ -1387,8 +1396,29 @@ export default async function plugin(bb: BbPluginApi) {
                   : undefined,
                 pluginMetadata: { teamRole: entry.role.name },
                 prompt,
-              });
-              return { threadId: thread.id, providerId: thread.providerId };
+              };
+              // A brand-new environment can fail its very first spawn while
+              // provisioning (observed as an HTTP 500); one retry after a
+              // short delay clears it. A second failure surfaces to the user
+              // with an idempotent re-run hint.
+              for (let attempt = 1; ; attempt += 1) {
+                try {
+                  const thread = await bb.sdk.threads.spawn(spawnArgs);
+                  return { threadId: thread.id, providerId: thread.providerId };
+                } catch (error) {
+                  if (attempt >= 2) {
+                    const err = t.spawnFailed(
+                      entry.role.name,
+                      (error as Error).message,
+                    );
+                    throw new PluginCliError(err.message, {
+                      code: "spawn_failed",
+                      hint: err.hint,
+                    });
+                  }
+                  await new Promise((resolve) => setTimeout(resolve, 1500));
+                }
+              }
             };
 
             const adoptRole = async (
