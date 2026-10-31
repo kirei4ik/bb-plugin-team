@@ -37,6 +37,7 @@ interface ReportLabels {
   ago: (age: string) => string;
   taskStatus: Record<string, string>;
   helpers: (count: number) => string;
+  threadStatus: Record<string, string>;
 }
 
 const LABELS: Record<Language, ReportLabels> = {
@@ -66,6 +67,14 @@ const LABELS: Record<Language, ReportLabels> = {
     notInConfig: "not in config",
     ago: (age) => `${age} ago`,
     helpers: (count) => `+${count} helper${count === 1 ? "" : "s"}`,
+    threadStatus: {
+      active: "working",
+      starting: "starting",
+      pending: "queued",
+      idle: "idle",
+      error: "error",
+      stopping: "stopping",
+    },
     taskStatus: {
       todo: "todo",
       "in-progress": "in progress",
@@ -100,6 +109,14 @@ const LABELS: Record<Language, ReportLabels> = {
     notInConfig: "нет в конфиге",
     ago: (age) => `${age} назад`,
     helpers: (count) => `+${count} помощн.`,
+    threadStatus: {
+      active: "работает",
+      starting: "запускается",
+      pending: "в очереди",
+      idle: "простаивает",
+      error: "ошибка",
+      stopping: "останавливается",
+    },
     taskStatus: {
       todo: "к выполнению",
       "in-progress": "в работе",

@@ -1,0 +1,35 @@
+# Example team "dev": copy to <project>/.bb/teams/dev.yaml together with the dev/ folder,
+# then: bb team doctor --team dev && bb team create --team dev
+version: 1
+title: Development team
+vars:
+  # A separate environment (for example a VM) for integration checks: bb environment list
+  testEnv: checkout
+  plan: docs/plan.md
+defaults:
+  environment: checkout
+  parentNotifications: stuck
+roles:
+  - name: lead
+    kind: lead
+    title: Development lead
+    lead: true
+    provider: codex
+    reasoningLevel: high
+    promptFile: .bb/teams/dev/lead.md
+  - name: developer
+    kind: developer
+    title: Developer
+    provider: codex
+  - name: junior
+    kind: junior
+    title: Junior developer
+    provider: pi
+    model: qwen3-coder:30b
+    notifyOn: [idle]
+  - name: tester
+    kind: tester
+    title: Tester
+    provider: codex
+    environment: "{{vars.testEnv}}"
+    promptFile: .bb/teams/dev/tester.md

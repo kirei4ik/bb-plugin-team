@@ -738,10 +738,16 @@ export function teamSectionName(t: Strings, team: string): string {
   return team === DEFAULT_TEAM ? t.sectionName : `${t.sectionName} · ${team}`;
 }
 
-export async function ensureSection(bb: BbPluginApi, name: string): Promise<string | null> {
+/** Find a section by any of its names (both languages), else create the first one. */
+export async function ensureSection(
+  bb: BbPluginApi,
+  name: string,
+  aliases: readonly string[] = [],
+): Promise<string | null> {
   try {
     const sections = await bb.sdk.threadSections.list();
-    const found = sections.find((s) => s.name === name);
+    const found =
+      sections.find((s) => s.name === name) ?? sections.find((s) => aliases.includes(s.name));
     if (found) return found.id;
     const created = await bb.sdk.threadSections.create({ name });
     return created.id;

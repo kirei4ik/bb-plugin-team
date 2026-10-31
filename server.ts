@@ -253,6 +253,45 @@ export const rpcContract = defineRpcContract({
     input: z.object({ projectId: projectIdSchema, team: teamSchema.optional() }).strict(),
     output: z.object({ snapshot: snapshotSchema, language: z.enum(["en", "ru"]) }),
   },
+  /** All projects, grouped by the panel: with teams / can create / blocked (+ reason). */
+  overview: {
+    input: z.null(),
+    output: z.object({
+      projects: z.array(
+        z.object({
+          id: z.string(),
+          name: z.string(),
+          path: z.string().nullable(),
+          teams: z.array(z.string()),
+          threads: z.number(),
+          running: z.number(),
+          errors: z.number(),
+          state: z.enum(["teams", "ready", "blocked"]),
+          reason: z.string().nullable(),
+        }),
+      ),
+      language: z.enum(["en", "ru"]),
+    }),
+  },
+  /** Every team of a project in one call: the panel's tree. */
+  tree: {
+    input: z.object({ projectId: projectIdSchema }).strict(),
+    output: z.object({
+      projectName: z.string(),
+      snapshots: z.array(snapshotSchema),
+      language: z.enum(["en", "ru"]),
+    }),
+  },
+  /** Spawn the team's missing roles (bb team create). */
+  teamSpawn: {
+    input: z.object({ projectId: projectIdSchema, team: teamSchema }).strict(),
+    output: z.object({ spawned: z.number() }),
+  },
+  /** Stop a role's running threads (bb team stop <role>). */
+  stop: {
+    input: z.object({ projectId: projectIdSchema, team: teamSchema, role: z.string().min(1).max(100) }).strict(),
+    output: z.object({ stopped: z.number() }),
+  },
   providers: {
     input: z.null(),
     output: z.object({ enabled: z.array(z.string()), disabled: z.array(z.string()) }),
@@ -814,6 +853,22 @@ export default async function plugin(bb: BbPluginApi) {
     }
   };
 
+  /** Executors move packages to review; only the lead (or a human) marks them done. */
+  const guardAccept = async (scope: Scope, status: TaskStatus | undefined, callerThreadId: string | undefined, t: Strings, m: Messages) => {
+    if (status !== "done" || !callerThreadId) return;
+    let mark: ReturnType<typeof readTeamMark> = null;
+    try {
+      mark = readTeamMark((await bb.sdk.threads.getPluginMetadata({ threadId: callerThreadId })) as Record<string, unknown>);
+    } catch {
+      return;
+    }
+    if (!mark || mark.team !== scope.team) return;
+    const { lead } = await teamContext(scope, t);
+    if (mark.role === lead) return;
+    const err = m.onlyLeadAccepts(mark.role);
+    throw new PluginCliError(err.message, { code: "only_lead_accepts", hint: err.hint });
+  };
+
   const taskOutput = (
     result: { task: TeamTask; previous: TeamTask; busy: TeamTask[] },
     json: boolean,
@@ -926,7 +981,7 @@ export default async function plugin(bb: BbPluginApi) {
     }
 
     const sectionId = settingsValues.teamSection
-      ? await ensureSection(bb, teamSectionName(t, scope.team))
+      ? await ensureSection(bb, teamSectionName(t, scope.team), [strings("en"), strings("ru")].map((x) => teamSectionName(x, scope.team)))
       : null;
     const roleThreads = new Map<string, string>();
     for (const [role, ids] of existing) if (ids[0]) roleThreads.set(role, ids[0]);
@@ -1015,6 +1070,18 @@ export default async function plugin(bb: BbPluginApi) {
       if (entry.role.name === lead.name || !needsWork(entry)) continue;
       await upsert(entry, leadThreadId ?? undefined);
     }
+    // Re-link existing executor threads that lost their lead (bb team doctor warns about them).
+    let relinked = 0;
+    if (leadThreadId && !options.only) {
+      for (const [role, list] of existingRows) {
+        if (role === lead.name) continue;
+        for (const row of list) {
+          if (row.parentThreadId === leadThreadId) continue;
+          await bb.sdk.threads.update({ threadId: row.threadId, parentThreadId: leadThreadId });
+          relinked += 1;
+        }
+      }
+    }
 
     const children = spawned.filter((item) => item.role !== lead.name);
     let rosterQueued = false;
@@ -1040,7 +1107,7 @@ export default async function plugin(bb: BbPluginApi) {
       rosterQueued = true;
     }
     publishChange(scope.projectId);
-    return { source, leadThreadId, sectionId, spawned, existing, rosterQueued };
+    return { source, leadThreadId, sectionId, spawned, existing, rosterQueued, relinked };
   };
 
   /** Add a role to a team config (append keeps comments), then spawn or adopt it. */
@@ -1120,7 +1187,13 @@ export default async function plugin(bb: BbPluginApi) {
       throw new PluginCliError(err.message, { code: "team_exists", hint: err.hint });
     }
     await validateProviders(bb, template.roles.filter((r) => r.enabled !== false), t);
-    const files = teamFilesFromTemplate(lang, template, scope.team);
+    // Without a checkout environment the roles start in the project default one.
+    const checkouts = await bb.sdk.environments
+      .list({ projectId: scope.projectId, environmentProviderId: "project-checkout" })
+      .catch(() => []);
+    const files = teamFilesFromTemplate(lang, template, scope.team, {
+      environment: checkouts.length > 0 ? "checkout" : "default",
+    });
     const written = await writeTeamFiles(scope, files, options.force, t);
     await setVersioned(scope, false, options.versioned);
     const result = options.spawn ? await spawnTeam(scope, lang, t, m) : null;
@@ -1405,6 +1478,76 @@ export default async function plugin(bb: BbPluginApi) {
       const teams = await allTeams(workspace);
       const chosen = team ?? teams[0] ?? DEFAULT_TEAM;
       return { snapshot: await buildSnapshot({ ...workspace, team: chosen }, t), language: lang };
+    },
+    async overview() {
+      const { lang, m } = await loadLang();
+      const projects = await bb.sdk.projects.list({ includePersonal: true });
+      let hosts: Awaited<ReturnType<typeof bb.sdk.hosts.list>> = [];
+      try {
+        hosts = await bb.sdk.hosts.list();
+      } catch {
+        // host states unknown — do not block projects on them
+      }
+      const hostById = new Map(hosts.map((host) => [host.id, host]));
+      const rows = await Promise.all(
+        projects.map(async (project) => {
+          const base = { id: project.id, name: project.name, teams: [] as string[], threads: 0, running: 0, errors: 0 };
+          const source = project.sources.find((s) => s.isDefault) ?? project.sources[0];
+          if (!source) return { ...base, path: null, state: "blocked" as const, reason: m.overviewNoSource };
+          const path = source.path.replace(/\/+$/, "");
+          const host = hostById.get(source.hostId);
+          if (host && host.status !== "connected") {
+            return { ...base, path, state: "blocked" as const, reason: m.overviewHostOffline(host.name) };
+          }
+          const workspace: Workspace = { projectId: project.id, projectName: project.name, path, hostId: source.hostId };
+          try {
+            await bb.sdk.files.list({ hostId: source.hostId, path, limit: 1 });
+          } catch (error) {
+            return { ...base, path, state: "blocked" as const, reason: m.overviewUnreadable((error as Error).message.slice(0, 160)) };
+          }
+          const scan = await scanTeamThreads(bb, project.id).catch(() => ({ rows: [], free: [] }) as ThreadScan);
+          const teams = await allTeams(workspace, scan).catch(() => [] as string[]);
+          const teamRows = scan.rows.filter((row) => !row.helper);
+          return {
+            ...base,
+            path,
+            teams,
+            threads: teamRows.length,
+            running: teamRows.filter((row) => RUNNING.includes(row.status)).length,
+            errors: teamRows.filter((row) => row.status === "error").length,
+            state: teams.length > 0 ? ("teams" as const) : ("ready" as const),
+            reason: null,
+          };
+        }),
+      );
+      return { projects: rows, language: lang };
+    },
+    async tree({ projectId }) {
+      const { lang, t } = await loadLang();
+      const workspace = await resolveWorkspace(bb, projectId, undefined, t, {});
+      const snapshots: TeamSnapshot[] = [];
+      for (const team of await allTeams(workspace)) {
+        snapshots.push(await buildSnapshot({ ...workspace, team }, t));
+      }
+      return { projectName: workspace.projectName, snapshots, language: lang };
+    },
+    async teamSpawn({ projectId, team }) {
+      const { lang, t, m } = await loadLang();
+      const scope = await scopeFor(projectId, team, t);
+      return { spawned: (await spawnTeam(scope, lang, t, m)).spawned.length };
+    },
+    async stop({ projectId, team, role }) {
+      const { t } = await loadLang();
+      const scope = await scopeFor(projectId, team, t);
+      const { rows, helpers } = await teamContext(scope, t);
+      let stopped = 0;
+      for (const row of [...(rows.get(role) ?? []), ...(helpers.get(role) ?? [])]) {
+        if (!RUNNING.includes(row.status)) continue;
+        await bb.sdk.threads.stop({ threadId: row.threadId });
+        stopped += 1;
+      }
+      if (stopped > 0) publishChange(projectId);
+      return { stopped };
     },
     async providers() {
       return providerState(bb);
@@ -1708,6 +1851,7 @@ export default async function plugin(bb: BbPluginApi) {
                   spawned: result.spawned,
                   existing: Object.fromEntries(result.existing),
                   rosterQueued: result.rosterQueued,
+                  relinked: result.relinked,
                 }),
               };
             }
@@ -1721,6 +1865,7 @@ export default async function plugin(bb: BbPluginApi) {
               const remaining = ids.filter((id) => !reported.has(id));
               if (remaining.length > 0) out.push(t.alreadyThere(role, remaining.join(", ")));
             }
+            if (result.relinked > 0) out.push(m.relinked(result.relinked));
             if (result.rosterQueued && result.leadThreadId) out.push("", t.rosterSent(result.leadThreadId));
             out.push("", "bb team status");
             return { exitCode: 0, stdout: out.join("\n") };
@@ -2023,6 +2168,7 @@ export default async function plugin(bb: BbPluginApi) {
             } catch (error) {
               return asCliError(error);
             }
+            await guardAccept(scope, status, ctx.threadId, t, m);
             const result = await updatePackage(scope, parseTaskId(input.positionals.id!), {
               status,
               title: input.options.title,
@@ -2039,6 +2185,7 @@ export default async function plugin(bb: BbPluginApi) {
           async run(input, ctx) {
             const { t, m } = await loadLang();
             const scope = await resolveScope(input.options, ctx, t);
+            await guardAccept(scope, "done", ctx.threadId, t, m);
             const result = await updatePackage(scope, parseTaskId(input.positionals.id!), { status: "done" });
             return taskOutput(result, input.options.json, scope, m);
           },
@@ -2235,7 +2382,7 @@ export default async function plugin(bb: BbPluginApi) {
                 t,
               ) + m.replaceHandoff(`@thread:${old.threadId}`, output, taskLines);
             const sectionId = settingsValues.teamSection
-              ? await ensureSection(bb, teamSectionName(t, scope.team))
+              ? await ensureSection(bb, teamSectionName(t, scope.team), [strings("en"), strings("ru")].map((x) => teamSectionName(x, scope.team)))
               : null;
             const defaults = config.defaults ?? {};
             const spawnArgs = {

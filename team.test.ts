@@ -184,8 +184,8 @@ function makeHost(
         create: async ({ name }: { name: string }) => ({ id: "sec_new", name }),
       },
       threads: {
-        list: async ({ offset }: { offset?: number } = {}) =>
-          (offset ?? 0) > 0 ? [] : [...threads.values()].map(toResponse),
+        list: async ({ offset, projectId }: { offset?: number; projectId?: string } = {}) =>
+          (offset ?? 0) > 0 || (projectId && projectId !== "proj_1") ? [] : [...threads.values()].map(toResponse),
         experimental_listPluginMetadata: async ({ threadIds }: { threadIds: string[] }) => ({
           threads: threadIds
             .map((id) => threads.get(id))
@@ -1176,5 +1176,73 @@ describe("retitle", () => {
     const result = await harness.behavior.runCli(["retitle", "--project", "demo"]);
     expect(result.stdout).toContain("3");
     expect(threads.get("thr_dev")!.title).toBe("[TM] Developer");
+  });
+});
+
+describe("RPC overview: проекты по группам", () => {
+  it("с командами / можно создать; без папки — заблокирован с причиной", async () => {
+    const { bb, harness } = makeHost({ threads: TEAM_THREADS });
+    await plugin(bb);
+    const result = (await harness.behavior.callRpc("overview", null)) as {
+      projects: Array<{ name: string; state: string; teams: string[]; threads: number; reason: string | null }>;
+    };
+    const byName = Object.fromEntries(result.projects.map((p) => [p.name, p]));
+    expect(byName.demo).toMatchObject({ state: "teams", teams: ["main"], threads: 3 });
+    expect(byName.other).toMatchObject({ state: "ready", teams: [] });
+
+    harness.sdk.stub("hosts.list", async () => [{ id: "host_1", name: "laptop", status: "disconnected" }] as never);
+    const offline = (await harness.behavior.callRpc("overview", null)) as {
+      projects: Array<{ state: string; reason: string | null }>;
+    };
+    expect(offline.projects.every((p) => p.state === "blocked")).toBe(true);
+    expect(offline.projects[0]!.reason).toContain("laptop");
+  });
+});
+
+describe("приёмка пакетов", () => {
+  it("исполнитель не может принять пакет сам; руководитель — может", async () => {
+    const { bb, harness } = makeHost({ threads: TEAM_THREADS });
+    await plugin(bb);
+    await harness.behavior.runCli(["task", "add", "tester", "Smoke", "--send", "--project", "demo"]);
+    const self = await harness.behavior.runCli(["task", "done", "1"], { projectId: "proj_1", threadId: "thr_test" });
+    expect(self.exitCode).not.toBe(0);
+    expect(self.stderr).toContain("only the lead accepts");
+    const review = await harness.behavior.runCli(["task", "update", "1", "--status", "review"], {
+      projectId: "proj_1",
+      threadId: "thr_test",
+    });
+    expect(review.exitCode).toBe(0);
+    const accepted = await harness.behavior.runCli(["task", "done", "1"], { projectId: "proj_1", threadId: "thr_lead" });
+    expect(accepted.exitCode).toBe(0);
+  });
+});
+
+describe("create восстанавливает связи", () => {
+  it("исполнитель без родителя снова становится дочерним тредом руководителя", async () => {
+    const { bb, harness, threads } = makeHost({
+      threads: [
+        { id: "thr_lead", role: "lead" },
+        { id: "thr_dev", role: "developer", parentThreadId: null },
+        { id: "thr_test", role: "tester", parentThreadId: "thr_lead" },
+      ],
+    });
+    await plugin(bb);
+    const result = await harness.behavior.runCli(["create", "--project", "demo"]);
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("re-linked under the lead: 1");
+    expect(threads.get("thr_dev")!.parentThreadId).toBe("thr_lead");
+    expect(harness.inspection.sdk.callsTo("threads.spawn")).toHaveLength(0);
+  });
+});
+
+describe("examples/teams", () => {
+  it("пример dev.yaml проходит схему и семантику", async () => {
+    const { readFileSync } = await import("node:fs");
+    const { load } = await import("js-yaml");
+    const { teamConfigSchema, semanticChecks: checks } = await import("./server");
+    const parsed = teamConfigSchema.parse(load(readFileSync(new URL("./examples/teams/dev.yaml", import.meta.url), "utf8")));
+    const { lead, roles } = checks(parsed);
+    expect(lead.name).toBe("lead");
+    expect(roles.map((r) => r.name)).toEqual(["lead", "developer", "junior", "tester"]);
   });
 });

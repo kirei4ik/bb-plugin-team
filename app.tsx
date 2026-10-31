@@ -8,17 +8,17 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import type { FormEvent, ReactNode } from "react";
 import {
   definePluginApp,
+  experimental_Icon as Icon,
   useBbContext,
   useBbNavigate,
   useRealtime,
   useRpc,
 } from "@get-bb/plugin-sdk/app";
 import type { rpcContract } from "./server";
-import { reportLabels, teamLabel } from "./report";
+import { reportLabels } from "./report";
 import {
   TASK_STATUSES,
   currentTask,
-  layoutHierarchy,
   relativeAgo,
   statusTone,
   type Language,
@@ -26,6 +26,7 @@ import {
   type StatusTone,
   type TaskStatus,
   type TeamSnapshot,
+  type TeamTask,
 } from "./snapshot";
 import type { TeamTemplate, TemplateRole } from "./templates";
 
@@ -104,6 +105,28 @@ const EN = {
   kinds: "Role kinds (the first one is the lead)",
   createTemplate: "Create with prepared prompts",
   deleted: (id: string) => `Template "${id}" deleted.`,
+  details: "Role details",
+  helper: "helper",
+  notUnderLead: "Not a child of the lead thread — re-run create to re-link",
+  treeSummary: (roles: number, running: number, errors: number, open: number) =>
+    `${roles} roles · ${running} working${errors ? ` · ${errors} in error` : ""} · ${open} packages`,
+  pausedTag: "paused",
+  missingRoles: (names: string) => `Not created yet: ${names}`,
+  spawnMissing: "Create missing",
+  spawned: (n: number) => `Threads created: ${n}.`,
+  stop: "Stop",
+  stopped: (n: number) => `Stopped: ${n}.`,
+  allProjects: "← All projects",
+  more: "More",
+  searchPlaceholder: "Search projects and teams…",
+  groupTeams: "Projects with teams",
+  groupReady: "A team can be created",
+  groupBlocked: "A team cannot be created now",
+  createHere: "Create a team",
+  nothingFound: "Nothing found",
+  current: "current",
+  projectStats: (threads: number, running: number, errors: number) =>
+    `${threads} threads · ${running} working${errors ? ` · ${errors} in error` : ""}`,
 };
 
 const RU: typeof EN = {
@@ -178,6 +201,28 @@ const RU: typeof EN = {
   kinds: "Виды ролей (первая — руководитель)",
   createTemplate: "Создать с готовыми промптами",
   deleted: (id) => `Шаблон «${id}» удалён.`,
+  details: "Роль подробно",
+  helper: "помощник",
+  notUnderLead: "Не дочерний тред руководителя — повторите create, чтобы восстановить связь",
+  treeSummary: (roles, running, errors, open) =>
+    `ролей: ${roles} · в работе: ${running}${errors ? ` · с ошибкой: ${errors}` : ""} · пакетов: ${open}`,
+  pausedTag: "пауза",
+  missingRoles: (names) => `Ещё не созданы: ${names}`,
+  spawnMissing: "Создать недостающих",
+  spawned: (n) => `Создано тредов: ${n}.`,
+  stop: "Остановить",
+  stopped: (n) => `Остановлено: ${n}.`,
+  allProjects: "← Все проекты",
+  more: "Ещё",
+  searchPlaceholder: "Поиск проекта или команды…",
+  groupTeams: "Проекты с командами",
+  groupReady: "Можно создать команду",
+  groupBlocked: "Сейчас нельзя создать команду",
+  createHere: "Создать команду",
+  nothingFound: "Ничего не найдено",
+  current: "текущий",
+  projectStats: (threads, running, errors) =>
+    `тредов: ${threads} · в работе: ${running}${errors ? ` · с ошибкой: ${errors}` : ""}`,
 };
 
 type Labels = typeof EN;
@@ -194,13 +239,6 @@ const TONE_CLASS: Record<StatusTone, string> = {
   other: "bg-amber-500",
 };
 
-const TONE_FILL: Record<StatusTone, string> = {
-  running: "var(--brand, var(--primary))",
-  idle: "var(--success, #22c55e)",
-  error: "var(--destructive)",
-  missing: "var(--muted-foreground)",
-  other: "var(--warning, #f59e0b)",
-};
 
 const errorText = (cause: unknown) => (cause instanceof Error ? cause.message : String(cause));
 
@@ -250,6 +288,10 @@ function Button({
 
 const inputClass = "h-7 rounded-md border border-input bg-background px-2 text-xs text-foreground";
 
+function TeamIcon() {
+  return <Icon name="team/team" fallback="Users" className="inline-block size-3.5 shrink-0" aria-hidden />;
+}
+
 function Dot({ tone }: { tone: StatusTone }) {
   return <span className={`inline-block h-2 w-2 shrink-0 rounded-full ${TONE_CLASS[tone]}`} />;
 }
@@ -272,35 +314,7 @@ function Notice({ children, tone }: { children: ReactNode; tone?: "warn" | "erro
   return <div className={`rounded-md bg-muted px-3 py-2 text-sm ${color}`}>{children}</div>;
 }
 
-function Section({ title, children, actions }: { title: string; children: ReactNode; actions?: ReactNode }) {
-  return (
-    <section className="flex flex-col gap-2">
-      <div className="flex items-center gap-2">
-        <h2 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">{title}</h2>
-        <div className="ml-auto flex gap-1.5">{actions}</div>
-      </div>
-      {children}
-    </section>
-  );
-}
-
 /* ──────────────────────── Data hooks ──────────────────────── */
-
-function useProjects() {
-  const rpc = useRpc<typeof rpcContract>();
-  const [projects, setProjects] = useState<Array<{ id: string; name: string }>>([]);
-  useEffect(() => {
-    let cancelled = false;
-    rpc
-      .call("projects")
-      .then((result) => !cancelled && setProjects(result.projects))
-      .catch(() => undefined);
-    return () => {
-      cancelled = true;
-    };
-  }, [rpc]);
-  return projects;
-}
 
 function useProviders() {
   const rpc = useRpc<typeof rpcContract>();
@@ -795,191 +809,450 @@ function AddExecutor({
   );
 }
 
-/* ──────────────────────── Hierarchy graph ──────────────────────── */
+/* ──────────────────────── Team tree ──────────────────────── */
 
-function Hierarchy({
-  snapshot,
-  language,
-  onOpen,
+interface Selection {
+  team: string;
+  role: string;
+}
+
+function TreeRow({
+  depth,
+  last,
+  tone,
+  title,
+  meta,
+  badge,
+  warn,
+  selected,
+  onClick,
 }: {
-  snapshot: TeamSnapshot;
-  language: Language;
-  onOpen: (threadId: string) => void;
+  depth: number;
+  last?: boolean;
+  tone: StatusTone;
+  title: string;
+  meta: string;
+  badge?: ReactNode;
+  warn?: string;
+  selected?: boolean;
+  onClick?: () => void;
 }) {
-  const l = reportLabels(language);
-  const layout = useMemo(() => layoutHierarchy(snapshot), [snapshot]);
-  if (layout.nodes.length === 0) return <Notice>{l.noThreads}</Notice>;
-  const byKey = new Map(layout.nodes.map((node) => [node.key, node]));
-  const cut = (value: string, max: number) => (value.length > max ? `${value.slice(0, max - 1)}…` : value);
   return (
-    <svg
-      viewBox={`0 0 ${layout.width} ${layout.height}`}
-      width="100%"
-      style={{ maxWidth: layout.width, height: "auto", display: "block" }}
-      role="img"
-      aria-label={l.hierarchy}
+    <button
+      type="button"
+      onClick={onClick}
+      aria-pressed={selected}
+      style={{ paddingLeft: 8 + depth * 18 }}
+      className={`group flex w-full items-center gap-2 rounded-md py-1.5 pr-2 text-left text-xs transition-colors ${
+        selected ? "bg-accent text-accent-foreground" : "hover:bg-accent/60"
+      }`}
     >
-      {layout.edges.map((edge) => {
-        const from = byKey.get(edge.from)!;
-        const to = byKey.get(edge.to)!;
-        const x1 = from.x + layout.nodeWidth / 2;
-        const y1 = from.y + layout.nodeHeight;
-        const x2 = to.x + layout.nodeWidth / 2;
-        const y2 = to.y;
-        const midY = (y1 + y2) / 2;
-        return (
-          <path
-            key={`${edge.from}->${edge.to}`}
-            d={`M${x1},${y1} C${x1},${midY} ${x2},${midY} ${x2},${y2}`}
-            fill="none"
-            stroke="var(--border)"
-            strokeWidth={1.5}
-            strokeDasharray={edge.linked ? undefined : "4 3"}
-          />
-        );
-      })}
-      {layout.nodes.map((node) => (
-        <g key={node.key} onClick={() => node.threadId && onOpen(node.threadId)} style={{ cursor: node.threadId ? "pointer" : "default" }}>
-          <title>{`${node.title} — ${node.role} — ${node.status ?? l.missing}${node.task ? ` — ${node.task}` : ""}`}</title>
-          <rect
-            x={node.x}
-            y={node.y}
-            width={layout.nodeWidth}
-            height={layout.nodeHeight}
-            rx={8}
-            fill="var(--card)"
-            stroke={node.lead ? "var(--brand, var(--primary))" : "var(--border)"}
-            strokeDasharray={node.tone === "missing" ? "4 3" : undefined}
-          />
-          <circle cx={node.x + 14} cy={node.y + 18} r={5} fill={TONE_FILL[node.tone]} />
-          <text x={node.x + 26} y={node.y + 22} fontSize={12} fontWeight={600} fill="var(--foreground)">
-            {cut(node.title, 20)}
-          </text>
-          <text x={node.x + 12} y={node.y + 40} fontSize={11} fill="var(--muted-foreground)">
-            {cut((node.task ?? `${node.role} · ${node.status ?? l.missing}`) + (node.helpers > 0 ? ` ${l.helpers(node.helpers)}` : ""), 26)}
-          </text>
-        </g>
-      ))}
-    </svg>
+      {depth > 0 && <span className="text-muted-foreground/60">{last ? "└" : "├"}</span>}
+      <Dot tone={tone} />
+      <span className={`truncate font-medium ${tone === "missing" ? "text-muted-foreground" : "text-foreground"}`}>{title}</span>
+      <span className="truncate text-muted-foreground">{meta}</span>
+      {warn && (
+        <span title={warn} className="text-amber-600">
+          ⚠
+        </span>
+      )}
+      <span className="ml-auto flex shrink-0 items-center gap-1">{badge}</span>
+    </button>
   );
 }
 
-/* ──────────────────────── Role card ──────────────────────── */
+function TeamBlock({
+  snapshot,
+  language,
+  labels,
+  expanded,
+  onToggle,
+  selection,
+  onSelect,
+  onAction,
+  adding,
+  onAdding,
+}: {
+  snapshot: TeamSnapshot;
+  language: Language;
+  labels: Labels;
+  expanded: boolean;
+  onToggle: () => void;
+  selection: Selection | null;
+  onSelect: (selection: Selection) => void;
+  onAction: (action: () => Promise<string>) => Promise<void>;
+  adding: boolean;
+  onAdding: (adding: boolean) => void;
+}) {
+  const rpc = useRpc<typeof rpcContract>();
+  const l = reportLabels(language);
+  const projectId = snapshot.projectId;
+  const team = snapshot.team;
+  const threads = snapshot.roles.flatMap((role) => role.threads);
+  const running = threads.filter((thread) => statusTone(thread.status) === "running").length;
+  const errors = threads.filter((thread) => statusTone(thread.status) === "error").length;
+  const tasks = snapshot.roles.flatMap((role) => role.tasks).sort((a, b) => a.id - b.id);
+  const lead = snapshot.roles.find((role) => role.lead);
+  const leadThread = lead?.threads[0]?.threadId ?? null;
+  const executors = snapshot.roles.filter((role) => !role.lead && (role.enabled || role.threads.length > 0));
+  const missing = snapshot.roles.filter((role) => role.enabled && role.inConfig && role.threads.length === 0);
+  const [templateId, setTemplateId] = useState<string | null>(null);
+  const [showTasks, setShowTasks] = useState(false);
+  const [menu, setMenu] = useState(false);
+  const nowMs = snapshot.generatedAtMs;
 
-function RoleCard({
+  const roleRow = (role: SnapshotRole, depth: number, last = false) => {
+    const thread = role.threads[0];
+    const task = currentTask(role.tasks);
+    const tone: StatusTone = thread ? statusTone(thread.status) : "missing";
+    const status = thread ? l.threadStatus[thread.status] ?? thread.status : l.missing;
+    const provider = thread?.provider ?? role.provider ?? labels.defaultProvider;
+    const broken =
+      !role.lead && thread && leadThread && thread.parentThreadId !== leadThread ? labels.notUnderLead : undefined;
+    return (
+      <div key={role.name}>
+        <TreeRow
+          depth={depth}
+          last={last && role.helpers.length === 0}
+          tone={tone}
+          title={role.title}
+          meta={`${role.name} · ${provider}${role.model ? ` · ${role.model}` : ""} · ${status}${
+            thread ? ` · ${relativeAgo(thread.updatedAtMs, nowMs)}` : ""
+          }`}
+          warn={broken}
+          selected={selection?.team === team && selection.role === role.name}
+          onClick={() => onSelect({ team, role: role.name })}
+          badge={
+            <>
+              {role.threads.length > 1 && <Tag>×{role.threads.length}</Tag>}
+              {task && (
+                <span className="max-w-48 truncate rounded-full bg-secondary px-1.5 py-0.5 text-[10px] text-secondary-foreground">
+                  #{task.id} {task.title} · {l.taskStatus[task.status] ?? task.status}
+                </span>
+              )}
+              {!role.inConfig && <Tag>{l.notInConfig}</Tag>}
+            </>
+          }
+        />
+        {role.helpers.map((helper, index) => (
+          <TreeRow
+            key={helper.threadId}
+            depth={depth + 1}
+            last={index === role.helpers.length - 1}
+            tone={statusTone(helper.status)}
+            title={helper.title || helper.threadId}
+            meta={`${labels.helper} · ${helper.provider} · ${l.threadStatus[helper.status] ?? helper.status}`}
+            selected={selection?.team === team && selection.role === role.name}
+            onClick={() => onSelect({ team, role: role.name })}
+          />
+        ))}
+      </div>
+    );
+  };
+
+  return (
+    <div className="flex flex-col gap-1 rounded-lg border border-border bg-card p-2">
+      <div className="flex flex-wrap items-center gap-2 px-1">
+        <button type="button" onClick={onToggle} aria-expanded={expanded} className="flex items-center gap-1.5 text-sm font-semibold text-foreground">
+          <span className="w-3 text-muted-foreground">{expanded ? "▾" : "▸"}</span>
+          <TeamIcon /> {team}
+          {snapshot.teamTitle && <span className="font-normal text-muted-foreground">— {snapshot.teamTitle}</span>}
+        </button>
+        <span className="text-xs text-muted-foreground">
+          {labels.treeSummary(snapshot.roles.filter((r) => r.enabled).length, running, errors, tasks.length)}
+        </span>
+        {snapshot.paused && <Tag>{labels.pausedTag}</Tag>}
+        <div className="ml-auto flex flex-wrap items-center gap-1.5">
+          {snapshot.configSource && (
+            <label className="flex items-center gap-1 text-xs text-muted-foreground" title={snapshot.versioningBlocked ? labels.versionBlocked : undefined}>
+              <input
+                type="checkbox"
+                aria-label={`${labels.versioned} ${team}`}
+                checked={snapshot.versioned === true}
+                disabled={snapshot.versioningBlocked}
+                onChange={(event) =>
+                  void onAction(async () => {
+                    const result = await rpc.call("setVersioned", { projectId, team, versioned: event.target.checked });
+                    return result.blocked ? labels.versionBlocked : result.versioned ? labels.versionedOn : labels.versionedOff;
+                  })
+                }
+              />
+              {labels.versioned}
+            </label>
+          )}
+          <Button
+            onClick={() =>
+              void onAction(async () => {
+                const result = await rpc.call("pause", { projectId, team, paused: !snapshot.paused });
+                return result.paused ? l.paused : `${labels.resume}: ${result.count}`;
+              })
+            }
+          >
+            {snapshot.paused ? labels.resume : labels.pause}
+          </Button>
+          {snapshot.configSource && !adding && <Button onClick={() => onAdding(true)}>{labels.addExecutor}</Button>}
+          {snapshot.configSource && (
+            <span className="relative">
+              <Button variant="ghost" onClick={() => setMenu(!menu)}>
+                <span aria-label={labels.more}>⋯</span>
+              </Button>
+              {menu && (
+                <span role="menu" className="absolute right-0 top-8 z-10 flex w-56 flex-col rounded-md border border-border bg-popover p-1 shadow-md">
+                  <button
+                    type="button"
+                    role="menuitem"
+                    onClick={() => {
+                      setMenu(false);
+                      setTemplateId(team);
+                    }}
+                    className="rounded px-2 py-1.5 text-left text-xs text-popover-foreground hover:bg-accent"
+                  >
+                    {labels.saveTemplate}
+                  </button>
+                  {snapshot.configSource && (
+                    <span className="px-2 py-1.5 text-[11px] text-muted-foreground">{snapshot.configSource}</span>
+                  )}
+                </span>
+              )}
+            </span>
+          )}
+        </div>
+      </div>
+      {expanded && (
+        <>
+          {snapshot.configError && <Notice tone="error">{l.configError(snapshot.configError)}</Notice>}
+          {!snapshot.configSource && <Notice>{l.noConfig}</Notice>}
+          {templateId !== null && (
+            <form
+              onSubmit={(event) => {
+                event.preventDefault();
+                if (!NAME_RE.test(templateId)) return;
+                void onAction(async () => {
+                  await rpc.call("templateFromTeam", { projectId, team, id: templateId, title: snapshot.teamTitle ?? templateId });
+                  setTemplateId(null);
+                  return labels.saved(templateId);
+                });
+              }}
+              className="flex items-end gap-2 px-1"
+            >
+              <label className="flex flex-col gap-1 text-xs text-muted-foreground">
+                {labels.templateId}
+                <input aria-label={labels.templateId} value={templateId} onChange={(event) => setTemplateId(event.target.value.toLowerCase())} className={inputClass} />
+              </label>
+              <Button type="submit" variant="primary" disabled={!NAME_RE.test(templateId)}>
+                {labels.save}
+              </Button>
+              <Button variant="ghost" onClick={() => setTemplateId(null)}>
+                {labels.cancel}
+              </Button>
+            </form>
+          )}
+          {adding && (
+            <AddExecutor
+              projectId={projectId}
+              team={team}
+              existingRoles={snapshot.roles.map((role) => role.name)}
+              labels={labels}
+              onDone={(message) => {
+                onAdding(false);
+                void onAction(async () => message);
+              }}
+              onCancel={() => onAdding(false)}
+            />
+          )}
+          <div className="flex flex-col">
+            {lead && roleRow(lead, 0)}
+            {executors.map((role, index) => roleRow(role, lead ? 1 : 0, index === executors.length - 1))}
+          </div>
+          {missing.length > 0 && snapshot.configSource && (
+            <div className="flex items-center gap-2 px-1 pt-1">
+              <span className="text-xs text-muted-foreground">{labels.missingRoles(missing.map((r) => r.name).join(", "))}</span>
+              <Button
+                onClick={() =>
+                  void onAction(async () => labels.spawned((await rpc.call("teamSpawn", { projectId, team })).spawned))
+                }
+              >
+                {labels.spawnMissing}
+              </Button>
+            </div>
+          )}
+          <div className="px-1 pt-1">
+            <button type="button" onClick={() => setShowTasks(!showTasks)} className="text-xs text-muted-foreground hover:text-foreground">
+              {showTasks ? "▾" : "▸"} {l.tasks} ({tasks.length})
+            </button>
+            {showTasks &&
+              (tasks.length === 0 ? (
+                <div className="py-1 text-xs text-muted-foreground">{l.noTasks}</div>
+              ) : (
+                <table className="mt-1 w-full text-xs">
+                  <tbody>
+                    {tasks.map((task) => (
+                      <tr key={task.id} className="border-b border-border">
+                        <td className="py-1 pr-2 text-muted-foreground">#{task.id}</td>
+                        <td className="py-1 pr-2 text-foreground">{task.role}</td>
+                        <td className="py-1 pr-2 text-foreground">{task.title}</td>
+                        <td className="py-1 text-right">
+                          <TaskStatusSelect projectId={projectId} team={team} task={task} language={language} onAction={onAction} />
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              ))}
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
+function TaskStatusSelect({
+  projectId,
+  team,
+  task,
+  language,
+  onAction,
+}: {
+  projectId: string;
+  team: string;
+  task: TeamTask;
+  language: Language;
+  onAction: (action: () => Promise<string>) => Promise<void>;
+}) {
+  const rpc = useRpc<typeof rpcContract>();
+  const l = reportLabels(language);
+  return (
+    <select
+      aria-label={`#${task.id}`}
+      value={task.status}
+      onChange={(event) =>
+        void onAction(async () => {
+          const result = await rpc.call("taskUpdate", { projectId, team, id: task.id, status: event.target.value as TaskStatus });
+          return `#${result.task.id}: ${l.taskStatus[result.task.status] ?? result.task.status}`;
+        })
+      }
+      className="h-6 rounded-md border border-input bg-background px-1 text-xs text-foreground"
+    >
+      {TASK_STATUSES.map((status) => (
+        <option key={status} value={status}>
+          {l.taskStatus[status] ?? status}
+        </option>
+      ))}
+    </select>
+  );
+}
+
+/* ──────────────────────── Role details (actions) ──────────────────────── */
+
+function RoleDetails({
+  snapshot,
   role,
   language,
   labels,
-  nowMs,
-  onOpen,
-  onTell,
-  onPackage,
+  onAction,
+  onClose,
 }: {
+  snapshot: TeamSnapshot;
   role: SnapshotRole;
   language: Language;
   labels: Labels;
-  nowMs: number;
-  onOpen: (threadId: string) => void;
-  onTell: (role: string, text: string) => Promise<void>;
-  onPackage: (role: string, title: string, note: string, send: boolean) => Promise<void>;
+  onAction: (action: () => Promise<string>) => Promise<void>;
+  onClose: () => void;
 }) {
+  const rpc = useRpc<typeof rpcContract>();
+  const navigate = useBbNavigate();
   const l = reportLabels(language);
   const [mode, setMode] = useState<"none" | "message" | "package">("none");
   const [text, setText] = useState("");
   const [note, setNote] = useState("");
   const [sendNow, setSendNow] = useState(true);
-  const [busy, setBusy] = useState(false);
-  const task = currentTask(role.tasks);
+  const { projectId, team } = snapshot;
   const hasThread = role.threads.length > 0;
+  const running = [...role.threads, ...role.helpers].some((thread) => statusTone(thread.status) === "running");
 
-  const submit = async (event: FormEvent) => {
+  const submit = (event: FormEvent) => {
     event.preventDefault();
     if (!text.trim()) return;
-    setBusy(true);
-    try {
-      if (mode === "message") await onTell(role.name, text.trim());
-      else await onPackage(role.name, text.trim(), note.trim(), sendNow && hasThread);
+    const body = text.trim();
+    void onAction(async () => {
+      if (mode === "message") return labels.sent((await rpc.call("tell", { projectId, team, role: role.name, text: body })).sent);
+      const result = await rpc.call("taskAdd", {
+        projectId,
+        team,
+        role: role.name,
+        title: body,
+        ...(note.trim() ? { note: note.trim() } : {}),
+        send: sendNow && hasThread,
+      });
+      return labels.added(result.task.id);
+    }).then(() => {
       setText("");
       setNote("");
       setMode("none");
-    } finally {
-      setBusy(false);
-    }
+    });
   };
 
   return (
-    <div className="flex flex-col gap-2 rounded-lg border border-border bg-card p-3">
-      <div className="flex items-center gap-1.5">
-        <strong className="truncate text-sm text-foreground">{role.title}</strong>
-        {role.lead && <Tag strong>{l.lead}</Tag>}
-        {!role.inConfig && <Tag>{l.notInConfig}</Tag>}
-      </div>
-      <div className="truncate text-xs text-muted-foreground">
-        {role.name} · {role.threads[0]?.provider ?? role.provider ?? "—"}
-        {role.model ? ` · ${role.model}` : ""}
-      </div>
-      {hasThread ? (
-        role.threads.map((thread) => (
-          <button
-            key={thread.threadId}
-            type="button"
-            onClick={() => onOpen(thread.threadId)}
-            className="flex items-center gap-1.5 text-left text-xs text-foreground hover:underline"
-          >
-            <Dot tone={statusTone(thread.status)} />
-            <span>{thread.status}</span>
-            <span className="text-muted-foreground">· {l.ago(relativeAgo(thread.updatedAtMs, nowMs))}</span>
-          </button>
-        ))
-      ) : (
-        <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
-          <Dot tone="missing" />
-          {l.missing}
-        </div>
-      )}
-      {role.helpers.length > 0 && (
-        <div className="flex flex-col gap-0.5 border-l border-border pl-2">
-          <span className="text-[10px] uppercase tracking-wide text-muted-foreground">{labels.helpers}</span>
-          {role.helpers.map((helper) => (
-            <button
-              key={helper.threadId}
-              type="button"
-              onClick={() => onOpen(helper.threadId)}
-              className="flex items-center gap-1.5 truncate text-left text-xs text-foreground hover:underline"
-            >
-              <Dot tone={statusTone(helper.status)} />
-              <span className="truncate">{helper.title || helper.threadId}</span>
-            </button>
-          ))}
-        </div>
-      )}
-      <div className="text-xs text-foreground">
-        {task ? (
-          <span className="flex items-center gap-1.5">
-            <Tag>{l.taskStatus[task.status] ?? task.status}</Tag>#{task.id} {task.title}
+    <aside aria-label={labels.details} className="flex w-full flex-col gap-3 rounded-lg border border-border bg-card p-3 lg:w-80 lg:shrink-0">
+      <div className="flex items-start gap-2">
+        <div className="flex min-w-0 flex-col">
+          <strong className="truncate text-sm text-foreground">{role.title}</strong>
+          <span className="truncate text-xs text-muted-foreground">
+            {team} · {role.name}
+            {role.lead ? ` · ${l.lead}` : ""}
           </span>
-        ) : (
-          <span className="text-muted-foreground">—</span>
+        </div>
+        <button type="button" aria-label={labels.cancel} onClick={onClose} className="ml-auto text-muted-foreground hover:text-foreground">
+          ✕
+        </button>
+      </div>
+      <div className="flex flex-col gap-1 text-xs">
+        <span className="text-muted-foreground">
+          {labels.provider}: <span className="text-foreground">{role.threads[0]?.provider ?? role.provider ?? labels.defaultProvider}</span>
+          {role.model ? ` · ${role.model}` : ""}
+        </span>
+        {role.threads.map((thread) => (
+          <button key={thread.threadId} type="button" onClick={() => navigate.toThread(thread.threadId)} className="flex items-center gap-1.5 text-left text-foreground hover:underline">
+            <Dot tone={statusTone(thread.status)} /> {l.threadStatus[thread.status] ?? thread.status} · {l.ago(relativeAgo(thread.updatedAtMs, snapshot.generatedAtMs))} · {thread.threadId}
+          </button>
+        ))}
+        {!hasThread && (
+          <span className="flex items-center gap-1.5 text-muted-foreground">
+            <Dot tone="missing" /> {l.missing}
+          </span>
+        )}
+        {role.helpers.length > 0 && <span className="pt-1 text-[10px] uppercase tracking-wide text-muted-foreground">{labels.helpers}</span>}
+        {role.helpers.map((helper) => (
+          <button key={helper.threadId} type="button" onClick={() => navigate.toThread(helper.threadId)} className="flex items-center gap-1.5 truncate text-left text-foreground hover:underline">
+            <Dot tone={statusTone(helper.status)} /> <span className="truncate">{helper.title || helper.threadId}</span>
+          </button>
+        ))}
+      </div>
+      <div className="flex flex-wrap gap-1.5">
+        {hasThread && (
+          <Button variant="primary" onClick={() => navigate.toThread(role.threads[0]!.threadId)}>
+            {labels.open}
+          </Button>
+        )}
+        {hasThread && <Button onClick={() => setMode("message")}>{labels.message}</Button>}
+        <Button onClick={() => setMode("package")}>{labels.package}</Button>
+        {running && (
+          <Button
+            variant="ghost"
+            onClick={() => void onAction(async () => labels.stopped((await rpc.call("stop", { projectId, team, role: role.name })).stopped))}
+          >
+            {labels.stop}
+          </Button>
         )}
       </div>
-      {mode === "none" ? (
-        <div className="flex flex-wrap gap-1.5 pt-1">
-          {hasThread && (
-            <Button variant="ghost" onClick={() => onOpen(role.threads[0]!.threadId)}>
-              {labels.open}
-            </Button>
-          )}
-          {hasThread && <Button onClick={() => setMode("message")}>{labels.message}</Button>}
-          <Button onClick={() => setMode("package")}>{labels.package}</Button>
-        </div>
-      ) : (
-        <form onSubmit={submit} className="flex flex-col gap-1.5 pt-1">
+      {mode !== "none" && (
+        <form onSubmit={submit} className="flex flex-col gap-1.5">
           {mode === "message" ? (
             <textarea
               value={text}
               onChange={(event) => setText(event.target.value)}
               placeholder={labels.messagePlaceholder}
-              rows={3}
+              rows={4}
               className="rounded-md border border-input bg-background px-2 py-1 text-xs text-foreground"
             />
           ) : (
@@ -989,7 +1262,7 @@ function RoleCard({
                 value={note}
                 onChange={(event) => setNote(event.target.value)}
                 placeholder={labels.note}
-                rows={2}
+                rows={3}
                 className="rounded-md border border-input bg-background px-2 py-1 text-xs text-foreground"
               />
               {hasThread && (
@@ -1001,7 +1274,7 @@ function RoleCard({
             </>
           )}
           <div className="flex gap-1.5">
-            <Button type="submit" variant="primary" disabled={busy || !text.trim()}>
+            <Button type="submit" variant="primary" disabled={!text.trim()}>
               {mode === "message" ? labels.send : labels.add}
             </Button>
             <Button variant="ghost" onClick={() => setMode("none")}>
@@ -1010,230 +1283,145 @@ function RoleCard({
           </div>
         </form>
       )}
-    </div>
+      {role.tasks.length > 0 && (
+        <div className="flex flex-col gap-1">
+          <span className="text-[10px] uppercase tracking-wide text-muted-foreground">{l.tasks}</span>
+          {role.tasks.map((task) => (
+            <div key={task.id} className="flex items-center gap-2 text-xs text-foreground">
+              <span className="text-muted-foreground">#{task.id}</span>
+              <span className="truncate">{task.title}</span>
+              <span className="ml-auto">
+                <TaskStatusSelect projectId={projectId} team={team} task={task} language={language} onAction={onAction} />
+              </span>
+            </div>
+          ))}
+        </div>
+      )}
+    </aside>
   );
 }
 
-/* ──────────────────────── Team view ──────────────────────── */
+/* ──────────────────────── Project overview (panel root) ──────────────────────── */
 
-function TeamView({
-  projectId,
-  team,
-  onFlash,
+interface ProjectRow {
+  id: string;
+  name: string;
+  path: string | null;
+  teams: string[];
+  threads: number;
+  running: number;
+  errors: number;
+  state: "teams" | "ready" | "blocked";
+  reason: string | null;
+}
+
+function ProjectOverview({
+  currentProjectId,
+  onOpen,
 }: {
-  projectId: string;
-  team: string;
-  onFlash: (message: string) => void;
+  currentProjectId: string | null;
+  onOpen: (projectId: string) => void;
 }) {
   const rpc = useRpc<typeof rpcContract>();
-  const navigate = useBbNavigate();
-  const [snapshot, setSnapshot] = useState<TeamSnapshot | null>(null);
+  const [rows, setRows] = useState<ProjectRow[] | null>(null);
   const [language, setLanguage] = useState<Language>("en");
+  const [query, setQuery] = useState("");
   const [error, setError] = useState<string | null>(null);
-  const [loading, setLoading] = useState(false);
-  const [adding, setAdding] = useState(false);
-  const [templateId, setTemplateId] = useState<string | null>(null);
   const labels = LABELS[language];
-  const l = reportLabels(language);
 
   const refresh = useCallback(async () => {
-    setLoading(true);
     try {
-      const result = await rpc.call("snapshot", { projectId, team });
-      setSnapshot(result.snapshot);
+      const result = await rpc.call("overview");
+      setRows(result.projects);
       setLanguage(result.language);
       setError(null);
     } catch (cause) {
       setError(errorText(cause));
-    } finally {
-      setLoading(false);
     }
-  }, [rpc, projectId, team]);
-
+  }, [rpc]);
   useEffect(() => {
     void refresh();
   }, [refresh]);
+  useRealtime("team-changed", () => void refresh());
 
-  useRealtime("team-changed", (payload) => {
-    const changed = (payload as { projectId?: string } | null)?.projectId;
-    if (!changed || changed === projectId) void refresh();
-  });
-
-  const run = async (action: () => Promise<string>) => {
-    try {
-      onFlash(await action());
-    } catch (cause) {
-      onFlash(`${labels.failed}: ${errorText(cause)}`);
-    }
-    void refresh();
-  };
-
-  const onTell = (role: string, text: string) =>
-    run(async () => labels.sent((await rpc.call("tell", { projectId, team, role, text })).sent));
-  const onPackage = (role: string, title: string, note: string, send: boolean) =>
-    run(async () => {
-      const result = await rpc.call("taskAdd", { projectId, team, role, title, ...(note ? { note } : {}), send });
-      return labels.added(result.task.id);
-    });
-  const onStatus = (id: number, status: TaskStatus) =>
-    run(async () => {
-      const result = await rpc.call("taskUpdate", { projectId, team, id, status });
-      return `#${result.task.id}: ${l.taskStatus[result.task.status] ?? result.task.status}`;
-    });
-  const onPause = (paused: boolean) =>
-    run(async () => {
-      const result = await rpc.call("pause", { projectId, team, paused });
-      return result.paused ? l.paused : `${labels.resume}: ${result.count}`;
-    });
-  const onVersioned = (versioned: boolean) =>
-    run(async () => {
-      const result = await rpc.call("setVersioned", { projectId, team, versioned });
-      return result.blocked ? labels.versionBlocked : result.versioned ? labels.versionedOn : labels.versionedOff;
-    });
-  const onSaveTemplate = (id: string) =>
-    run(async () => {
-      await rpc.call("templateFromTeam", { projectId, team, id, title: snapshot?.teamTitle ?? id });
-      setTemplateId(null);
-      return labels.saved(id);
-    });
-
-  if (error && !snapshot) return <Notice tone="error">{error}</Notice>;
-  if (!snapshot) return <Notice>{labels.loading}</Notice>;
-  const tasks = snapshot.roles.flatMap((role) => role.tasks).sort((a, b) => a.id - b.id);
-  const threads = snapshot.roles.flatMap((role) => role.threads);
-  const nowMs = snapshot.generatedAtMs;
+  const q = query.trim().toLowerCase();
+  const visible = (rows ?? [])
+    .filter((row) => !q || [row.name, row.path ?? "", ...row.teams].some((value) => value.toLowerCase().includes(q)))
+    .sort((a, b) => a.name.localeCompare(b.name, language));
+  const groups: Array<{ key: ProjectRow["state"]; title: string }> = [
+    { key: "teams", title: labels.groupTeams },
+    { key: "ready", title: labels.groupReady },
+    { key: "blocked", title: labels.groupBlocked },
+  ];
 
   return (
-    <div className="flex flex-col gap-4">
+    <div className="flex h-full flex-col gap-3 overflow-auto p-4">
       <div className="flex flex-wrap items-center gap-2">
-        <h1 className="mr-2 text-base font-semibold text-foreground">
-          {l.title(teamLabel(snapshot))}
-          {snapshot.teamTitle ? <span className="ml-2 text-sm font-normal text-muted-foreground">{snapshot.teamTitle}</span> : null}
-        </h1>
-        <div className="ml-auto flex flex-wrap items-center gap-1.5">
-          {snapshot.configSource && (
-            <label className="flex items-center gap-1 text-xs text-muted-foreground" title={snapshot.versioningBlocked ? labels.versionBlocked : undefined}>
-              <input
-                type="checkbox"
-                aria-label={labels.versioned}
-                checked={snapshot.versioned === true}
-                disabled={snapshot.versioningBlocked}
-                onChange={(event) => void onVersioned(event.target.checked)}
-              />
-              {labels.versioned}
-            </label>
-          )}
-          {snapshot.configSource && <Button onClick={() => setTemplateId(snapshot.team)}>{labels.saveTemplate}</Button>}
-          <Button onClick={() => void onPause(!snapshot.paused)}>{snapshot.paused ? labels.resume : labels.pause}</Button>
-          <Button onClick={() => void refresh()} disabled={loading}>
-            {loading ? labels.loading : labels.refresh}
-          </Button>
-        </div>
+        <h1 className="mr-1 text-base font-semibold text-foreground">{labels.panelTitle}</h1>
+        <input
+          type="search"
+          autoFocus
+          aria-label={labels.searchPlaceholder}
+          placeholder={labels.searchPlaceholder}
+          value={query}
+          onChange={(event) => setQuery(event.target.value)}
+          className="h-8 min-w-0 grow rounded-md border border-input bg-background px-3 text-sm text-foreground sm:max-w-md"
+        />
+        <Button onClick={() => void refresh()}>{labels.refresh}</Button>
       </div>
-      {templateId !== null && (
-        <form
-          onSubmit={(event) => {
-            event.preventDefault();
-            if (NAME_RE.test(templateId)) void onSaveTemplate(templateId);
-          }}
-          className="flex items-end gap-2"
-        >
-          <label className="flex flex-col gap-1 text-xs text-muted-foreground">
-            {labels.templateId}
-            <input aria-label={labels.templateId} value={templateId} onChange={(event) => setTemplateId(event.target.value.toLowerCase())} className={inputClass} />
-          </label>
-          <Button type="submit" variant="primary" disabled={!NAME_RE.test(templateId)}>
-            {labels.save}
-          </Button>
-          <Button variant="ghost" onClick={() => setTemplateId(null)}>
-            {labels.cancel}
-          </Button>
-        </form>
-      )}
-      <div className="text-xs text-muted-foreground">
-        {l.summary(
-          snapshot.roles.filter((role) => role.enabled).length,
-          threads.filter((thread) => statusTone(thread.status) === "running").length,
-          threads.filter((thread) => statusTone(thread.status) === "error").length,
-          tasks.length,
-        )}
-      </div>
-      {snapshot.paused && <Notice tone="warn">{l.paused}</Notice>}
-      {!snapshot.configSource && <Notice>{l.noConfig}</Notice>}
-      {snapshot.configError && <Notice tone="error">{l.configError(snapshot.configError)}</Notice>}
-
-      <Section title={l.hierarchy}>
-        <Hierarchy snapshot={snapshot} language={language} onOpen={(id) => navigate.toThread(id)} />
-      </Section>
-
-      <Section
-        title={l.roles}
-        actions={snapshot.configSource && !adding ? <Button onClick={() => setAdding(true)}>{labels.addExecutor}</Button> : null}
-      >
-        {adding && (
-          <AddExecutor
-            projectId={projectId}
-            team={team}
-            existingRoles={snapshot.roles.map((role) => role.name)}
-            labels={labels}
-            onDone={(message) => {
-              setAdding(false);
-              onFlash(message);
-              void refresh();
-            }}
-            onCancel={() => setAdding(false)}
-          />
-        )}
-        <div className="grid grid-cols-[repeat(auto-fill,minmax(220px,1fr))] gap-3">
-          {snapshot.roles
-            .filter((role) => role.enabled || role.threads.length > 0)
-            .map((role) => (
-              <RoleCard
-                key={role.name}
-                role={role}
-                language={language}
-                labels={labels}
-                nowMs={nowMs}
-                onOpen={(id) => navigate.toThread(id)}
-                onTell={onTell}
-                onPackage={onPackage}
-              />
-            ))}
-        </div>
-      </Section>
-
-      <Section title={l.tasks}>
-        {tasks.length === 0 ? (
-          <div className="text-sm text-muted-foreground">{l.noTasks}</div>
-        ) : (
-          <table className="w-full text-xs">
-            <tbody>
-              {tasks.map((task) => (
-                <tr key={task.id} className="border-b border-border">
-                  <td className="py-1.5 pr-2 text-muted-foreground">#{task.id}</td>
-                  <td className="py-1.5 pr-2 text-foreground">{task.role}</td>
-                  <td className="py-1.5 pr-2 text-foreground">{task.title}</td>
-                  <td className="py-1.5 text-right">
-                    <select
-                      aria-label={`#${task.id}`}
-                      value={task.status}
-                      onChange={(event) => void onStatus(task.id, event.target.value as TaskStatus)}
-                      className="h-6 rounded-md border border-input bg-background px-1 text-xs text-foreground"
-                    >
-                      {TASK_STATUSES.map((status) => (
-                        <option key={status} value={status}>
-                          {l.taskStatus[status] ?? status}
-                        </option>
-                      ))}
-                    </select>
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        )}
-      </Section>
-      <div className="text-xs text-muted-foreground">{labels.tip}</div>
+      {error && <Notice tone="error">{error}</Notice>}
+      {rows === null && !error && <Notice>{labels.loading}</Notice>}
+      {rows !== null && visible.length === 0 && <Notice>{labels.nothingFound}</Notice>}
+      {groups.map((group) => {
+        const items = visible.filter((row) => row.state === group.key);
+        if (items.length === 0) return null;
+        return (
+          <section key={group.key} aria-label={group.title} className="flex flex-col gap-1">
+            <h2 className="px-1 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+              {group.title} · {items.length}
+            </h2>
+            <div className="flex flex-col divide-y divide-border rounded-lg border border-border bg-card">
+              {items.map((row) => {
+                const blocked = row.state === "blocked";
+                return (
+                  <button
+                    key={row.id}
+                    type="button"
+                    disabled={blocked}
+                    onClick={() => onOpen(row.id)}
+                    className="flex flex-wrap items-center gap-x-3 gap-y-1 px-3 py-2 text-left hover:bg-accent/60 disabled:cursor-default disabled:hover:bg-transparent"
+                  >
+                    <span className="flex min-w-0 flex-col">
+                      <span className="flex items-center gap-1.5 text-sm font-medium text-foreground">
+                        {row.name}
+                        {row.id === currentProjectId && <Tag>{labels.current}</Tag>}
+                      </span>
+                      <span className="truncate text-xs text-muted-foreground">
+                        {blocked ? row.reason : row.path}
+                      </span>
+                    </span>
+                    <span className="ml-auto flex flex-wrap items-center gap-1.5">
+                      {row.state === "teams" && (
+                        <>
+                          {row.teams.map((team) => (
+                            <span key={team} className="rounded-full bg-secondary px-2 py-0.5 text-xs text-secondary-foreground">
+                              <span className="inline-flex items-center gap-1"><TeamIcon /> {team}</span>
+                            </span>
+                          ))}
+                          <span className="text-xs text-muted-foreground">
+                            {labels.projectStats(row.threads, row.running, row.errors)}
+                          </span>
+                        </>
+                      )}
+                      {row.state === "ready" && <span className="text-xs text-primary">{labels.createHere} →</span>}
+                    </span>
+                  </button>
+                );
+              })}
+            </div>
+          </section>
+        );
+      })}
     </div>
   );
 }
@@ -1244,98 +1432,145 @@ function TeamPanel({ subPath }: { subPath: string }) {
   const context = useBbContext();
   const navigate = useBbNavigate();
   const rpc = useRpc<typeof rpcContract>();
-  const projects = useProjects();
   const parts = subPath ? subPath.split("/").map((part) => decodeURIComponent(part)) : [];
-  const projectId = parts[0] || context.projectId || null;
-  const [teams, setTeams] = useState<string[] | null>(null);
+  const projectId = parts[0] || null;
+  const [projectName, setProjectName] = useState<string | null>(null);
+  const [snapshots, setSnapshots] = useState<TeamSnapshot[] | null>(null);
   const [language, setLanguage] = useState<Language>("en");
+  const [loading, setLoading] = useState(false);
   const [creating, setCreating] = useState(false);
   const [flash, setFlash] = useState<string | null>(null);
+  const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
+  const [selection, setSelection] = useState<Selection | null>(null);
+  const [adding, setAdding] = useState<string | null>(null);
   const labels = LABELS[language];
-  const team = parts[1] && teams?.includes(parts[1]) ? parts[1] : teams?.[0] ?? null;
 
-  const loadTeams = useCallback(async () => {
+  const refresh = useCallback(async () => {
     if (!projectId) return;
+    setLoading(true);
     try {
-      const result = await rpc.call("teams", { projectId });
-      setTeams(result.teams);
+      const result = await rpc.call("tree", { projectId });
+      setSnapshots(result.snapshots);
       setLanguage(result.language);
+      setProjectName(result.projectName);
     } catch (cause) {
       setFlash(errorText(cause));
-      setTeams([]);
+      setSnapshots((current) => current ?? []);
+    } finally {
+      setLoading(false);
     }
   }, [rpc, projectId]);
 
   useEffect(() => {
-    setTeams(null);
-    void loadTeams();
-  }, [loadTeams]);
+    setSnapshots(null);
+    setSelection(null);
+    void refresh();
+  }, [refresh]);
 
-  const go = (nextProject: string, nextTeam?: string) =>
-    navigate.toPluginPanel("team", {
-      subPath: [nextProject, nextTeam].filter(Boolean).map((part) => encodeURIComponent(part!)).join("/"),
-    });
+  useRealtime("team-changed", (payload) => {
+    const changed = (payload as { projectId?: string } | null)?.projectId;
+    if (!changed || changed === projectId) void refresh();
+  });
+
+  const onAction = async (action: () => Promise<string>) => {
+    try {
+      setFlash(await action());
+    } catch (cause) {
+      setFlash(`${labels.failed}: ${errorText(cause)}`);
+    }
+    await refresh();
+  };
+
+  const teams = snapshots?.map((snapshot) => snapshot.team) ?? [];
+  const selectedSnapshot = selection ? snapshots?.find((snapshot) => snapshot.team === selection.team) : undefined;
+  const selectedRole = selection ? selectedSnapshot?.roles.find((role) => role.name === selection.role) : undefined;
+
+  if (!projectId) {
+    return (
+      <ProjectOverview
+        currentProjectId={context.projectId}
+        onOpen={(id) => navigate.toPluginPanel("team", { subPath: encodeURIComponent(id) })}
+      />
+    );
+  }
 
   return (
-    <div className="flex h-full flex-col gap-4 overflow-auto p-4">
+    <div className="flex h-full flex-col gap-3 overflow-auto p-4">
       <div className="flex flex-wrap items-center gap-2">
-        <select
-          aria-label={labels.project}
-          value={projectId ?? ""}
-          onChange={(event) => go(event.target.value)}
-          className={inputClass}
-        >
-          {!projectId && <option value="">{labels.pickProject}</option>}
-          {projects.map((project) => (
-            <option key={project.id} value={project.id}>
-              {project.name}
-            </option>
-          ))}
-        </select>
-        {teams && teams.length > 0 && (
-          <div role="tablist" className="flex flex-wrap gap-1">
-            {teams.map((name) => (
-              <button
-                key={name}
-                role="tab"
-                type="button"
-                aria-selected={!creating && name === team}
-                onClick={() => {
-                  setCreating(false);
-                  go(projectId!, name);
-                }}
-                className={`h-7 rounded-md px-2.5 text-xs font-medium ${
-                  !creating && name === team ? "bg-primary text-primary-foreground" : "text-muted-foreground hover:bg-accent"
-                }`}
-              >
-                👥 {name}
-              </button>
-            ))}
-            <Button variant="ghost" onClick={() => setCreating(true)}>
-              {labels.newTeam}
-            </Button>
-          </div>
-        )}
+        <Button variant="ghost" onClick={() => navigate.toPluginPanel("team", { subPath: "" })}>
+          {labels.allProjects}
+        </Button>
+        <h1 className="mr-1 text-base font-semibold text-foreground">{projectName ?? labels.panelTitle}</h1>
+        <div className="ml-auto flex gap-1.5">
+          {snapshots && snapshots.length > 0 && !creating && <Button onClick={() => setCreating(true)}>{labels.newTeam}</Button>}
+          <Button onClick={() => void refresh()} disabled={loading || !projectId}>
+            {loading ? labels.loading : labels.refresh}
+          </Button>
+        </div>
       </div>
-      {!projectId && <Notice>{labels.noProject}</Notice>}
-      {flash && <Notice>{flash}</Notice>}
-      {projectId && teams === null && <Notice>{labels.loading}</Notice>}
-      {projectId && teams !== null && (teams.length === 0 || creating) && (
+      {flash && (
+        <div className="flex items-start gap-2 rounded-md bg-muted px-3 py-2 text-sm text-muted-foreground">
+          <span className="grow">{flash}</span>
+          <button type="button" aria-label={labels.cancel} onClick={() => setFlash(null)}>
+            ✕
+          </button>
+        </div>
+      )}
+      {projectId && snapshots === null && <Notice>{labels.loading}</Notice>}
+      {projectId && snapshots !== null && (snapshots.length === 0 || creating) && (
         <>
-          {teams.length === 0 && <Notice>{labels.noTeams}</Notice>}
+          {snapshots.length === 0 && <Notice>{labels.noTeams}</Notice>}
           <CreateTeam
             projectId={projectId}
             existingTeams={teams}
             onCreated={(created) => {
               setCreating(false);
-              setFlash(labels.teamCreated(created));
-              void loadTeams().then(() => go(projectId, created));
+              void onAction(async () => labels.teamCreated(created));
             }}
-            onCancel={teams.length > 0 ? () => setCreating(false) : undefined}
+            onCancel={snapshots.length > 0 ? () => setCreating(false) : undefined}
           />
         </>
       )}
-      {projectId && team && !creating && <TeamView key={`${projectId}/${team}`} projectId={projectId} team={team} onFlash={setFlash} />}
+      {snapshots && snapshots.length > 0 && (
+        <div className="flex flex-col gap-3 lg:flex-row lg:items-start">
+          <div role="tree" aria-label={labels.panelTitle} className="flex min-w-0 grow flex-col gap-3">
+            {snapshots.map((snapshot) => (
+              <TeamBlock
+                key={snapshot.team}
+                snapshot={snapshot}
+                language={language}
+                labels={labels}
+                expanded={!collapsed.has(snapshot.team)}
+                onToggle={() =>
+                  setCollapsed((current) => {
+                    const next = new Set(current);
+                    if (next.has(snapshot.team)) next.delete(snapshot.team);
+                    else next.add(snapshot.team);
+                    return next;
+                  })
+                }
+                selection={selection}
+                onSelect={setSelection}
+                onAction={onAction}
+                adding={adding === snapshot.team}
+                onAdding={(value) => setAdding(value ? snapshot.team : null)}
+              />
+            ))}
+            <div className="text-xs text-muted-foreground">{labels.tip}</div>
+          </div>
+          {selectedSnapshot && selectedRole && (
+            <RoleDetails
+              key={`${selectedSnapshot.team}/${selectedRole.name}`}
+              snapshot={selectedSnapshot}
+              role={selectedRole}
+              language={language}
+              labels={labels}
+              onAction={onAction}
+              onClose={() => setSelection(null)}
+            />
+          )}
+        </div>
+      )}
     </div>
   );
 }
@@ -1524,7 +1759,7 @@ export default definePluginApp((app) => {
   app.slots.navPanel({
     id: "team",
     title: "Team",
-    icon: "Users",
+    icon: "team/team",
     path: "team",
     component: TeamPanel,
   });

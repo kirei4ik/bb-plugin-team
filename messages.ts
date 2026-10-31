@@ -92,6 +92,11 @@ export interface Messages {
   retitled: (count: number) => string;
   versionedYes: string;
   versionedNo: string;
+  onlyLeadAccepts: (role: string) => { message: string; hint: string };
+  relinked: (count: number) => string;
+  overviewNoSource: string;
+  overviewHostOffline: (host: string) => string;
+  overviewUnreadable: (error: string) => string;
 }
 
 const EN: Messages = {
@@ -124,8 +129,8 @@ const EN: Messages = {
       ...(note ? ["", note] : []),
       "",
       leadRef
-        ? `When it is done, report to the lead ${leadRef}. The lead accepts it with: bb team task done ${id}`
-        : `When it is done, report back. Close it with: bb team task done ${id}`,
+        ? `When it is done: bb team task update ${id} --status review — then report to the lead ${leadRef}. Only the lead accepts packages (done).`
+        : `When it is done: bb team task update ${id} --status review — then report back.`,
     ].join("\n"),
   taskStatusLine: (status) => `status: ${status}`,
 
@@ -252,6 +257,14 @@ const EN: Messages = {
   retitled: (count) => `threads renamed: ${count}`,
   versionedYes: "versioned (tracked in git)",
   versionedNo: "not versioned (kept out of git)",
+  relinked: (count) => `executors re-linked under the lead: ${count}`,
+  onlyLeadAccepts: (role) => ({
+    message: `only the lead accepts packages; "${role}" is an executor`,
+    hint: "Move it to review: bb team task update <id> --status review — and report to the lead",
+  }),
+  overviewNoSource: "The project has no folder (source) on a connected machine",
+  overviewHostOffline: (host) => `Machine "${host}" is offline — team threads cannot start there`,
+  overviewUnreadable: (error) => `The project folder cannot be read: ${error}`,
 };
 
 const RU: Messages = {
@@ -284,8 +297,8 @@ const RU: Messages = {
       ...(note ? ["", note] : []),
       "",
       leadRef
-        ? `По завершении отчитайся руководителю ${leadRef}. Руководитель принимает пакет: bb team task done ${id}`
-        : `По завершении отчитайся. Закрыть пакет: bb team task done ${id}`,
+        ? `По завершении: bb team task update ${id} --status review — и отчёт руководителю ${leadRef}. Принимает пакет (done) только руководитель.`
+        : `По завершении: bb team task update ${id} --status review — и отчёт.`,
     ].join("\n"),
   taskStatusLine: (status) => `статус: ${status}`,
 
@@ -412,6 +425,14 @@ const RU: Messages = {
   retitled: (count) => `переименовано тредов: ${count}`,
   versionedYes: "в git (версионируется)",
   versionedNo: "вне git (не версионируется)",
+  relinked: (count) => `исполнителей заново привязано к руководителю: ${count}`,
+  onlyLeadAccepts: (role) => ({
+    message: `принимает пакеты только руководитель; "${role}" — исполнитель`,
+    hint: "Переведите в ревью: bb team task update <id> --status review — и отчитайтесь руководителю",
+  }),
+  overviewNoSource: "У проекта нет папки (источника) на подключённой машине",
+  overviewHostOffline: (host) => `Машина «${host}» не в сети — треды команды там не запустятся`,
+  overviewUnreadable: (error) => `Папка проекта недоступна: ${error}`,
 };
 
 export function messages(lang: Language): Messages {

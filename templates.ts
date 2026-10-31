@@ -35,11 +35,11 @@ export const ROLE_NAME_RE = /^[a-z0-9][a-z0-9-]*$/;
 
 /* ──────────────────────── Built-in role prompts ──────────────────────── */
 
-const EN_REPORT = `Report to the lead {{leadThreadRef}} when done:
-  bb thread tell {{leadThreadId}} --message-file -
+const EN_REPORT = `When a package is done, move it to review (bb team task update <id> --status review)
+and report to the lead {{leadThreadRef}}: bb thread tell {{leadThreadId}} --message-file -
 Report in ≤10 lines: changed files, what was verified and how, risks.`;
-const RU_REPORT = `По завершении — отчёт руководителю {{leadThreadRef}}:
-  bb thread tell {{leadThreadId}} --message-file -
+const RU_REPORT = `Готовый пакет переведи в ревью (bb team task update <id> --status review)
+и отчитайся руководителю {{leadThreadRef}}: bb thread tell {{leadThreadId}} --message-file -
 Отчёт ≤10 строк: изменённые файлы, что и как проверено, риски.`;
 
 const KIND_PROMPTS: Record<Language, Record<RoleKind, string>> = {

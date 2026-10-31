@@ -1,6 +1,6 @@
 {
   "name": "bb-plugin-team",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "type": "module",
   "engines": {
     "bb": ">=0.47",
@@ -8,9 +8,12 @@
   },
   "bb": {
     "name": "Team",
-    "description": "Role-based agent team for a project from .bb/team.yaml: spawn lead + executors, message roles by name, track work packages, and watch it all in the Team panel.",
+    "description": "Role-based agent teams for a project: create from templates, message roles by name, track work packages, and manage them in a live team tree.",
     "branding": {
-      "icon": "Users"
+      "icon": "./assets/team.svg",
+      "experimental_icons": {
+        "team": "./assets/team.svg"
+      }
     },
     "server": "./server.ts",
     "skills": [
@@ -41,5 +44,5 @@
     "typecheck": "tsc --noEmit"
   },
   "license": "MIT",
-  "description": "Spawn a role-based agent team for a project from .bb/team.yaml: a lead plus developers, testers, and other executors."
+  "description": "Role-based agent teams for bb projects: several teams per project from templates, a lead plus developers, juniors and testers, work packages, a live team tree."
 }
