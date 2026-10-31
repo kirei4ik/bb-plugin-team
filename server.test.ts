@@ -232,7 +232,7 @@ describe("публичные импорты SDK", () => {
   it("без нарушений и приватных зависимостей", async () => {
     const scan = await experimental_scanPublicSdkOnly(
       new URL(".", import.meta.url).pathname,
-      { allow: [/^js-yaml$/, /^vitest$/] },
+      { allow: [/^js-yaml$/, /^vitest$/, /^react$/, /^@testing-library\/react$/] },
     );
     expect(scan.violations).toEqual([]);
     expect(scan.privateDependencies).toEqual([]);

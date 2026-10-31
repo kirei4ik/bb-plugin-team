@@ -17,9 +17,16 @@
       ]
     },
     "noEmit": true,
-    "skipLibCheck": false
+    "skipLibCheck": false,
+    "jsx": "react-jsx"
   },
   "include": [
-    "server.ts"
+    "server.ts",
+    "app.tsx",
+    "snapshot.ts",
+    "tasks.ts",
+    "report.ts",
+    "messages.ts",
+    "templates.ts"
   ]
 }
