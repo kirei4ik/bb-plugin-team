@@ -23,6 +23,8 @@
   "include": [
     "server.ts",
     "app.tsx",
+    "core.ts",
+    "strings.ts",
     "snapshot.ts",
     "tasks.ts",
     "report.ts",

@@ -73,6 +73,25 @@ export interface Messages {
   templateTitle: (name: string) => string;
   fromNoConfig: (name: string) => { message: string; hint: string };
   fromStripped: (count: number) => string;
+  teamsTitle: (project: string) => string;
+  teamLine: (team: string, title: string | null, versioned: boolean, roles: number, threads: number) => string;
+  teamExists: (team: string) => { message: string; hint: string };
+  versionOn: (team: string, files: string) => string;
+  versionOff: (team: string, files: string) => string;
+  versionBlocked: string;
+  roleAdded: (role: string, team: string) => string;
+  roleExists: (role: string, team: string) => { message: string; hint: string };
+  threadTaken: (id: string, team: string, role: string) => { message: string; hint: string };
+  configRewritten: string;
+  templatesTitle: string;
+  templateLine: (id: string, title: string, roles: string, builtin: boolean) => string;
+  templateSaved: (id: string) => string;
+  templateDeleted: (id: string) => string;
+  templateNotFound: (id: string) => { message: string; hint: string };
+  templateBuiltin: (id: string) => { message: string; hint: string };
+  retitled: (count: number) => string;
+  versionedYes: string;
+  versionedNo: string;
 }
 
 const EN: Messages = {
@@ -197,6 +216,42 @@ const EN: Messages = {
   }),
   fromStripped: (count) =>
     `removed ${count} threadId binding(s): threads belong to the source project`,
+  teamsTitle: (project) => `Teams of "${project}":`,
+  teamLine: (team, title, versioned, roles, threads) =>
+    `  ${team}${title ? ` — ${title}` : ""} · roles: ${roles} · threads: ${threads} · ${versioned ? "versioned" : "not versioned"}`,
+  teamExists: (team) => ({
+    message: `team "${team}" already has a config`,
+    hint: "Pick another --team name, or --force to overwrite its files",
+  }),
+  versionOn: (team, files) => `team "${team}" is versioned now: commit ${files}`,
+  versionOff: (team, files) => `team "${team}" is out of git now (${files} ignored); remove tracked copies with git rm --cached if needed`,
+  versionBlocked:
+    "the root .gitignore ignores .bb/ entirely — replace it with `.bb/*` and `!.bb/teams/` to version teams",
+  roleAdded: (role, team) => `role "${role}" added to team "${team}"`,
+  roleExists: (role, team) => ({
+    message: `team "${team}" already has a role "${role}"`,
+    hint: "Pick another --name, e.g. developer-2",
+  }),
+  threadTaken: (id, team, role) => ({
+    message: `thread ${id} already belongs to team "${team}" as "${role}"`,
+    hint: "A thread can be in one team only. Free threads: the Team panel → Add executor",
+  }),
+  configRewritten: "note: the config was rewritten (comments dropped) because roles: is not its last key",
+  templatesTitle: "Team templates:",
+  templateLine: (id, title, roles, builtin) => `  ${id}${builtin ? " (built-in)" : ""} — ${title}: ${roles}`,
+  templateSaved: (id) => `template "${id}" saved`,
+  templateDeleted: (id) => `template "${id}" deleted`,
+  templateNotFound: (id) => ({
+    message: `template "${id}" not found`,
+    hint: "List: bb team template list",
+  }),
+  templateBuiltin: (id) => ({
+    message: `"${id}" is a built-in template and cannot be changed`,
+    hint: "Copy it under a new id: bb team template save <new-id> --from-template " + id,
+  }),
+  retitled: (count) => `threads renamed: ${count}`,
+  versionedYes: "versioned (tracked in git)",
+  versionedNo: "not versioned (kept out of git)",
 };
 
 const RU: Messages = {
@@ -321,6 +376,42 @@ const RU: Messages = {
   }),
   fromStripped: (count) =>
     `убрано привязок threadId: ${count} — треды принадлежат исходному проекту`,
+  teamsTitle: (project) => `Команды проекта «${project}»:`,
+  teamLine: (team, title, versioned, roles, threads) =>
+    `  ${team}${title ? ` — ${title}` : ""} · ролей: ${roles} · тредов: ${threads} · ${versioned ? "в git" : "не в git"}`,
+  teamExists: (team) => ({
+    message: `у команды "${team}" уже есть конфиг`,
+    hint: "Выберите другое имя --team или --force для перезаписи её файлов",
+  }),
+  versionOn: (team, files) => `команда "${team}" теперь версионируется: закоммитьте ${files}`,
+  versionOff: (team, files) => `команда "${team}" выведена из git (${files} игнорируются); уже закоммиченные копии уберите git rm --cached`,
+  versionBlocked:
+    "корневой .gitignore игнорирует весь .bb/ — замените строку на `.bb/*` и `!.bb/teams/`, чтобы версионировать команды",
+  roleAdded: (role, team) => `роль "${role}" добавлена в команду "${team}"`,
+  roleExists: (role, team) => ({
+    message: `в команде "${team}" уже есть роль "${role}"`,
+    hint: "Выберите другое --name, например developer-2",
+  }),
+  threadTaken: (id, team, role) => ({
+    message: `тред ${id} уже состоит в команде "${team}" как "${role}"`,
+    hint: "Тред может быть только в одной команде. Свободные треды: панель Team → «Добавить исполнителя»",
+  }),
+  configRewritten: "заметка: конфиг переписан целиком (комментарии потеряны), так как roles: — не последний ключ",
+  templatesTitle: "Шаблоны команд:",
+  templateLine: (id, title, roles, builtin) => `  ${id}${builtin ? " (встроенный)" : ""} — ${title}: ${roles}`,
+  templateSaved: (id) => `шаблон "${id}" сохранён`,
+  templateDeleted: (id) => `шаблон "${id}" удалён`,
+  templateNotFound: (id) => ({
+    message: `шаблон "${id}" не найден`,
+    hint: "Список: bb team template list",
+  }),
+  templateBuiltin: (id) => ({
+    message: `"${id}" — встроенный шаблон, его нельзя менять`,
+    hint: "Скопируйте под новым id: bb team template save <новый-id> --from-template " + id,
+  }),
+  retitled: (count) => `переименовано тредов: ${count}`,
+  versionedYes: "в git (версионируется)",
+  versionedNo: "вне git (не версионируется)",
 };
 
 export function messages(lang: Language): Messages {

@@ -20,13 +20,25 @@ import {
   parseTaskStatus,
   updateTask,
 } from "./tasks";
-import { teamYaml, templateFiles } from "./templates";
+import {
+  appendRoleToYaml,
+  builtinPrompt,
+  builtinTemplates,
+  formatThreadTitle,
+  isVersioned,
+  newTemplateFromKinds,
+  roleKindOf,
+  setVersionedContent,
+  teamFilesFromTemplate,
+} from "./templates";
 
 /* ──────────────────────── Фейковый хост с состоянием ──────────────────────── */
 
 interface FakeThread {
   id: string;
   role: string | null;
+  team?: string;
+  helperOf?: string;
   status: string;
   parentThreadId: string | null;
   providerId: string;
@@ -96,8 +108,12 @@ function makeHost(
       environmentId: "env_1",
       updatedAt: Date.now() - 60_000,
     });
-  const metadataOf = (thread: FakeThread) =>
-    thread.role ? { teamRole: thread.role, teamNotifyOn: thread.notifyOn } : {};
+  const metadataOf = (thread: FakeThread): Record<string, unknown> =>
+    thread.role
+      ? { teamRole: thread.role, teamNotifyOn: thread.notifyOn, ...(thread.team ? { teamName: thread.team } : {}) }
+      : thread.helperOf
+        ? { teamHelperOf: thread.helperOf, ...(thread.team ? { teamName: thread.team } : {}) }
+        : {};
   const project = (id: string, name: string, path: string) => ({
     id,
     name,
@@ -140,6 +156,12 @@ function makeHost(
           files.set(path, content);
           return { outcome: "written", sha256: "y", sizeBytes: content.length };
         },
+        list: async ({ path }: { path: string }) => ({
+          files: [...files.keys()]
+            .filter((key) => key.startsWith(`${path}/`))
+            .map((key) => ({ path: key.slice(path.length + 1), name: key.split("/").pop()! })),
+          truncated: false,
+        }),
       },
       environments: {
         list: async () => [
@@ -181,7 +203,11 @@ function makeHost(
         },
         spawn: async (args: Record<string, unknown>) => {
           spawnNo += 1;
-          const meta = (args.pluginMetadata ?? {}) as { teamRole?: string; teamNotifyOn?: string[] };
+          const meta = (args.pluginMetadata ?? {}) as {
+            teamRole?: string;
+            teamName?: string;
+            teamNotifyOn?: string[];
+          };
           const thread: FakeThread = {
             id: `thr_new${spawnNo}`,
             role: meta.teamRole ?? null,
@@ -191,14 +217,24 @@ function makeHost(
             title: String(args.title ?? ""),
             archivedAt: null,
             notifyOn: meta.teamNotifyOn ?? [],
+            ...(meta.teamName ? { team: meta.teamName } : {}),
           };
           threads.set(thread.id, thread);
           return toResponse(thread);
         },
         send: async () => ({ ok: true, delivery: "sent" }),
-        update: async ({ threadId, parentThreadId }: { threadId: string; parentThreadId?: string }) => {
+        update: async ({
+          threadId,
+          parentThreadId,
+          title,
+        }: {
+          threadId: string;
+          parentThreadId?: string;
+          title?: string;
+        }) => {
           const thread = threads.get(threadId)!;
           if (parentThreadId !== undefined) thread.parentThreadId = parentThreadId;
+          if (title !== undefined) thread.title = title;
           return toResponse(thread);
         },
         updatePluginMetadata: async ({
@@ -207,11 +243,13 @@ function makeHost(
           remove,
         }: {
           threadId: string;
-          set?: { teamRole?: string; teamNotifyOn?: string[] };
+          set?: { teamRole?: string; teamName?: string; teamNotifyOn?: string[]; teamHelperOf?: string };
           remove?: string[];
         }) => {
           const thread = threads.get(threadId)!;
           if (set?.teamRole) thread.role = set.teamRole;
+          if (set?.teamName) thread.team = set.teamName;
+          if (set?.teamHelperOf) thread.helperOf = set.teamHelperOf;
           if (set?.teamNotifyOn) thread.notifyOn = set.teamNotifyOn;
           if (remove?.includes("teamRole")) thread.role = null;
           return metadataOf(thread);
@@ -397,17 +435,64 @@ describe("иерархия и отчёт", () => {
   });
 });
 
-describe("шаблоны init", () => {
-  it("пресеты code / qa / docs", () => {
-    expect(templateFiles("en", "code").map((f) => f.rel)).toEqual([
-      ".bb/team.yaml",
-      ".bb/team/roles/lead.md",
-      ".bb/team/roles/developer.md",
-      ".bb/team/roles/tester.md",
+describe("шаблоны, промпты, названия, версионирование (чистая логика)", () => {
+  it("встроенные шаблоны: dev по умолчанию с джуном; файлы с промптами", () => {
+    const dev = builtinTemplates("ru").find((tpl) => tpl.id === "dev")!;
+    expect(dev.roles.map((r) => r.name)).toEqual(["lead", "developer", "junior", "tester"]);
+    expect(builtinTemplates("en").map((tpl) => tpl.id)).toEqual(["dev", "qa", "docs", "product"]);
+    const files = teamFilesFromTemplate("ru", dev, "core");
+    expect(files.map((f) => f.rel)).toEqual([
+      ".bb/teams/core.yaml",
+      ".bb/teams/core/lead.md",
+      ".bb/teams/core/developer.md",
+      ".bb/teams/core/junior.md",
+      ".bb/teams/core/tester.md",
     ]);
-    expect(templateFiles("en", "qa")).toHaveLength(3);
-    expect(templateFiles("ru", "docs").map((f) => f.rel)).toContain(".bb/team/roles/writer.md");
-    expect(teamYaml("ru", "docs")).toContain("Технический писатель");
+    expect(files[0]!.content).toContain("promptFile: .bb/teams/core/junior.md");
+    expect(files[3]!.content).toContain("младший разработчик");
+  });
+
+  it("встроенный промпт: по виду, по имени с суффиксом, общий из title", () => {
+    expect(roleKindOf("developer-2")).toBe("developer");
+    expect(roleKindOf("helper", "junior")).toBe("junior");
+    expect(roleKindOf("designer")).toBeNull();
+    expect(builtinPrompt("en", { name: "designer", title: "UI designer" })).toContain("UI designer");
+    expect(builtinPrompt("en", { name: "lead" })).toContain("fewest tokens");
+  });
+
+  it("новый шаблон из видов ролей: уникальные имена, первый — руководитель, промпты готовы", () => {
+    const tpl = newTemplateFromKinds("en", "x", "X", ["lead", "developer", "developer", "designer"]);
+    expect(tpl.roles.map((r) => r.name)).toEqual(["lead", "developer", "developer-2", "designer"]);
+    expect(tpl.roles[0]!.lead).toBe(true);
+    expect(tpl.roles.every((r) => (r.prompt ?? "").length > 20)).toBe(true);
+  });
+
+  it("formatThreadTitle: команда видна только при нескольких командах", () => {
+    expect(formatThreadTitle("👥 {team} · {role}", { team: "core", role: "Dev", showTeam: true })).toBe("👥 core · Dev");
+    expect(formatThreadTitle("👥 {team} · {role}", { team: "core", role: "Dev", showTeam: false })).toBe("👥 Dev");
+    expect(formatThreadTitle("[TM] {role} ({team})", { team: "qa", role: "Tester", showTeam: false })).toBe("[TM] Tester");
+    expect(formatThreadTitle("[{team}] {role}", { team: "qa", role: "Tester", showTeam: true })).toBe("[qa] Tester");
+  });
+
+  it("appendRoleToYaml сохраняет комментарии; без безопасного места — null", () => {
+    const yaml = "# head\nversion: 1\nroles:\n  - name: lead\n    title: Lead # c\n";
+    const next = appendRoleToYaml(yaml, { name: "junior", provider: "pi" })!;
+    expect(next).toContain("# head");
+    expect(next).toContain("  - name: junior\n    provider: pi");
+    expect(appendRoleToYaml("roles:\n  - name: a\nvars:\n  x: 1\n", { name: "b" })).toBeNull();
+    // Вложенный список (notifyOn) не сбивает отступ элементов roles.
+    const nested = "roles:\n  - name: dev\n    notifyOn:\n      - idle\n    promptFile: a.md\n";
+    expect(appendRoleToYaml(nested, { name: "junior" })).toBe(`${nested}  - name: junior\n`);
+  });
+
+  it("версионирование через .gitignore команды", () => {
+    const entries = ["/core.yaml", "/core.json", "/core/"];
+    const off = setVersionedContent("/other.yaml\n", entries, false);
+    expect(isVersioned(off, entries)).toBe(false);
+    expect(off).toContain("/other.yaml");
+    const on = setVersionedContent(off, entries, true);
+    expect(isVersioned(on, entries)).toBe(true);
+    expect(on).toBe("/other.yaml\n");
   });
 });
 
@@ -569,7 +654,7 @@ describe("bb team doctor", () => {
     expect(details).toContain("tester: no thread yet");
     expect(details).toContain("developer: thread thr_dev is not a child of the lead");
     expect(details).toContain("analyst: thread thr_ghost carries a role missing");
-    expect(details).toContain(".bb is gitignored");
+    expect(details).toContain("ignores .bb/ entirely");
   });
 
   it("нет конфига и неизвестная vars — провал / предупреждение", async () => {
@@ -596,9 +681,17 @@ describe("bb team create: vars и notifyOn", () => {
       .callsTo("threads.spawn")
       .map((args) => args[0] as Record<string, unknown>);
     expect(String(spawns[0]!.prompt)).toContain("Board docs/plan.md");
-    const developer = spawns.find((s) => s.title === "Developer")!;
-    expect(developer.pluginMetadata).toEqual({ teamRole: "developer", teamNotifyOn: ["idle"] });
-    const tester = spawns.find((s) => s.title === "Tester")!;
+    const byRole = (role: string) =>
+      spawns.find((s) => (s.pluginMetadata as { teamRole: string }).teamRole === role)!;
+    const developer = byRole("developer");
+    expect(developer.pluginMetadata).toEqual({
+      teamRole: "developer",
+      teamName: "main",
+      teamNotifyOn: ["idle"],
+    });
+    // Одна команда в проекте — имя команды в названии не пишется.
+    expect(developer.title).toBe("👥 Developer");
+    const tester = byRole("tester");
     expect(tester.environment).toEqual({ type: "reuse", environmentId: "env_1" });
   });
 
@@ -744,8 +837,8 @@ describe("bb team init: шаблоны и --from", () => {
     await plugin(bb);
     const result = await harness.behavior.runCli(["init", "--template", "qa", "--project", "demo"]);
     expect(result.exitCode).toBe(0);
-    expect(files.has("/ws/demo/.bb/team/roles/tester.md")).toBe(true);
-    expect(files.has("/ws/demo/.bb/team/roles/developer.md")).toBe(false);
+    expect(files.has("/ws/demo/.bb/teams/main/tester.md")).toBe(true);
+    expect(files.has("/ws/demo/.bb/teams/main/developer.md")).toBe(false);
   });
 
   it("--from копирует конфиг и промпты, убирая threadId", async () => {
@@ -761,8 +854,8 @@ describe("bb team init: шаблоны и --from", () => {
     const result = await harness.behavior.runCli(["init", "--from", "other", "--project", "demo"]);
     expect(result.exitCode).toBe(0);
     expect(result.stdout).toContain("removed 1 threadId");
-    expect(files.get("/ws/demo/.bb/team.yaml")).not.toContain("thr_old");
-    expect(files.get("/ws/demo/.bb/team/roles/dev.md")).toBe("Dev prompt");
+    expect(files.get("/ws/demo/.bb/teams/main.yaml")).not.toContain("thr_old");
+    expect(files.get("/ws/demo/.bb/teams/main/dev.md")).toBe("Dev prompt\n");
   });
 });
 
@@ -772,8 +865,8 @@ describe("@-меню «Team roles»", () => {
     await plugin(bb);
     const provider = harness.inspection.registrations.mentionProviders.find((p) => p.id === "team-roles")!;
     const items = await provider.search({ query: "dev", projectId: "proj_1" } as never);
-    expect(items.map((i) => i.id)).toEqual(["developer:thr_dev"]);
-    const resolved = await provider.resolve("developer:thr_dev");
+    expect(items.map((i) => i.id)).toEqual(["main:developer:thr_dev"]);
+    const resolved = await provider.resolve("main:developer:thr_dev");
     expect(resolved.context).toContain("@thread:thr_dev");
   });
 });
@@ -784,14 +877,15 @@ describe("RPC панели", () => {
     await plugin(bb);
     const added = (await harness.behavior.callRpc("taskAdd", {
       projectId: "proj_1",
+      team: "main",
       role: "developer",
       title: "Panel task",
       send: true,
     })) as { task: { id: number; status: string }; sentTo: string };
     expect(added.task.status).toBe("in-progress");
     expect(added.sentTo).toBe("thr_dev");
-    await harness.behavior.callRpc("taskUpdate", { projectId: "proj_1", id: 1, status: "review" });
-    await harness.behavior.callRpc("pause", { projectId: "proj_1", paused: true });
+    await harness.behavior.callRpc("taskUpdate", { projectId: "proj_1", team: "main", id: 1, status: "review" });
+    await harness.behavior.callRpc("pause", { projectId: "proj_1", team: "main", paused: true });
     const { snapshot } = (await harness.behavior.callRpc("snapshot", { projectId: "proj_1" })) as {
       snapshot: TeamSnapshot;
     };
@@ -799,7 +893,288 @@ describe("RPC панели", () => {
     expect(snapshot.leadRole).toBe("lead");
     expect(snapshot.roles.find((r) => r.name === "developer")!.tasks[0]!.status).toBe("review");
     await expect(
-      harness.behavior.callRpc("taskUpdate", { projectId: "proj_1", id: 1, status: "bogus" }),
+      harness.behavior.callRpc("taskUpdate", { projectId: "proj_1", team: "main", id: 1, status: "bogus" }),
     ).rejects.toThrow();
+  });
+});
+
+/* ──────────────────────── v0.3: несколько команд, роли, шаблоны ──────────────────────── */
+
+const CORE_YAML = `version: 1
+title: Core
+defaults:
+  environment: checkout
+roles:
+  - name: lead
+    title: Lead
+    provider: pi
+  - name: developer
+    title: Developer
+    provider: pi
+`;
+
+const QA_YAML = `version: 1
+roles:
+  - name: lead
+    title: QA lead
+    provider: pi
+  - name: tester
+    title: Tester
+    provider: pi
+`;
+
+function twoTeams(threads: Array<Partial<FakeThread> & { id: string }> = []) {
+  return makeHost({
+    config: null,
+    files: { "/ws/demo/.bb/teams/core.yaml": CORE_YAML, "/ws/demo/.bb/teams/qa.yaml": QA_YAML },
+    threads,
+  });
+}
+
+describe("несколько команд в проекте", () => {
+  it("без --team и вне треда команды — ошибка со списком команд", async () => {
+    const { bb, harness } = twoTeams();
+    await plugin(bb);
+    const result = await harness.behavior.runCli(["create", "--project", "demo"]);
+    expect(result.exitCode).not.toBe(0);
+    expect(result.stderr).toContain("core, qa");
+  });
+
+  it("create --team: свои метаданные, имя команды в названиях, своя секция", async () => {
+    const { bb, harness } = twoTeams();
+    await plugin(bb);
+    const result = await harness.behavior.runCli(["create", "--team", "qa", "--project", "demo"]);
+    expect(result.exitCode).toBe(0);
+    const spawns = harness.inspection.sdk.callsTo("threads.spawn").map((a) => a[0] as Record<string, unknown>);
+    expect(spawns.map((s) => s.title)).toEqual(["👥 qa · QA lead", "👥 qa · Tester"]);
+    expect((spawns[1]!.pluginMetadata as { teamName: string }).teamName).toBe("qa");
+    const sections = harness.inspection.sdk.callsTo("threadSections.create").map((a) => (a[0] as { name: string }).name);
+    expect(sections).toEqual(["Team · qa"]);
+  });
+
+  it("команда определяется по треду, из которого вызвана команда", async () => {
+    const { bb, harness } = twoTeams([
+      { id: "thr_ql", role: "lead", team: "qa" },
+      { id: "thr_qt", role: "tester", team: "qa", parentThreadId: "thr_ql" },
+      { id: "thr_cl", role: "lead", team: "core" },
+    ]);
+    await plugin(bb);
+    const result = await harness.behavior.runCli(["tell", "tester", "--message", "go"], {
+      projectId: "proj_1",
+      threadId: "thr_ql",
+    });
+    expect(result.exitCode).toBe(0);
+    expect(sendsOf(harness).map((s) => s.threadId)).toEqual(["thr_qt"]);
+  });
+
+  it("status без --team показывает все команды; list — сводка", async () => {
+    const { bb, harness } = twoTeams([{ id: "thr_cl", role: "lead", team: "core" }]);
+    await plugin(bb);
+    const status = await harness.behavior.runCli(["status", "--project", "demo"]);
+    expect(status.stdout).toContain('Team "core" — Core [versioned]');
+    expect(status.stdout).toContain('Team "qa"');
+    const list = JSON.parse((await harness.behavior.runCli(["list", "--project", "demo", "--json"])).stdout) as {
+      teams: Array<{ team: string; threads: number }>;
+    };
+    expect(list.teams).toEqual([
+      expect.objectContaining({ team: "core", threads: 1 }),
+      expect.objectContaining({ team: "qa", threads: 0 }),
+    ]);
+  });
+
+  it("пакеты и пауза раздельны по командам", async () => {
+    const { bb, harness } = twoTeams([
+      { id: "thr_cl", role: "lead", team: "core" },
+      { id: "thr_cd", role: "developer", team: "core", parentThreadId: "thr_cl" },
+      { id: "thr_ql", role: "lead", team: "qa" },
+      { id: "thr_qt", role: "tester", team: "qa", parentThreadId: "thr_ql" },
+    ]);
+    await plugin(bb);
+    await harness.behavior.runCli(["task", "add", "developer", "A", "--team", "core", "--project", "demo"]);
+    const qaTasks = await harness.behavior.runCli(["task", "list", "--team", "qa", "--project", "demo"]);
+    expect(qaTasks.stdout).toContain("No open work packages");
+    await harness.behavior.runCli(["pause", "--team", "qa", "--project", "demo"]);
+    const hook = harness.inspection.registrations.hooks["message.dispatch"]!;
+    const decide = (id: string) => hook({ thread: { id }, initiator: "agent", originPluginId: null } as never);
+    expect(await decide("thr_qt")).toMatchObject({ action: "wait" });
+    expect(await decide("thr_cd")).toEqual({ action: "proceed" });
+  });
+});
+
+describe("добавление исполнителя", () => {
+  it("add-role: роль дописывается в конфиг (комментарии целы) и создаётся тред", async () => {
+    const { bb, harness, files } = twoTeams([{ id: "thr_cl", role: "lead", team: "core" }]);
+    files.set("/ws/demo/.bb/teams/core.yaml", `# keep me\n${CORE_YAML}`);
+    await plugin(bb);
+    const result = await harness.behavior.runCli([
+      "add-role", "junior", "--provider", "pi", "--model", "qwen", "--team", "core", "--project", "demo",
+    ]);
+    expect(result.exitCode).toBe(0);
+    const config = files.get("/ws/demo/.bb/teams/core.yaml")!;
+    expect(config).toContain("# keep me");
+    expect(config).toContain("name: junior");
+    expect(config).toContain("model: qwen");
+    const spawns = harness.inspection.sdk.callsTo("threads.spawn").map((a) => a[0] as Record<string, unknown>);
+    // Только новая роль: руководитель уже есть, developer не трогается.
+    expect(spawns.map((s) => (s.pluginMetadata as { teamRole: string }).teamRole)).toEqual(["junior"]);
+    expect(spawns[0]!.parentThreadId).toBe("thr_cl");
+    expect(String(spawns[0]!.prompt)).toContain("junior developer");
+  });
+
+  it("существующий свободный тред становится исполнителем и переименовывается", async () => {
+    const { bb, harness, files, threads } = twoTeams([
+      { id: "thr_cl", role: "lead", team: "core" },
+      { id: "thr_free", title: "Old chat" },
+    ]);
+    await plugin(bb);
+    const free = (await harness.behavior.callRpc("freeThreads", { projectId: "proj_1" })) as {
+      threads: Array<{ id: string }>;
+    };
+    expect(free.threads.map((t) => t.id)).toEqual(["thr_free"]);
+    await harness.behavior.callRpc("roleAdd", {
+      projectId: "proj_1",
+      team: "core",
+      role: { name: "reviewer", kind: "reviewer", title: "Reviewer" },
+      threadId: "thr_free",
+    });
+    expect(files.get("/ws/demo/.bb/teams/core.yaml")).toContain("threadId: thr_free");
+    expect(threads.get("thr_free")!.role).toBe("reviewer");
+    expect(threads.get("thr_free")!.team).toBe("core");
+    expect(threads.get("thr_free")!.parentThreadId).toBe("thr_cl");
+    expect(threads.get("thr_free")!.title).toBe("👥 core · Reviewer");
+  });
+
+  it("тред другой команды не берётся; имя роли не дублируется", async () => {
+    const { bb, harness } = twoTeams([
+      { id: "thr_cl", role: "lead", team: "core" },
+      { id: "thr_ql", role: "lead", team: "qa" },
+    ]);
+    await plugin(bb);
+    const taken = await harness.behavior.runCli([
+      "add-role", "helper", "--thread", "thr_ql", "--team", "core", "--project", "demo",
+    ]);
+    expect(taken.exitCode).not.toBe(0);
+    expect(taken.stderr).toContain('team "qa"');
+    const dup = await harness.behavior.runCli(["add-role", "developer", "--team", "core", "--project", "demo"]);
+    expect(dup.exitCode).not.toBe(0);
+    expect(dup.stderr).toContain("developer-2");
+  });
+});
+
+describe("помощники (вложенные треды)", () => {
+  it("тред под тредом роли — помощник этой роли в status и снимке", async () => {
+    const { bb, harness } = makeHost({
+      threads: [...TEAM_THREADS, { id: "thr_sub", parentThreadId: "thr_dev", title: "Subtask" }],
+    });
+    await plugin(bb);
+    const { snapshot } = (await harness.behavior.callRpc("snapshot", { projectId: "proj_1" })) as {
+      snapshot: TeamSnapshot;
+    };
+    expect(snapshot.roles.find((r) => r.name === "developer")!.helpers.map((h) => h.threadId)).toEqual(["thr_sub"]);
+    const status = await harness.behavior.runCli(["status", "--project", "demo"]);
+    expect(status.stdout).toContain("1 helper thread(s)");
+    const free = (await harness.behavior.callRpc("freeThreads", { projectId: "proj_1" })) as { threads: unknown[] };
+    expect(free.threads).toHaveLength(0);
+  });
+
+  it("thread.created под тредом роли ставит метку помощника", async () => {
+    const { bb, harness, threads } = makeHost({
+      threads: [...TEAM_THREADS, { id: "thr_sub", parentThreadId: "thr_dev" }],
+    });
+    await plugin(bb);
+    await harness.behavior.emitThreadEvent("thread.created", {
+      thread: makeThreadResponse({ id: "thr_sub", projectId: "proj_1", parentThreadId: "thr_dev" }),
+    });
+    expect(threads.get("thr_sub")!.helperOf).toBe("developer");
+  });
+});
+
+describe("версионирование конфига", () => {
+  it("по умолчанию вне git; version on/off меняет .bb/teams/.gitignore", async () => {
+    const { bb, harness, files } = makeHost({ config: null });
+    await plugin(bb);
+    await harness.behavior.runCli(["init", "--team", "core", "--project", "demo"]);
+    expect(files.get("/ws/demo/.bb/teams/.gitignore")).toContain("/core.yaml");
+    const on = await harness.behavior.runCli(["version", "on", "--team", "core", "--project", "demo"]);
+    expect(on.exitCode).toBe(0);
+    expect(files.get("/ws/demo/.bb/teams/.gitignore") ?? "").not.toContain("/core.yaml");
+    await harness.behavior.runCli(["version", "off", "--team", "core", "--project", "demo"]);
+    expect(files.get("/ws/demo/.bb/teams/.gitignore")).toContain("/core/");
+  });
+
+  it("корневой .gitignore закрывает .bb — включить нельзя", async () => {
+    const { bb, harness } = makeHost({ config: null, files: { "/ws/demo/.gitignore": ".bb\n" } });
+    await plugin(bb);
+    await harness.behavior.runCli(["init", "--team", "core", "--project", "demo"]);
+    const on = await harness.behavior.runCli(["version", "on", "--team", "core", "--project", "demo"]);
+    expect(on.exitCode).toBe(1);
+    expect(on.stdout).toContain(".bb/*");
+  });
+});
+
+describe("шаблоны команд", () => {
+  it("CLI: save из видов, list, show, delete; встроенные защищены", async () => {
+    const { bb, harness } = makeHost();
+    await plugin(bb);
+    const saved = await harness.behavior.runCli(["template", "save", "pm", "--kinds", "manager,analyst", "--title", "PM"]);
+    expect(saved.exitCode).toBe(0);
+    const list = await harness.behavior.runCli(["template", "list"]);
+    expect(list.stdout).toContain("dev (built-in)");
+    expect(list.stdout).toContain("pm — PM: manager, analyst");
+    const show = await harness.behavior.runCli(["template", "show", "dev"]);
+    expect(show.stdout).toContain("prompt:");
+    const builtin = await harness.behavior.runCli(["template", "delete", "dev"]);
+    expect(builtin.exitCode).not.toBe(0);
+    expect((await harness.behavior.runCli(["template", "delete", "pm"])).exitCode).toBe(0);
+  });
+
+  it("сохранить текущую команду как шаблон и создать по нему новую", async () => {
+    const { bb, harness, files } = makeHost();
+    await plugin(bb);
+    const saved = await harness.behavior.runCli(["template", "save", "mine", "--from-team", "main", "--project", "demo"]);
+    expect(saved.exitCode).toBe(0);
+    const init = await harness.behavior.runCli(["init", "--team", "copy", "--template", "mine", "--project", "demo"]);
+    expect(init.exitCode).toBe(0);
+    const copied = files.get("/ws/demo/.bb/teams/copy.yaml")!;
+    expect(copied).toContain("name: developer");
+    expect(copied).toContain("notifyOn:");
+    expect(files.get("/ws/demo/.bb/teams/copy/developer.md")).toContain("Report to {{leadThreadRef}}.");
+  });
+
+  it("RPC teamCreate: выключенный провайдер блокирует, валидный — создаёт команду", async () => {
+    const { bb, harness, files } = makeHost({ config: null });
+    await plugin(bb);
+    await expect(
+      harness.behavior.callRpc("teamCreate", {
+        projectId: "proj_1",
+        team: "main",
+        title: "Main",
+        roles: [{ name: "lead", provider: "nope", lead: true }],
+        versioned: false,
+      }),
+    ).rejects.toThrow(/nope/);
+    expect(files.has("/ws/demo/.bb/teams/main.yaml")).toBe(false);
+    const created = (await harness.behavior.callRpc("teamCreate", {
+      projectId: "proj_1",
+      team: "main",
+      title: "Main",
+      roles: [
+        { name: "lead", kind: "lead", provider: "pi", lead: true },
+        { name: "junior", kind: "junior", provider: "pi" },
+      ],
+      versioned: true,
+    })) as { spawned: number };
+    expect(created.spawned).toBe(2);
+    expect(files.get("/ws/demo/.bb/teams/.gitignore") ?? "").not.toContain("/main.yaml");
+  });
+});
+
+describe("retitle", () => {
+  it("переименовывает треды по текущему формату", async () => {
+    const { bb, harness, threads } = makeHost({ threads: TEAM_THREADS, settings: { titleFormat: "[TM] {role}" } });
+    await plugin(bb);
+    const result = await harness.behavior.runCli(["retitle", "--project", "demo"]);
+    expect(result.stdout).toContain("3");
+    expect(threads.get("thr_dev")!.title).toBe("[TM] Developer");
   });
 });

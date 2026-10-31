@@ -22,8 +22,8 @@ export class TaskError extends Error {
   }
 }
 
-export function taskKey(projectId: string): string {
-  return `tasks:${projectId}`;
+export function taskKey(projectId: string, team: string): string {
+  return `tasks:${projectId}:${team}`;
 }
 
 export function emptyTaskStore(): TaskStore {

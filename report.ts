@@ -36,6 +36,7 @@ interface ReportLabels {
   notInConfig: string;
   ago: (age: string) => string;
   taskStatus: Record<string, string>;
+  helpers: (count: number) => string;
 }
 
 const LABELS: Record<Language, ReportLabels> = {
@@ -64,6 +65,7 @@ const LABELS: Record<Language, ReportLabels> = {
     lead: "lead",
     notInConfig: "not in config",
     ago: (age) => `${age} ago`,
+    helpers: (count) => `+${count} helper${count === 1 ? "" : "s"}`,
     taskStatus: {
       todo: "todo",
       "in-progress": "in progress",
@@ -97,6 +99,7 @@ const LABELS: Record<Language, ReportLabels> = {
     lead: "руководитель",
     notInConfig: "нет в конфиге",
     ago: (age) => `${age} назад`,
+    helpers: (count) => `+${count} помощн.`,
     taskStatus: {
       todo: "к выполнению",
       "in-progress": "в работе",
@@ -109,6 +112,13 @@ const LABELS: Record<Language, ReportLabels> = {
 
 export function reportLabels(lang: Language): ReportLabels {
   return LABELS[lang] ?? LABELS.en;
+}
+
+/** "demo" for the main team, "demo · qa" otherwise. */
+export function teamLabel(snapshot: Pick<TeamSnapshot, "projectName" | "team">): string {
+  return !snapshot.team || snapshot.team === "main"
+    ? snapshot.projectName
+    : `${snapshot.projectName} · ${snapshot.team}`;
 }
 
 export function escapeHtml(value: string): string {
@@ -177,7 +187,7 @@ export function renderReportMarkdown(
 ): string {
   const l = reportLabels(lang);
   const d = digest(snapshot);
-  const out: string[] = [`## ${l.title(snapshot.projectName)}`, ""];
+  const out: string[] = [`## ${l.title(teamLabel(snapshot))}`, ""];
   out.push(`_${l.summary(d.roleCount, d.running, d.errors.length, d.openTasks)}_`);
   if (snapshot.paused) out.push("", `> ${l.paused}`);
   if (!snapshot.configSource) out.push("", `> ${l.noConfig}`);
@@ -187,7 +197,7 @@ export function renderReportMarkdown(
   out.push("", `| ${l.role} | ${l.thread} | ${l.status} | ${l.provider} | ${l.activity} | ${l.task} |`);
   out.push("|---|---|---|---|---|---|");
   for (const role of snapshot.roles) {
-    const label = `${role.title}${role.lead ? ` (${l.lead})` : ""}${role.inConfig ? "" : ` (${l.notInConfig})`}`;
+    const label = `${role.title}${role.lead ? ` (${l.lead})` : ""}${role.inConfig ? "" : ` (${l.notInConfig})`}${role.helpers?.length ? ` ${l.helpers(role.helpers.length)}` : ""}`;
     const task = currentTask(role.tasks);
     const taskText = task ? `#${task.id} ${task.title} — ${l.taskStatus[task.status]}` : "—";
     if (role.threads.length === 0) {
@@ -234,7 +244,7 @@ function renderGraphSvg(snapshot: TeamSnapshot, lang: Language): string {
   for (const node of layout.nodes) {
     const color = TONE_COLOR[node.tone];
     const status = node.status ?? l.missing;
-    const sub = node.task ?? `${node.role} · ${status}`;
+    const sub = (node.task ?? `${node.role} · ${status}`) + (node.helpers > 0 ? ` ${l.helpers(node.helpers)}` : "");
     parts.push(
       `<g><title>${escapeHtml(`${node.title} — ${node.role} — ${status}${node.task ? ` — ${node.task}` : ""}`)}</title>` +
         `<rect x="${node.x}" y="${node.y}" width="${layout.nodeWidth}" height="${layout.nodeHeight}" rx="8" fill="var(--card)" stroke="${node.lead ? "var(--brand, var(--primary))" : "var(--border)"}"${node.tone === "missing" ? ' stroke-dasharray="4 3"' : ""}/>` +
@@ -285,6 +295,7 @@ export function renderReportHtml(
       const tags = [
         role.lead ? `<span class="tag lead">${escapeHtml(l.lead)}</span>` : "",
         role.inConfig ? "" : `<span class="tag">${escapeHtml(l.notInConfig)}</span>`,
+        role.helpers?.length ? `<span class="tag">${escapeHtml(l.helpers(role.helpers.length))}</span>` : "",
       ].join("");
       return (
         `<div class="card"><div class="head"><strong>${escapeHtml(role.title)}</strong>${tags}</div>` +
@@ -326,7 +337,7 @@ code{font-family:var(--font-mono);font-size:11px;color:var(--muted-foreground)}
 .task{font-size:12px}
 table{border-collapse:collapse;width:100%;font-size:12px}td{padding:4px 6px;border-bottom:1px solid var(--border)}
 </style></head><body><div class="wrap">
-<div><h2>${escapeHtml(l.title(snapshot.projectName))}</h2><div class="muted small">${escapeHtml(l.summary(d.roleCount, d.running, d.errors.length, d.openTasks))} · ${escapeHtml(l.generated(formatWhen(snapshot.generatedAtMs)))}</div></div>
+<div><h2>${escapeHtml(l.title(teamLabel(snapshot)))}</h2><div class="muted small">${escapeHtml(l.summary(d.roleCount, d.running, d.errors.length, d.openTasks))} · ${escapeHtml(l.generated(formatWhen(snapshot.generatedAtMs)))}</div></div>
 ${notes.join("\n")}
 ${graph ? `<div><h3>${escapeHtml(l.hierarchy)}</h3>${graph}</div>` : `<div class="muted">${escapeHtml(l.noThreads)}</div>`}
 <div><h3>${escapeHtml(l.roles)}</h3><div class="grid">${cards}</div></div>

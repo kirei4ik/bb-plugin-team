@@ -36,6 +36,8 @@ export interface SnapshotRole {
   provider: string | null;
   model: string | null;
   threads: SnapshotThread[];
+  /** Nested threads under the role's thread (spawned by the agent or by hand). */
+  helpers: SnapshotThread[];
   /** Open tasks (todo / in-progress / review), oldest first. */
   tasks: TeamTask[];
 }
@@ -43,6 +45,14 @@ export interface SnapshotRole {
 export interface TeamSnapshot {
   projectId: string;
   projectName: string;
+  team: string;
+  teamTitle: string | null;
+  /** Every team of the project (configs and threads), for the team switcher. */
+  teams: string[];
+  /** Config tracked by git; null when there is no config. */
+  versioned: boolean | null;
+  /** The root .gitignore ignores .bb/ entirely: versioning is impossible. */
+  versioningBlocked: boolean;
   configSource: string | null;
   configError: string | null;
   leadRole: string | null;
@@ -105,6 +115,7 @@ export interface GraphNode {
   tone: StatusTone;
   lead: boolean;
   task: string | null;
+  helpers: number;
   x: number;
   y: number;
 }
@@ -146,6 +157,7 @@ export function layoutHierarchy(snapshot: TeamSnapshot): GraphLayout {
       role: role.name,
       lead: role.lead,
       task: task ? `#${task.id} ${task.title}` : null,
+      helpers: role.helpers?.length ?? 0,
       x: 0,
       y: 0,
     };

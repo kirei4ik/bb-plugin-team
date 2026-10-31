@@ -85,10 +85,14 @@ roles:
     expect(lead.name).toBe("tester");
   });
 
-  it("reject: роль без промпта (если нет threadId)", () => {
+  it("роль без промпта допустима (встроенный промпт вида), prompt + promptFile — нет", () => {
+    const { roles } = semanticChecks(parseConfig("roles:\n  - name: lead\n    prompt: x\n  - name: dev\n"));
+    expect(roles.map((r) => r.name)).toEqual(["lead", "dev"]);
     expect(() =>
-      semanticChecks(parseConfig("roles:\n  - name: lead\n    prompt: x\n  - name: dev\n")),
-    ).toThrow(/dev/);
+      semanticChecks(
+        parseConfig("roles:\n  - name: lead\n    prompt: x\n    promptFile: a.md\n"),
+      ),
+    ).toThrow(/lead/);
   });
 
   it("привязываемому треду (threadId) промпт не нужен", () => {
@@ -273,7 +277,9 @@ describe("gitIgnoresBB", () => {
   it("распознаёт типичные паттерны .bb", () => {
     expect(gitIgnoresBB("node_modules\n.bb\n")).toBe(true);
     expect(gitIgnoresBB(".bb/\n")).toBe(true);
-    expect(gitIgnoresBB(".bb/team.yaml\n")).toBe(true);
+    expect(gitIgnoresBB(".bb/*\n")).toBe(true);
+    // A single file under .bb does not block versioning of .bb/teams/.
+    expect(gitIgnoresBB(".bb/team.yaml\n")).toBe(false);
     expect(gitIgnoresBB("# .bb comment\ndist/\n")).toBe(false);
     expect(gitIgnoresBB("")).toBe(false);
   });
@@ -537,7 +543,11 @@ describe("bb team CLI (поведение)", () => {
     const first = await harness.behavior.runCli(["init", "--project", "demo"]);
     if (first.exitCode !== 0) console.log("INIT STDERR:", first.stderr);
     expect(first.exitCode).toBe(0);
-    expect(written.map((w) => w.path)).toContain("/ws/demo/.bb/team.yaml");
+    expect(written.map((w) => w.path)).toContain("/ws/demo/.bb/teams/main.yaml");
+    expect(written.map((w) => w.path)).toContain("/ws/demo/.bb/teams/main/junior.md");
+    // По умолчанию конфиг не версионируется: .bb/teams/.gitignore со строками команды.
+    const ignore = written.find((w) => w.path === "/ws/demo/.bb/teams/.gitignore");
+    expect(ignore?.content).toContain("/main.yaml");
 
     // Второй вызов: файл появился — защита от перезаписи без --force.
     setConfigYaml(FAKE_CONFIG_YAML);
@@ -598,16 +608,16 @@ describe("bb team CLI (поведение)", () => {
     expect(result.stderr).toContain("--project");
   });
 
-  it("init: заметка, если .bb игнорируется git", async () => {
+  it("init: заметка, если корневой .gitignore закрывает весь .bb", async () => {
     const { bb, harness } = makeHost({ configYaml: null });
     await plugin(bb);
     const result = await harness.behavior.runCli(["init"], { cwd: "/ws/demo" });
     expect(result.exitCode).toBe(0);
-    expect(result.stdout).toContain("gitignored");
+    expect(result.stdout).toContain("cannot be versioned");
     const json = await harness.behavior.runCli(["init", "--force", "--json"], {
       cwd: "/ws/demo",
     });
-    expect((JSON.parse(json.stdout) as { gitignored: boolean }).gitignored).toBe(true);
+    expect((JSON.parse(json.stdout) as { versioningBlocked: boolean }).versioningBlocked).toBe(true);
   });
 
   it("spawn: одиночный сбой спавна автоматически повторяется", async () => {
