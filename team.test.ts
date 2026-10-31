@@ -896,6 +896,43 @@ describe("RPC панели", () => {
       harness.behavior.callRpc("taskUpdate", { projectId: "proj_1", team: "main", id: 1, status: "bogus" }),
     ).rejects.toThrow();
   });
+
+  it("сохраняет оба пакета при одновременном добавлении (issue #1)", async () => {
+    const { bb, harness } = makeHost({ threads: TEAM_THREADS });
+    await plugin(bb);
+    const results = await Promise.all([
+      harness.behavior.callRpc("taskAdd", {
+        projectId: "proj_1", team: "main", role: "developer",
+        title: "Review A", send: false,
+      }),
+      harness.behavior.callRpc("taskAdd", {
+        projectId: "proj_1", team: "main", role: "tester",
+        title: "Review B", send: false,
+      }),
+    ]);
+    const ids = results.map((r) => (r as { task: { id: number } }).task.id);
+    expect(new Set(ids).size).toBe(2);
+    const listing = await harness.behavior.runCli(["task", "list", "--all", "--project", "demo"]);
+    expect(listing.stdout).toContain("Review A");
+    expect(listing.stdout).toContain("Review B");
+  });
+
+  it("сохраняет оба обновления при параллельном taskUpdate (issue #1)", async () => {
+    const { bb, harness } = makeHost({ threads: TEAM_THREADS });
+    await plugin(bb);
+    await harness.behavior.callRpc("taskAdd", {
+      projectId: "proj_1", team: "main", role: "developer", title: "A", send: false,
+    });
+    await harness.behavior.callRpc("taskAdd", {
+      projectId: "proj_1", team: "main", role: "tester", title: "B", send: false,
+    });
+    await Promise.all([
+      harness.behavior.callRpc("taskUpdate", { projectId: "proj_1", team: "main", id: 1, status: "review" }),
+      harness.behavior.callRpc("taskUpdate", { projectId: "proj_1", team: "main", id: 2, status: "review" }),
+    ]);
+    const stored = await bb.storage.kv.get<{ tasks: Array<{ status: string }> }>("tasks:proj_1:main");
+    expect(stored!.tasks.map((task) => task.status)).toEqual(["review", "review"]);
+  });
 });
 
 /* ──────────────────────── v0.3: несколько команд, роли, шаблоны ──────────────────────── */

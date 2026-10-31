@@ -656,6 +656,37 @@ export default async function plugin(bb: BbPluginApi) {
     await bb.storage.kv.set(taskKey(scope.projectId, scope.team), store);
     publishChange(scope.projectId);
   };
+
+  // Serialize read-modify-write cycles per project/team. Two concurrent
+  // taskAdd/taskUpdate calls must not read the same snapshot and then have the
+  // last write clobber the first (issue #1); a single kv.set is not atomic
+  // across a read-modify-write.
+  const taskLocks = new Map<string, Promise<void>>();
+  const withTaskLock = async <T>(scope: Scope, fn: () => Promise<T>): Promise<T> => {
+    const key = taskKey(scope.projectId, scope.team);
+    const previous = taskLocks.get(key) ?? Promise.resolve();
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    const chain = previous.then(() => gate);
+    taskLocks.set(key, chain);
+    await previous;
+    try {
+      return await fn();
+    } finally {
+      release();
+      if (taskLocks.get(key) === chain) taskLocks.delete(key);
+    }
+  };
+  const mutateTasks = async <T>(
+    scope: Scope,
+    fn: (store: TaskStore) => { store: TaskStore; value: T },
+  ): Promise<T> =>
+    withTaskLock(scope, async () => {
+      const current = await readTasks(scope);
+      const { store, value } = fn(current);
+      await writeTasks(scope, store);
+      return value;
+    });
   const asCliError = (error: unknown): never => {
     if (error instanceof TaskError) throw new PluginCliError(error.message, { code: error.code });
     throw error;
@@ -797,24 +828,25 @@ export default async function plugin(bb: BbPluginApi) {
       const err = m.taskNoThread(input.role);
       throw new PluginCliError(err.message, { code: "role_not_found", hint: err.hint });
     }
-    let store = await readTasks(scope);
-    const busy = busyTasks(store, input.role);
+    const busy = busyTasks(await readTasks(scope), input.role);
     let task: TeamTask;
     try {
-      ({ store, task } = addTask(
-        store,
-        {
-          role: input.role,
-          title: input.title,
-          note: input.note,
-          status: input.send ? "in-progress" : "todo",
-        },
-        Date.now(),
-      ));
+      task = await mutateTasks(scope, (current) => {
+        const result = addTask(
+          current,
+          {
+            role: input.role,
+            title: input.title,
+            note: input.note,
+            status: input.send ? "in-progress" : "todo",
+          },
+          Date.now(),
+        );
+        return { store: result.store, value: result.task };
+      });
     } catch (error) {
       return asCliError(error);
     }
-    await writeTasks(scope, store);
     let sentTo: string | null = null;
     if (input.send && target) {
       const leadThread = lead && lead !== input.role ? rows.get(lead)?.[0]?.threadId : null;
@@ -841,10 +873,11 @@ export default async function plugin(bb: BbPluginApi) {
     id: number,
     patch: { status?: TaskStatus; title?: string; note?: string | null },
   ): Promise<{ task: TeamTask; previous: TeamTask; busy: TeamTask[] }> => {
-    const store = await readTasks(scope);
     try {
-      const result = updateTask(store, id, patch, Date.now());
-      await writeTasks(scope, result.store);
+      const result = await mutateTasks(scope, (current) => {
+        const updated = updateTask(current, id, patch, Date.now());
+        return { store: updated.store, value: updated };
+      });
       const busy =
         patch.status === "in-progress" ? busyTasks(result.store, result.task.role, result.task.id) : [];
       return { task: result.task, previous: result.previous, busy };
@@ -2199,13 +2232,14 @@ export default async function plugin(bb: BbPluginApi) {
             const { t, m } = await loadLang();
             const scope = await resolveScope(input.options, ctx, t);
             const id = parseTaskId(input.positionals.id!);
-            let next: TaskStore;
             try {
-              ({ store: next } = removeTask(await readTasks(scope), id));
+              await mutateTasks(scope, (current) => {
+                const result = removeTask(current, id);
+                return { store: result.store, value: undefined };
+              });
             } catch (error) {
               return asCliError(error);
             }
-            await writeTasks(scope, next);
             if (input.options.json) return { exitCode: 0, stdout: JSON.stringify({ ok: true, removed: id }) };
             return { exitCode: 0, stdout: m.taskRemoved(id) };
           },
