@@ -381,7 +381,7 @@ export const rpcContract = defineRpcContract({
         send: z.boolean(),
       })
       .strict(),
-    output: z.object({ task: taskSchema, sentTo: z.string().nullable() }),
+    output: z.object({ task: taskSchema, sentTo: z.string().nullable(), sendError: z.string().nullable() }),
   },
   taskUpdate: {
     input: z
@@ -660,28 +660,29 @@ export default async function plugin(bb: BbPluginApi) {
   // Serialize read-modify-write cycles per project/team. Two concurrent
   // taskAdd/taskUpdate calls must not read the same snapshot and then have the
   // last write clobber the first (issue #1); a single kv.set is not atomic
-  // across a read-modify-write.
-  const taskLocks = new Map<string, Promise<void>>();
-  const withTaskLock = async <T>(scope: Scope, fn: () => Promise<T>): Promise<T> => {
-    const key = taskKey(scope.projectId, scope.team);
-    const previous = taskLocks.get(key) ?? Promise.resolve();
+  // across a read-modify-write. The same lock also guards team config
+  // mutations (addRole, create) and pause state.
+  const scopeLocks = new Map<string, Promise<void>>();
+  const withScopeLock = async <T>(scope: Scope, fn: () => Promise<T>): Promise<T> => {
+    const key = `${scope.projectId}:${scope.team}`;
+    const previous = scopeLocks.get(key) ?? Promise.resolve();
     let release!: () => void;
     const gate = new Promise<void>((resolve) => (release = resolve));
     const chain = previous.then(() => gate);
-    taskLocks.set(key, chain);
+    scopeLocks.set(key, chain);
     await previous;
     try {
       return await fn();
     } finally {
       release();
-      if (taskLocks.get(key) === chain) taskLocks.delete(key);
+      if (scopeLocks.get(key) === chain) scopeLocks.delete(key);
     }
   };
   const mutateTasks = async <T>(
     scope: Scope,
     fn: (store: TaskStore) => { store: TaskStore; value: T },
   ): Promise<T> =>
-    withTaskLock(scope, async () => {
+    withScopeLock(scope, async () => {
       const current = await readTasks(scope);
       const { store, value } = fn(current);
       await writeTasks(scope, store);
@@ -816,7 +817,7 @@ export default async function plugin(bb: BbPluginApi) {
     t: Strings,
     m: Messages,
     senderThreadId?: string,
-  ): Promise<{ task: TeamTask; sentTo: string | null; busy: TeamTask[] }> => {
+  ): Promise<{ task: TeamTask; sentTo: string | null; busy: TeamTask[]; sendError: string | null }> => {
     const { loaded, rows, lead } = await teamContext(scope, t);
     const roles = new Set([...rows.keys(), ...(loaded?.config.roles.map((r) => r.name) ?? [])]);
     if (!roles.has(input.role)) {
@@ -828,10 +829,13 @@ export default async function plugin(bb: BbPluginApi) {
       const err = m.taskNoThread(input.role);
       throw new PluginCliError(err.message, { code: "role_not_found", hint: err.hint });
     }
-    const busy = busyTasks(await readTasks(scope), input.role);
     let task: TeamTask;
+    let busy: TeamTask[];
     try {
-      task = await mutateTasks(scope, (current) => {
+      // busy is computed under the lock so a concurrent add for the same role
+      // sees this package and the "one active package" note stays truthful.
+      ({ task, busy } = await mutateTasks(scope, (current) => {
+        const busy = busyTasks(current, input.role);
         const result = addTask(
           current,
           {
@@ -842,30 +846,37 @@ export default async function plugin(bb: BbPluginApi) {
           },
           Date.now(),
         );
-        return { store: result.store, value: result.task };
-      });
+        return { store: result.store, value: { task: result.task, busy } };
+      }));
     } catch (error) {
       return asCliError(error);
     }
     let sentTo: string | null = null;
+    let sendError: string | null = null;
     if (input.send && target) {
       const leadThread = lead && lead !== input.role ? rows.get(lead)?.[0]?.threadId : null;
-      await bb.sdk.threads.send({
-        originPluginId: bb.pluginId,
-        ...(senderThreadId && senderThreadId !== target.threadId ? { senderThreadId } : {}),
-        threadId: target.threadId,
-        mode: "auto",
-        input: [
-          {
-            type: "text",
-            text: m.taskBody(task.id, task.title, task.note, leadThread ? `@thread:${leadThread}` : null),
-            mentions: [],
-          },
-        ],
-      });
-      sentTo = target.threadId;
+      try {
+        await bb.sdk.threads.send({
+          originPluginId: bb.pluginId,
+          ...(senderThreadId && senderThreadId !== target.threadId ? { senderThreadId } : {}),
+          threadId: target.threadId,
+          mode: "auto",
+          input: [
+            {
+              type: "text",
+              text: m.taskBody(task.id, task.title, task.note, leadThread ? `@thread:${leadThread}` : null),
+              mentions: [],
+            },
+          ],
+        });
+        sentTo = target.threadId;
+      } catch (error) {
+        // The package is already persisted; report the partial state instead
+        // of failing the whole command (which would prompt a duplicate retry).
+        sendError = (error as Error).message;
+      }
     }
-    return { task, sentTo, busy };
+    return { task, sentTo, busy, sendError };
   };
 
   const updatePackage = async (
@@ -1153,10 +1164,6 @@ export default async function plugin(bb: BbPluginApi) {
     spawn: boolean,
   ) => {
     const loaded = await readTeamConfig(bb, scope, scope.team, t);
-    if (loaded.config.roles.some((role) => role.name === input.name)) {
-      const err = m.roleExists(input.name, scope.team);
-      throw new PluginCliError(err.message, { code: "role_exists", hint: err.hint });
-    }
     const scan = await scanTeamThreads(bb, scope.projectId);
     if (input.threadId) await adoptableThread(scope, input.name, input.threadId, scan, t, m);
     if (input.provider && !input.threadId) await validateProviders(bb, [input], t);
@@ -1178,24 +1185,34 @@ export default async function plugin(bb: BbPluginApi) {
       entry.promptFile = rel;
     }
 
-    const raw = (await readFileOrNull(bb, scope, loaded.source)) ?? "";
-    let rewritten = false;
-    let next: string;
-    if (loaded.source.endsWith(".json")) {
-      const parsed = JSON.parse(raw) as { roles: unknown[] };
-      parsed.roles.push(entry);
-      next = `${JSON.stringify(parsed, null, 2)}\n`;
-    } else {
-      const appended = appendRoleToYaml(raw, entry);
-      if (appended) {
-        next = appended;
-      } else {
-        rewritten = true;
-        next = dumpYaml({ ...loaded.config, roles: [...loaded.config.roles, entry] }, { lineWidth: 120 });
+    // The exists-check and the append must be atomic: two concurrent roleAdd
+    // calls would otherwise both pass the check and one role would be lost.
+    const rewritten = await withScopeLock(scope, async () => {
+      const current = await readTeamConfig(bb, scope, scope.team, t);
+      if (current.config.roles.some((role) => role.name === input.name)) {
+        const err = m.roleExists(input.name, scope.team);
+        throw new PluginCliError(err.message, { code: "role_exists", hint: err.hint });
       }
-    }
-    core.parseTeamConfig(next, loaded.source, t); // never write a config that does not parse
-    await writeWorkspaceFile(bb, scope, loaded.source, next);
+      const raw = (await readFileOrNull(bb, scope, current.source)) ?? "";
+      let rewritten = false;
+      let next: string;
+      if (current.source.endsWith(".json")) {
+        const parsed = JSON.parse(raw) as { roles: unknown[] };
+        parsed.roles.push(entry);
+        next = `${JSON.stringify(parsed, null, 2)}\n`;
+      } else {
+        const appended = appendRoleToYaml(raw, entry);
+        if (appended) {
+          next = appended;
+        } else {
+          rewritten = true;
+          next = dumpYaml({ ...current.config, roles: [...current.config.roles, entry] }, { lineWidth: 120 });
+        }
+      }
+      core.parseTeamConfig(next, current.source, t); // never write a config that does not parse
+      await writeWorkspaceFile(bb, scope, current.source, next);
+      return rewritten;
+    });
     let threadId: string | null = null;
     if (spawn) {
       const result = await spawnTeam(scope, lang, t, m, { only: [input.name] });
@@ -1214,21 +1231,26 @@ export default async function plugin(bb: BbPluginApi) {
     t: Strings,
     m: Messages,
   ) => {
-    const teams = await listConfiguredTeams(bb, scope);
-    if (teams.includes(scope.team) && !options.force) {
-      const err = m.teamExists(scope.team);
-      throw new PluginCliError(err.message, { code: "team_exists", hint: err.hint });
-    }
-    await validateProviders(bb, template.roles.filter((r) => r.enabled !== false), t);
-    // Without a checkout environment the roles start in the project default one.
-    const checkouts = await bb.sdk.environments
-      .list({ projectId: scope.projectId, environmentProviderId: "project-checkout" })
-      .catch(() => []);
-    const files = teamFilesFromTemplate(lang, template, scope.team, {
-      environment: checkouts.length > 0 ? "checkout" : "default",
+    // The exists-check and the file writes must be atomic: two concurrent
+    // creates would otherwise both pass the check and write/spawn twice.
+    const written = await withScopeLock(scope, async () => {
+      const teams = await listConfiguredTeams(bb, scope);
+      if (teams.includes(scope.team) && !options.force) {
+        const err = m.teamExists(scope.team);
+        throw new PluginCliError(err.message, { code: "team_exists", hint: err.hint });
+      }
+      await validateProviders(bb, template.roles.filter((r) => r.enabled !== false), t);
+      // Without a checkout environment the roles start in the project default one.
+      const checkouts = await bb.sdk.environments
+        .list({ projectId: scope.projectId, environmentProviderId: "project-checkout" })
+        .catch(() => []);
+      const files = teamFilesFromTemplate(lang, template, scope.team, {
+        environment: checkouts.length > 0 ? "checkout" : "default",
+      });
+      const written = await writeTeamFiles(scope, files, options.force, t);
+      await setVersioned(scope, false, options.versioned);
+      return written;
     });
-    const written = await writeTeamFiles(scope, files, options.force, t);
-    await setVersioned(scope, false, options.versioned);
     const result = options.spawn ? await spawnTeam(scope, lang, t, m) : null;
     return { written, result };
   };
@@ -1668,7 +1690,7 @@ export default async function plugin(bb: BbPluginApi) {
       const { t, m } = await loadLang();
       const scope = await scopeFor(projectId, team, t);
       const result = await addPackage(scope, { role, title, note: note ?? null, send }, t, m);
-      return { task: result.task, sentTo: result.sentTo };
+      return { task: result.task, sentTo: result.sentTo, sendError: result.sendError };
     },
     async taskUpdate({ projectId, team, id, status }) {
       const { t } = await loadLang();
@@ -1792,17 +1814,21 @@ export default async function plugin(bb: BbPluginApi) {
               templateId = input.options.template ?? "dev";
               template = await getTemplate(templateId, lang, m);
             }
-            const teams = await listConfiguredTeams(bb, workspace);
-            if (teams.includes(team) && !input.options.force) {
-              const err = m.teamExists(team);
-              throw new PluginCliError(err.message, { code: "team_exists", hint: err.hint });
-            }
-            const files = teamFilesFromTemplate(lang, template, team, {
-              vars,
-              ...(defaults ? { defaults: defaults as Record<string, unknown> } : {}),
+            const written = await withScopeLock(scope, async () => {
+              const teams = await listConfiguredTeams(bb, workspace);
+              if (teams.includes(team) && !input.options.force) {
+                const err = m.teamExists(team);
+                throw new PluginCliError(err.message, { code: "team_exists", hint: err.hint });
+              }
+              const files = teamFilesFromTemplate(lang, template, team, {
+                vars,
+                ...(defaults ? { defaults: defaults as Record<string, unknown> } : {}),
+              });
+              const written = await writeTeamFiles(scope, files, Boolean(input.options.force), t);
+              await setVersioned(scope, false, Boolean(input.options.versioned));
+              return written;
             });
-            const written = await writeTeamFiles(scope, files, Boolean(input.options.force), t);
-            const version = await setVersioned(scope, false, Boolean(input.options.versioned));
+            const version = await versionState(scope, false);
             if (input.options.json) {
               return {
                 exitCode: 0,
@@ -2132,6 +2158,7 @@ export default async function plugin(bb: BbPluginApi) {
                   team: scope.team,
                   task: result.task,
                   sentTo: result.sentTo,
+                  sendError: result.sendError,
                   busy: result.busy.map((task) => task.id),
                 }),
               };
@@ -2139,6 +2166,7 @@ export default async function plugin(bb: BbPluginApi) {
             const out = [m.taskAdded(result.task.id, result.task.role, result.task.title)];
             out.push(`  ${m.taskStatusLine(result.task.status)}`);
             if (result.sentTo) out.push(`  ${m.taskSent(result.task.role, result.sentTo)}`);
+            if (result.sendError) out.push(`  ${m.taskSendFailed(result.task.id, result.sendError)}`);
             if (result.busy.length > 0) {
               out.push(`  ${m.taskBusy(result.task.role, result.busy.map((task) => `#${task.id}`).join(", "))}`);
             }

@@ -10,6 +10,7 @@ export interface Messages {
 
   taskAdded: (id: number, role: string, title: string) => string;
   taskSent: (role: string, threadId: string) => string;
+  taskSendFailed: (id: number, error: string) => string;
   taskUpdated: (id: number, from: string, to: string) => string;
   taskRemoved: (id: number) => string;
   taskListEmpty: string;
@@ -109,6 +110,7 @@ const EN: Messages = {
 
   taskAdded: (id, role, title) => `task #${id} → ${role}: ${title}`,
   taskSent: (role, threadId) => `sent to ${role} — @thread:${threadId}`,
+  taskSendFailed: (id, error) => `package #${id} created, but sending it to the role failed: ${error}`,
   taskUpdated: (id, from, to) => `task #${id}: ${from} → ${to}`,
   taskRemoved: (id) => `task #${id} removed`,
   taskListEmpty: "No open work packages. Add one: bb team task add <role> <title>",
@@ -277,6 +279,7 @@ const RU: Messages = {
 
   taskAdded: (id, role, title) => `пакет #${id} → ${role}: ${title}`,
   taskSent: (role, threadId) => `отправлен ${role} — @thread:${threadId}`,
+  taskSendFailed: (id, error) => `пакет #${id} создан, но отправить его роли не удалось: ${error}`,
   taskUpdated: (id, from, to) => `пакет #${id}: ${from} → ${to}`,
   taskRemoved: (id) => `пакет #${id} удалён`,
   taskListEmpty: "Открытых пакетов нет. Добавить: bb team task add <роль> <название>",

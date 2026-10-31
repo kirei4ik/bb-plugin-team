@@ -78,6 +78,7 @@ function makeHost(
     threads?: Array<Partial<FakeThread> & { id: string }>;
     files?: Record<string, string>;
     settings?: Record<string, unknown>;
+    sendError?: string;
   } = {},
 ) {
   const files = new Map<string, string>(Object.entries(opts.files ?? {}));
@@ -222,7 +223,10 @@ function makeHost(
           threads.set(thread.id, thread);
           return toResponse(thread);
         },
-        send: async () => ({ ok: true, delivery: "sent" }),
+        send: async () => {
+          if (opts.sendError) throw new Error(opts.sendError);
+          return { ok: true, delivery: "sent" };
+        },
         update: async ({
           threadId,
           parentThreadId,
@@ -933,6 +937,33 @@ describe("RPC панели", () => {
     const stored = await bb.storage.kv.get<{ tasks: Array<{ status: string }> }>("tasks:proj_1:main");
     expect(stored!.tasks.map((task) => task.status)).toEqual(["review", "review"]);
   });
+
+  it("два одновременных --send одной роли: предупреждение busy у второго (B8)", async () => {
+    const { bb, harness } = makeHost({ threads: TEAM_THREADS });
+    await plugin(bb);
+    const results = await Promise.all([
+      harness.behavior.runCli(["task", "add", "developer", "One", "--send", "--project", "demo"]),
+      harness.behavior.runCli(["task", "add", "developer", "Two", "--send", "--project", "demo"]),
+    ]);
+    const busyWarnings = results.filter((r) => r.stdout.includes("one active package"));
+    expect(busyWarnings).toHaveLength(1);
+    const listing = await harness.behavior.runCli(["task", "list", "--project", "demo"]);
+    expect(listing.stdout).toContain("One");
+    expect(listing.stdout).toContain("Two");
+  });
+
+  it("send упал — пакет создан, sendError в ответе (B6)", async () => {
+    const { bb, harness } = makeHost({ threads: TEAM_THREADS, sendError: "thread in error state" });
+    await plugin(bb);
+    const result = (await harness.behavior.callRpc("taskAdd", {
+      projectId: "proj_1", team: "main", role: "developer", title: "Broken send", send: true,
+    })) as { task: { status: string }; sentTo: string | null; sendError: string | null };
+    expect(result.task.status).toBe("in-progress");
+    expect(result.sentTo).toBeNull();
+    expect(result.sendError).toContain("thread in error state");
+    const listing = await harness.behavior.runCli(["task", "list", "--project", "demo"]);
+    expect(listing.stdout).toContain("Broken send");
+  });
 });
 
 /* ──────────────────────── v0.3: несколько команд, роли, шаблоны ──────────────────────── */
@@ -1095,6 +1126,60 @@ describe("добавление исполнителя", () => {
     const dup = await harness.behavior.runCli(["add-role", "developer", "--team", "core", "--project", "demo"]);
     expect(dup.exitCode).not.toBe(0);
     expect(dup.stderr).toContain("developer-2");
+  });
+
+  it("два одновременных roleAdd не теряют роль (A1)", async () => {
+    const { bb, harness, files } = twoTeams([{ id: "thr_cl", role: "lead", team: "core" }]);
+    await plugin(bb);
+    await Promise.all([
+      harness.behavior.callRpc("roleAdd", {
+        projectId: "proj_1", team: "core",
+        role: { name: "junior", kind: "junior", title: "Junior" },
+      }),
+      harness.behavior.callRpc("roleAdd", {
+        projectId: "proj_1", team: "core",
+        role: { name: "reviewer", kind: "reviewer", title: "Reviewer" },
+      }),
+    ]);
+    const config = files.get("/ws/demo/.bb/teams/core.yaml")!;
+    expect(config).toContain("name: junior");
+    expect(config).toContain("name: reviewer");
+    const spawns = harness.inspection.sdk
+      .callsTo("threads.spawn")
+      .map((a) => (a[0] as { pluginMetadata: { teamRole: string } }).pluginMetadata.teamRole);
+    expect(spawns.filter((r) => r === "junior")).toHaveLength(1);
+    expect(spawns.filter((r) => r === "reviewer")).toHaveLength(1);
+  });
+
+  it("два одновременных teamCreate — второй получает team_exists (A2)", async () => {
+    const { bb, harness } = makeHost({ config: null, files: { "/ws/demo/.gitignore": ".bb\n" } });
+    await plugin(bb);
+    const results = await Promise.allSettled([
+      harness.behavior.callRpc("teamCreate", {
+        projectId: "proj_1", team: "dev", title: "Dev",
+        roles: [
+          { name: "lead", kind: "lead", provider: "pi", lead: true },
+          { name: "developer", kind: "developer", provider: "pi" },
+        ],
+        versioned: false,
+      }),
+      harness.behavior.callRpc("teamCreate", {
+        projectId: "proj_1", team: "dev", title: "Dev",
+        roles: [
+          { name: "lead", kind: "lead", provider: "pi", lead: true },
+          { name: "developer", kind: "developer", provider: "pi" },
+        ],
+        versioned: false,
+      }),
+    ]);
+    const ok = results.filter((r) => r.status === "fulfilled");
+    const failed = results.filter((r) => r.status === "rejected");
+    expect(ok).toHaveLength(1);
+    expect(failed).toHaveLength(1);
+    const reason = (failed[0] as PromiseRejectedResult).reason as Error;
+    expect(reason.message).toContain("already has a config");
+    // Треды ролей созданы ровно один раз (lead + developer).
+    expect(harness.inspection.sdk.callsTo("threads.spawn")).toHaveLength(2);
   });
 });
 
