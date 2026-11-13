@@ -8,17 +8,21 @@ export interface Messages {
   reportShow: string;
   reportOutRequired: { message: string; hint: string };
 
-  taskAdded: (id: number, role: string, title: string) => string;
+  taskAdded: (id: number | string, role: string, title: string) => string;
   taskSent: (role: string, threadId: string) => string;
-  taskSendFailed: (id: number, error: string) => string;
-  taskUpdated: (id: number, from: string, to: string) => string;
-  taskRemoved: (id: number) => string;
+  taskSendFailed: (id: number | string, error: string) => string;
+  taskUpdated: (id: number | string, from: string, to: string) => string;
+  taskRemoved: (id: number | string) => string;
   taskListEmpty: string;
   taskListTitle: (project: string) => string;
   taskBusy: (role: string, ids: string) => string;
   taskRoleUnknown: (role: string) => { message: string; hint: string };
   taskNoThread: (role: string) => { message: string; hint: string };
-  taskBody: (id: number, title: string, note: string | null, leadRef: string | null) => string;
+  reviewSubmissionRequired: () => { message: string; hint: string };
+  acceptanceReasonRequired: () => { message: string; hint: string };
+  returnReasonRequired: () => { message: string; hint: string };
+  submissionConflict: (expected: string, current: string) => { message: string; hint: string };
+  taskBody: (id: number | string, title: string, note: string | null, leadRef: string | null) => string;
   taskStatusLine: (status: string) => string;
 
   doctorTitle: (project: string) => string;
@@ -125,14 +129,32 @@ const EN: Messages = {
     message: `role "${role}" has no team thread to send the package to`,
     hint: "Spawn the team first: bb team create — or add the task without --send",
   }),
+  reviewSubmissionRequired: () => ({
+    message:
+      "this step needs a grounded review report: attach --review JSON with result, artifacts, actual checks and remaining problems (each check is {what,result} or {what,notApplicable} with a justification — never both)",
+    hint: 'bb team task update <id> --status review --review \'{"result":"…","artifacts":[…],"checks":[{"what":"…","result":"…"}],"problems":[…]}\' — presence of text is not a passed check; a failed or not-run check stays a failure in its result',
+  }),
+  acceptanceReasonRequired: () => ({
+    message:
+      "accepting a package (done) needs grounds: a grounded review report on the task, and your reason stating what you checked and why it is enough; the manual path always requires a reason too",
+    hint: "bb team task done <id> --reason <why you accept> — or return it: bb team task update <id> --status todo --return-reason <concrete remark>",
+  }),
+  returnReasonRequired: () => ({
+    message: "returning a package from review needs a concrete remark for the executor (the manual path needs it too)",
+    hint: "bb team task update <id> --status todo --return-reason <what exactly must change>",
+  }),
+  submissionConflict: (expected, current) => ({
+    message: `the review report changed since it was reviewed: expected submission "${expected}", the task now carries ${current}; nothing was changed`,
+    hint: "Re-read the current report (bb team task list --json shows the submission id), then accept or return with the new id in --expected-submission",
+  }),
   taskBody: (id, title, note, leadRef) =>
     [
       `Work package #${id}: ${title}`,
       ...(note ? ["", note] : []),
       "",
       leadRef
-        ? `When it is done: bb team task update ${id} --status review — then report to the lead ${leadRef}. Only the lead accepts packages (done).`
-        : `When it is done: bb team task update ${id} --status review — then report back.`,
+        ? `When it is done: bb team task update ${id} --status review --review '<json: result, artifacts, checks[{what,result}|{what,notApplicable}], problems>' — then report to the lead role using bb team tell ${leadRef} --message-file -. Only the lead accepts packages (done).`
+        : `When it is done: bb team task update ${id} --status review --review '<json: result, artifacts, checks[{what,result}|{what,notApplicable}], problems>' — then report back.`,
     ].join("\n"),
   taskStatusLine: (status) => `status: ${status}`,
 
@@ -181,10 +203,10 @@ const EN: Messages = {
       "",
       "---",
       `Handoff: you replace the previous thread of this role, ${oldRef}.`,
-      ...(output ? ["Its last report:", "", output] : ["It left no final report."]),
+      ...(output ? ["Saved task checkpoint:", "", output] : ["It left no final report."]),
       ...(tasks ? ["", "Open work packages of the role:", tasks] : []),
       "",
-      "Read the previous thread if you need more context, then confirm readiness.",
+      "Continue from the saved task checkpoint. Address roles with bb team tell <role>; do not reload the previous conversation.",
     ].join("\n"),
   replaceDone: (role, oldId, newId) => `${role}: @thread:${oldId} → @thread:${newId}`,
   replaceArchived: (id) => `old thread archived: ${id}`,
@@ -193,7 +215,7 @@ const EN: Messages = {
   replaceConfigNote: (role, id) =>
     `note: .bb/team.yaml binds role "${role}" to threadId ${id} — update or remove that line`,
   replaceLeadNotice: (role, oldRef, newRef) =>
-    `Team change: role "${role}" moved from ${oldRef} to a fresh thread ${newRef} (bb team replace). Send its next packages there.`,
+    `Team change: role "${role}" moved from ${oldRef} to a fresh thread ${newRef} (bb team replace). Address the role using bb team tell <role>; it resolves the current session.`,
   replacePlan: (role, oldId) =>
     `would replace ${role}: ${oldId} → new thread (handoff: last report + open packages)`,
 
@@ -294,14 +316,32 @@ const RU: Messages = {
     message: `у роли "${role}" нет треда, чтобы отправить пакет`,
     hint: "Сначала создайте команду: bb team create — или добавьте пакет без --send",
   }),
+  reviewSubmissionRequired: () => ({
+    message:
+      "этот шаг требует содержательного отчёта ревью: приложите --review JSON с результатом, артефактами, фактическими проверками и оставшимися проблемами (каждая проверка — {what,result} или {what,notApplicable} с обоснованием, но не оба сразу)",
+    hint: 'bb team task update <id> --status review --review \'{"result":"…","artifacts":[…],"checks":[{"what":"…","result":"…"}],"problems":[…]}\' — наличие текста не равносильно пройденной проверке; проваленная или невыполнявшаяся проверка остаётся провалом в result',
+  }),
+  acceptanceReasonRequired: () => ({
+    message:
+      "приёмка пакета (done) требует оснований: содержательный отчёт ревью у задачи и ваша причина — что именно проверено и почему этого достаточно; для ручного пути причина также обязательна",
+    hint: "bb team task done <id> --reason <почему принимаете> — или верните: bb team task update <id> --status todo --return-reason <конкретное замечание>",
+  }),
+  returnReasonRequired: () => ({
+    message: "возврат пакета из review требует конкретного замечания исполнителю (для ручного пути тоже)",
+    hint: "bb team task update <id> --status todo --return-reason <что именно нужно исправить>",
+  }),
+  submissionConflict: (expected, current) => ({
+    message: `отчёт ревью изменился с момента просмотра: ожидался submission «${expected}», в задаче сейчас ${current}; ничего не изменено`,
+    hint: "Перечитайте текущий отчёт (id submission виден в bb team task list --json) и повторите приёмку/возврат с новым id в --expected-submission",
+  }),
   taskBody: (id, title, note, leadRef) =>
     [
       `Пакет работ #${id}: ${title}`,
       ...(note ? ["", note] : []),
       "",
       leadRef
-        ? `По завершении: bb team task update ${id} --status review — и отчёт руководителю ${leadRef}. Принимает пакет (done) только руководитель.`
-        : `По завершении: bb team task update ${id} --status review — и отчёт.`,
+        ? `По завершении: bb team task update ${id} --status review --review '<json: result, artifacts, checks[{what,result}|{what,notApplicable}], problems>' — и отчёт роли руководителя через bb team tell ${leadRef} --message-file -. Принимает пакет (done) только руководитель.`
+        : `По завершении: bb team task update ${id} --status review --review '<json: result, artifacts, checks[{what,result}|{what,notApplicable}], problems>' — и отчёт.`,
     ].join("\n"),
   taskStatusLine: (status) => `статус: ${status}`,
 
@@ -350,10 +390,10 @@ const RU: Messages = {
       "",
       "---",
       `Передача дел: ты заменяешь предыдущий тред этой роли, ${oldRef}.`,
-      ...(output ? ["Его последний отчёт:", "", output] : ["Финального отчёта он не оставил."]),
+      ...(output ? ["Сохранённый checkpoint задачи:", "", output] : ["Финального отчёта он не оставил."]),
       ...(tasks ? ["", "Открытые пакеты роли:", tasks] : []),
       "",
-      "Если нужно больше контекста — прочитай предыдущий тред, затем подтверди готовность.",
+      "Продолжай по checkpoint задачи. Адресуй сообщения через bb team tell <роль>; прежнюю беседу не загружай.",
     ].join("\n"),
   replaceDone: (role, oldId, newId) => `${role}: @thread:${oldId} → @thread:${newId}`,
   replaceArchived: (id) => `старый тред архивирован: ${id}`,
@@ -362,7 +402,7 @@ const RU: Messages = {
   replaceConfigNote: (role, id) =>
     `заметка: .bb/team.yaml привязывает роль "${role}" к threadId ${id} — обновите или уберите строку`,
   replaceLeadNotice: (role, oldRef, newRef) =>
-    `Изменение команды: роль "${role}" переехала из ${oldRef} в новый тред ${newRef} (bb team replace). Следующие пакеты отправляй туда.`,
+    `Изменение команды: роль "${role}" переехала из ${oldRef} в новый тред ${newRef} (bb team replace). Сообщения отправляй через bb team tell <роль>: он определяет актуальную сессию.`,
   replacePlan: (role, oldId) =>
     `заменит ${role}: ${oldId} → новый тред (передача: последний отчёт + открытые пакеты)`,
 
@@ -437,6 +477,71 @@ const RU: Messages = {
   overviewHostOffline: (host) => `Машина «${host}» не в сети — треды команды там не запустятся`,
   overviewUnreadable: (error) => `Папка проекта недоступна: ${error}`,
 };
+
+const EN_LEAD_POLICY = `Autonomous lead operating rules (keep after session replacement):
+- Accept an ordinary goal, define the minimal sufficient solution for it, and run the work through the project's selected tracker by default. Do not ask "should this go to Beads?" and do not maintain a second tracker.
+- Plan work as small tracked packages. For each one set acceptance criteria, dependencies, order, and an assignee role. Create epics only when they genuinely group substantial work; never force an epic for trivial tasks.
+- Delegate by minimal cost: first try a ready-made command or script (no LLM); then give a narrow simple errand to the junior or an existing helper; only genuinely complex work goes to a stronger role. Reuse an existing helper for one-off errands, use the junior with a replaceable session for recurring simple work, and never keep a permanently thinking observer. Do not do executors' work yourself.
+- Make technical decisions yourself and record the reasons (decisions, checkpoint, or bb team tell lead). Choose models only from the team's approved roster; no arbitrary fallbacks and no unapproved extra paid calls. Do not promise features that are not implemented.
+- Verify by evidence, not by the presence of text: accept a package only with a grounded review report — result/artifacts, actual checks with results or a justified not-applicable, remaining problems. Filled-in fields are not a passed check; a model's self-report is not a test result.
+- Resource limits are enforced in code across lead, workers, helpers and retries. A failed attempt needs a concrete changed approach; do not bypass a hold with another card/session or blind model cycling. Check Team resources/report. Quota handoff only uses approved independent backups and a fresh verified checkpoint; without it, stop and explain. Context is not cumulative spend, unknown usage is not zero, and provider-internal retries/cost may be unavailable.
+- Accept or return concretely: accept with your reason (bb team task done <id> --reason … --expected-submission <report-id>), or return the package with a concrete remark (bb team task update <id> --status in-progress --return-reason … --expected-submission <report-id>). Executors never accept packages; your decision and the return reason stay recorded on the task. Escalate to the user only product priorities, scope boundaries, and significant costs.
+- A request to discuss or plan does not grant permission to write code. An instruction to implement does; preserve existing authorization and do not ask for it again.
+- Keep a coordination task linked to your session with a checkpoint when managing work. Reuse a suitable existing lead task or epic; do not create duplicate coordination cards.
+- Before a handoff or session rotation, save a substantive checkpoint with bb team checkpoint <id> --file <absolute-json-path>.`;
+
+const RU_LEAD_POLICY = `Правила автономного руководителя (сохраняй после замены сессии):
+- Принимай обычную цель, определяй минимально достаточное решение и по умолчанию веди работу в выбранном для проекта трекере. Не спрашивай «в Beads?» и не поддерживай второй трекер.
+- Планируй работу небольшими пакетами с учётом. Для каждого пакета задавай критерии приёмки, зависимости, порядок и роль-исполнителя. Создавай эпики только когда они действительно объединяют существенную работу; никогда не требуй эпика для мелочей.
+- Делегируй по минимальной достаточности: сначала готовая команда или скрипт без LLM; узкое простое поручение — джуну или существующему helper; действительно сложное — сильной роли. Для разовых поручений используй существующего helper, для повторяющихся простых — джуна со сменяемой сессией; не держи постоянно думающего наблюдателя. Работу исполнителей не делай сам.
+- Технические решения принимай сам и фиксируй причины (decisions, checkpoint или сообщение роли lead). Выбирай модели только из утверждённого roster команды; никаких произвольных fallback и несогласованных дополнительных платных вызовов. Не обещай ещё не реализованные возможности.
+- Проверяй по доказательствам, а не по наличию текста: принимай пакет только с содержательным отчётом ревью — результат/артефакты, фактические проверки с результатами или обоснованный not-applicable, оставшиеся проблемы. Заполненные поля — не прошедшая проверка; самоотчёт модели — не результат теста.
+- Лимиты ресурсов проверяет код для lead, исполнителей, helpers и повторов. После ошибки нужно конкретное изменение подхода; не обходи блокировку новой карточкой/сессией или перебором моделей. Смотри ресурсы Team/отчёт. Замена при квоте — только разрешённый независимый резерв и свежий проверенный checkpoint; без него остановись с объяснением. Контекст не равен накопленному расходу, неизвестный расход не равен нулю; внутренние retry/стоимость провайдера могут быть недоступны.
+- Принимай или возвращай конкретно: принимай с причиной (bb team task done <id> --reason … --expected-submission <report-id>) или возвращай пакет с конкретным замечанием (bb team task update <id> --status in-progress --return-reason … --expected-submission <report-id>). Исполнители никогда не принимают пакеты; твоё решение и причина возврата сохраняются в задаче. Эскалируй пользователю только продуктовые приоритеты, границы scope и существенные затраты.
+- Просьба обсудить или спланировать не даёт разрешения писать код. Поручение реализовать даёт такое разрешение; сохраняй уже полученное разрешение и не спрашивай его повторно.
+- При руководстве работой свяжи сессию с задачей координации через checkpoint. Используй подходящую существующую задачу или эпик руководителя, не создавай дублирующую карточку координации.
+- Перед передачей дела или сменой сессии сохраняй содержательный checkpoint: bb team checkpoint <id> --file <абсолютный-путь.json>.`;
+
+/** Persistent autonomous-lead policy text, localized. */
+export function leadAutonomyPolicy(lang: Language): string {
+  return lang === "ru" ? RU_LEAD_POLICY : EN_LEAD_POLICY;
+}
+
+/** True when the text already carries the lead policy for the language. */
+export function hasLeadPolicy(text: string, lang: Language): boolean {
+  return text.includes("Правила автономного руководителя") || text.includes("Autonomous lead operating rules");
+}
+
+/**
+ * bbt-iwi.2: review/acceptance rules for executor sessions. loadRolePrompt does
+ * not append it automatically; template authors embed it once (templates.ts
+ * is owned by the roster worker, so the insertion is handed to the parent):
+ *   `${prompt}\n\n${executorReviewPolicy(lang)}`
+ */
+export function executorReviewPolicy(lang: Language): string {
+  return lang === "ru"
+    ? `Отчёт и приёмка пакета Team:
+- Завершив пакет, переведи его в review с содержательным отчётом: bb team task update <id> --status review --review '<json>'. JSON: result (что фактически сделано), artifacts[], checks[] — каждая запись {"what":…,"result": фактический результат} или {"what":…,"notApplicable": обоснование}, problems[] (оставшиеся проблемы).
+- Не выдавай наличие текста за выполненную проверку: описывай только то, что реально запускал/проверял; для непрограммной работы допустим обоснованный not-applicable. Самоотчёт не заменяет проверку.
+- Никогда не принимай свой пакет сам (статус done/dropped — только руководитель или пользователь). При возврате с замечанием исправь конкретику из return-reason и снова подай отчёт в review.`
+    : `Team package review and acceptance:
+- When your package is done, move it to review with a grounded report: bb team task update <id> --status review --review '<json>'. JSON: result (what was actually produced), artifacts[], checks[] — each {"what":…,"result": actual outcome} or {"what":…,"notApplicable": justification}, problems[] (remaining issues).
+- Never pass the presence of text off as a performed check: describe only what you actually ran/verified; for non-programmatic work a justified not-applicable is fine. A self-report is not a check.
+- Never accept your own package (done/dropped is for the lead or the user only). When it is returned with a remark, address the concrete return-reason and submit a fresh review report.`;
+}
+
+/** Shared with custom role prompts so estimated context usage has an agent path. */
+export function sessionHandoffPolicy(lang: Language): string {
+  return lang === "ru"
+    ? `Передача сессии Team:
+- Продолжай один пакет в текущей сессии, включая связанные исправления. Если контекст мешает надёжному продолжению, сохрани содержательный checkpoint и запроси передачу: bb team checkpoint <id> --file <абсолютный-json-путь> --rotate. Для руководителя используй его задачу координации.
+- Поля JSON: goal, criteria[], progress, decisions[{what,why}], checks[{what,result}], blockers[], nextAction, files[]. Не выдумывай проверки и не копируй последний output вместо состояния. Заверши текущие операции; Team дождётся безопасной границы и сохранит окружение. Не создавай новый worktree или вторую задачу ради передачи.
+- Если цель, состояние или безопасное продолжение неясны — спроси руководителя, а руководитель пользователя. Не повторяй spawn/send при неоднозначном результате.`
+    : `Team session handoff:
+- Keep one package in its session, including related fixes. When growing context prevents reliable continuation, save a substantive checkpoint and request handoff: bb team checkpoint <id> --file <absolute-json-path> --rotate. A lead uses its coordination task.
+- JSON fields: goal, criteria[], progress, decisions[{what,why}], checks[{what,result}], blockers[], nextAction, files[]. Never invent checks or copy the last output as state. Finish current operations; Team waits for a safe boundary and preserves the environment. Do not create another worktree or task just for handoff.
+- If the goal, state or safe continuation is unclear, ask the lead (the lead asks the user). Never repeat a spawn/send after an ambiguous result.`;
+}
 
 export function messages(lang: Language): Messages {
   return lang === "ru" ? RU : EN;

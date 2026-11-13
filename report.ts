@@ -197,6 +197,17 @@ function formatWhen(ms: number): string {
   return new Date(ms).toISOString().replace("T", " ").slice(0, 16) + " UTC";
 }
 
+function resourceLines(snapshot:TeamSnapshot,lang:Language):string[]{
+ const r=snapshot.resources;if(!r)return [];const ru=lang==="ru";
+ return [ru?"Ресурсы команды":"Team resources",`${ru?"Допусков запусков (включая резервы)":"Start admissions (including reservations)"}: ${r.starts}/${r.policy.teamStarts}; ${ru?"осталось":"remaining"} ${r.remainingStarts}`,
+ `${ru?"Сообщённые накопленные токены":"Reported cumulative tokens"}: ${r.reportedTokens===null?(ru?"недоступны":"unavailable"):`${r.reportedTokens} (${ru?"неполный учёт":"partial coverage"})`}`,
+ ru?"Контекст не равен расходу. Денежный расход неизвестен. Активный вызов не прерывается; Send-now — ручное исключение BB.":"Context is not cumulative spend. Monetary cost is unknown. Active calls are not interrupted; Send-now is a manual BB override.",
+ ...(r.blocked?[`${ru?"Блокировка":"Blocked"}: ${r.blocked}`]:[]),
+ ...Object.entries(r.holds).map(([key,why])=>`${key}: ${why}`),
+ ...r.fallbacks.map(f=>`#${f.taskId??"—"}: ${f.stage} · ${f.selection?.provider??"—"}/${f.selection?.model??"—"} · ${f.reason}`),
+ ...(r.results?[`${ru?"Принято":"Accepted"}: ${r.results.accepted}; review: ${r.results.review}`,...r.results.recent.map(t=>`#${t.id} ${t.title}: ${t.result??"—"}; ${ru?"основание":"grounds"}: ${t.acceptanceReason??"—"}`)]:[])];
+}
+
 export function renderReportMarkdown(
   snapshot: TeamSnapshot,
   lang: Language,
@@ -232,10 +243,11 @@ export function renderReportMarkdown(
   if (tasks.length === 0) {
     out.push(l.noTasks);
   } else {
-    for (const task of tasks.sort((a, b) => a.id - b.id)) {
+    for (const task of tasks.sort((a, b) => a.createdAtMs - b.createdAtMs)) {
       out.push(`- #${task.id} **${task.role}** — ${task.title} · ${l.taskStatus[task.status]}`);
     }
   }
+  if(snapshot.resources)out.push("",...resourceLines(snapshot,lang));
   out.push("", `_${l.generated(formatWhen(snapshot.generatedAtMs))}_`);
   return out.join("\n");
 }
@@ -323,7 +335,7 @@ export function renderReportHtml(
     })
     .join("");
 
-  const tasks = snapshot.roles.flatMap((role) => role.tasks).sort((a, b) => a.id - b.id);
+  const tasks = snapshot.roles.flatMap((role) => role.tasks).sort((a, b) => a.createdAtMs - b.createdAtMs);
   const taskRows =
     tasks.length === 0
       ? `<div class="muted">${escapeHtml(l.noTasks)}</div>`
@@ -356,6 +368,7 @@ table{border-collapse:collapse;width:100%;font-size:12px}td{padding:4px 6px;bord
 </style></head><body><div class="wrap">
 <div><h2>${escapeHtml(l.title(teamLabel(snapshot)))}</h2><div class="muted small">${escapeHtml(l.summary(d.roleCount, d.running, d.errors.length, d.openTasks))} · ${escapeHtml(l.generated(formatWhen(snapshot.generatedAtMs)))}</div></div>
 ${notes.join("\n")}
+${snapshot.resources?`<section class="note">${resourceLines(snapshot,lang).map(line=>`<div>${escapeHtml(line)}</div>`).join("")}</section>`:""}
 ${graph ? `<div><h3>${escapeHtml(l.hierarchy)}</h3>${graph}</div>` : `<div class="muted">${escapeHtml(l.noThreads)}</div>`}
 <div><h3>${escapeHtml(l.roles)}</h3><div class="grid">${cards}</div></div>
 <div><h3>${escapeHtml(l.tasks)}</h3>${taskRows}</div>

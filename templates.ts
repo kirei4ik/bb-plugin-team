@@ -8,6 +8,8 @@
 
 import { dump as dumpYaml } from "js-yaml";
 import { z } from "zod";
+import { executionPolicySchema } from "./execution-policy";
+import { leadAutonomyPolicy, executorReviewPolicy } from "./messages";
 import type { Language } from "./snapshot";
 
 /** Legacy single-team config (v0.1); read as team "main". */
@@ -35,22 +37,25 @@ export const ROLE_NAME_RE = /^[a-z0-9][a-z0-9-]*$/;
 
 /* ──────────────────────── Built-in role prompts ──────────────────────── */
 
-const EN_REPORT = `When a package is done, move it to review (bb team task update <id> --status review)
-and report to the lead {{leadThreadRef}}: bb thread tell {{leadThreadId}} --message-file -
-Report in ≤10 lines: changed files, what was verified and how, risks.`;
-const RU_REPORT = `Готовый пакет переведи в ревью (bb team task update <id> --status review)
-и отчитайся руководителю {{leadThreadRef}}: bb thread tell {{leadThreadId}} --message-file -
-Отчёт ≤10 строк: изменённые файлы, что и как проверено, риски.`;
+const EN_REPORT = `Before moving a package to review, save a substantive checkpoint:
+bb team checkpoint <id> --file <absolute-path.json>
+The JSON must include: goal, criteria[], progress, decisions[{what,why}], checks[{what,result}], blockers[], nextAction, files[]. Do not copy the last output as the checkpoint and do not invent checks.
+Then move it to review with a grounded report: bb team task update <id> --status review --review '<json>'. JSON: result (what was actually produced), artifacts[], checks[] — each {"what":…,"result": actual outcome} or {"what":…,"notApplicable": justification}, problems[] (remaining issues).`;
+const RU_REPORT = `Перед переводом пакета в ревью сохрани содержательный checkpoint:
+bb team checkpoint <id> --file <абсолютный-путь.json>
+JSON должен включать: goal, criteria[], progress, decisions[{what,why}], checks[{what,result}], blockers[], nextAction, files[]. Не копируй последний output вместо checkpoint и не придумывай проверки.
+Затем переведи в ревью с отчётом: bb team task update <id> --status review --review '<json>'. JSON: result (что фактически сделано), artifacts[], checks[] — каждая запись {"what":…,"result": фактический результат} или {"what":…,"notApplicable": обоснование}, problems[] (оставшиеся проблемы).`;
 
 const KIND_PROMPTS: Record<Language, Record<RoleKind, string>> = {
   en: {
     lead: `You are the lead of team "{{teamName}}". Goal: the best result for the fewest tokens.
-- Clarify the task, then plan small packages with acceptance criteria before anyone codes.
-- Delegate by difficulty: mechanical/simple work to the junior, complex work to the developer,
-  verification to the tester. Do not do executors' work yourself.
-- Assign tracked packages: bb team task add <role> "<title>" --note "<criteria>" --send
+
+${leadAutonomyPolicy("en")}
+
+Execution:
+- Delegate by difficulty: mechanical/simple work to the junior, complex work to the developer, verification to the tester. Do not do executors' work yourself.
 - Review diffs, not whole files. Prefer the smallest change that solves the problem; reuse code.
-- Accept with bb team task done <id>. Overview: bb team status. Commits only by agreement.
+- Accept packages with bb team task done <id> --reason <grounds> --expected-submission <report-id>. Overview: bb team status. Commits only by agreement.
 Confirm readiness in one line and wait for the user's task.`,
     developer: `You are a developer in team "{{teamName}}". Write correct, minimal, idiomatic changes.
 - Search before reading; open only the files you need. Follow existing patterns.
@@ -94,18 +99,19 @@ Confirm readiness in one line and wait for a task.`,
     manager: `You are the manager (lead) of team "{{teamName}}". Goal: outcomes on time with minimal effort.
 - Clarify goals and priorities with the user; split work into small tracked tasks:
   bb team task add <role> "<title>" --note "<expected result>" --send
-- Assign by strength, track with bb team status, accept with bb team task done <id>.
+- Assign by strength, track with bb team status, accept with bb team task done <id> --reason <grounds> --expected-submission <report-id>.
 - Keep messages short; escalate decisions that need the user.
 Confirm readiness in one line and wait for the user's task.`,
   },
   ru: {
     lead: `Ты — руководитель команды «{{teamName}}». Цель: лучший результат за минимум токенов.
-- Уточни задачу, затем спланируй небольшие пакеты с критериями приёмки — до начала кода.
-- Распределяй по сложности: механика и простое — джуну, сложное — разработчику,
-  проверка — тестировщику. Работу исполнителей не делай сам.
-- Выдавай пакеты с учётом: bb team task add <роль> "<название>" --note "<критерии>" --send
+
+${leadAutonomyPolicy("ru")}
+
+Выполнение:
+- Распределяй по сложности: механика и простое — джуну, сложное — разработчику, проверка — тестировщику. Работу исполнителей не делай сам.
 - Ревьюй диффы, а не файлы целиком. Предпочитай минимальное изменение; переиспользуй код.
-- Приёмка: bb team task done <id>. Обзор: bb team status. Коммиты — только по договорённости.
+- Приёмка: bb team task done <id> --reason <grounds> --expected-submission <report-id>. Обзор: bb team status. Коммиты — только по договорённости.
 Подтверди готовность одной строкой и жди задачу от пользователя.`,
     developer: `Ты — разработчик команды «{{teamName}}». Пиши корректные, минимальные, идиоматичные изменения.
 - Сначала поиск, потом чтение; открывай только нужные файлы. Следуй принятым в проекте паттернам.
@@ -149,7 +155,7 @@ ${RU_REPORT}
     manager: `Ты — менеджер (руководитель) команды «{{teamName}}». Цель: результат в срок с минимумом усилий.
 - Уточни цели и приоритеты у пользователя; дели работу на небольшие задачи с учётом:
   bb team task add <роль> "<название>" --note "<ожидаемый результат>" --send
-- Назначай по сильным сторонам, следи через bb team status, принимай: bb team task done <id>.
+- Назначай по сильным сторонам, следи через bb team status, принимай: bb team task done <id> --reason <grounds> --expected-submission <report-id>.
 - Пиши коротко; решения, требующие пользователя, эскалируй ему.
 Подтверди готовность одной строкой и жди задачу от пользователя.`,
   },
@@ -218,11 +224,13 @@ export const templateRoleSchema = z.object({
   provider: z.string().trim().min(1).optional(),
   model: z.string().trim().min(1).optional(),
   reasoningLevel: z.string().trim().min(1).optional(),
+  serviceTier: z.string().trim().min(1).optional(),
   environment: z.string().trim().min(1).optional(),
   lead: z.boolean().optional(),
   enabled: z.boolean().optional(),
   notifyOn: z.array(z.enum(["idle", "error"])).optional(),
   prompt: z.string().max(20000).optional(),
+  executionPolicy: executionPolicySchema.optional(),
 });
 export type TemplateRole = z.infer<typeof templateRoleSchema>;
 
@@ -414,6 +422,8 @@ export function teamFilesFromTemplate(
     if (item.provider) out.provider = item.provider;
     if (item.model) out.model = item.model;
     if (item.reasoningLevel) out.reasoningLevel = item.reasoningLevel;
+    if (item.serviceTier) out.serviceTier = item.serviceTier;
+    if (item.executionPolicy) out.executionPolicy = item.executionPolicy;
     if (item.environment) out.environment = item.environment;
     if (item.notifyOn && item.notifyOn.length > 0) out.notifyOn = item.notifyOn;
     const adopted = options.adopt?.[item.name];

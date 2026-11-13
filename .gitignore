@@ -1,4 +1,8 @@
 dist/
-node_modules/
+node_modules
 .harness/
 AGENTS.md
+
+# Local Beads database and locks
+.beads/
+.beads.gate.lock

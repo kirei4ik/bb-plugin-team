@@ -15,6 +15,21 @@ import {
   useRpc,
 } from "@get-bb/plugin-sdk/app";
 import type { rpcContract } from "./server";
+import { RoleSessionCard } from "./role-session-card";
+import { ResourcePanel } from "./resource-panel";
+import { ReviewForm } from "./review-form";
+import {
+  GENERATOR_SELECTION_META,
+  type GeneratorSelection,
+  stringsFor,
+} from "./settings-localization";
+import {
+  findDuplicateFallback,
+  type ExecutionFallbackSelection,
+  type ExecutionPolicy,
+} from "./execution-policy";
+import { ExecutionModelPicker, useProjectModelRouting, type ExecutionModel, type ProjectModelRoutingState } from "./execution-picker";
+import type { ExperimentalProviderModelPickerRouting } from "@get-bb/plugin-sdk/app";
 import { reportLabels } from "./report";
 import {
   TASK_STATUSES,
@@ -23,12 +38,49 @@ import {
   statusTone,
   type Language,
   type SnapshotRole,
+  type RoleExecutionState,
   type StatusTone,
   type TaskStatus,
   type TeamSnapshot,
   type TeamTask,
 } from "./snapshot";
-import type { TeamTemplate, TemplateRole } from "./templates";
+import { builtinPrompt, type TeamTemplate, type TemplateRole } from "./templates";
+
+const EXECUTION_LABELS: Record<Language, Record<RoleExecutionState["kind"], string>> = {
+  en: {
+    working: "Working",
+    "awaiting-acceptance": "Awaiting acceptance or decision",
+    "awaiting-checkpoint": "Awaiting saved checkpoint",
+    "awaiting-safe-boundary": "Waiting for operations to finish",
+    "awaiting-package": "Waiting for a ready package",
+    replacing: "Replacing session",
+    error: "Needs attention",
+  },
+  ru: {
+    working: "Работает",
+    "awaiting-acceptance": "Ждёт приёмки или решения",
+    "awaiting-checkpoint": "Ждёт сохранения состояния",
+    "awaiting-safe-boundary": "Ждёт окончания операций",
+    "awaiting-package": "Ждёт готовую задачу",
+    replacing: "Меняет сессию",
+    error: "Требует внимания",
+  },
+};
+
+function recoveryAction(language: Language, role: string, state: RoleExecutionState): string | null {
+  if (language !== "ru") return state.safeAction;
+  if(state.errorCode==="resource_hold")return "Откройте ресурсы команды и укажите конкретное решение. Замена сессии не сбрасывает бюджет.";
+  if (state.errorCode === "release_failed" || state.errorCode === "delivery_uncertain") {
+    return "Выполните bb team resume, чтобы продолжить доставку уже созданного запроса. Не отправляйте его повторно.";
+  }
+  if (state.errorCode === "spawn_uncertain") {
+    return `Проверьте, был ли создан новый тред: bb team replace ${role} --dry-run --json. Подтвердите найденный тред через --thread или отмените незавершённую замену через --abort.`;
+  }
+  if (state.errorCode === "replacement_unfinished") {
+    return `Продолжите сохранённую передачу: bb team replace ${role}. До переключения её можно отменить через --abort.`;
+  }
+  return `Проверьте причину ошибки и bb team doctor. После исправления проверьте план: bb team replace ${role} --dry-run. Автоматический повтор остановлен.`;
+}
 
 /* ──────────────────────── Labels ──────────────────────── */
 
@@ -52,8 +104,12 @@ const EN = {
   loading: "Loading…",
   noProject: "Open the panel from a project, or pick one above.",
   sent: (n: number) => `Sent to ${n} thread(s).`,
-  added: (id: number) => `Package #${id} added.`,
+  added: (id: number | string) => `Package #${id} added.`,
   failed: "Failed",
+  trackerAbsent: "The Beads database does not exist yet — packages cannot be stored.",
+  createDatabase: "Create database",
+  databaseCreated: "Beads database created.",
+  databaseReady: "Beads database already exists.",
   tip: "Tip: bb team report draws this picture in chat; bb team doctor checks the setup.",
   newTeam: "+ New team",
   createTeam: "Create team",
@@ -108,6 +164,28 @@ const EN = {
   details: "Role details",
   helper: "helper",
   notUnderLead: "Not a child of the lead thread — re-run create to re-link",
+  selectModel: "Select model",
+  useDefault: "Use default",
+  reasoningLevel: "Reasoning",
+  serviceTier: "Tier",
+  starterPrompt: "Starter prompt",
+  insertStarter: "Insert starter",
+  defaultTemplate: "Default template",
+  defaultSaved: "Default template saved.",
+  generatorSelection: "Prompt draft model",
+  generatorSelectionHint: "Provider and model for AI prompt drafts. Stored separately from role models.",
+  defaultTemplateMissing: (id: string) => `Default template "${id}" does not exist.`,
+  resetEdits: "Reset edits",
+  generatorSaved: "Prompt draft model saved.",
+  settingsTitle: "Team templates",
+  executionPolicy: "Fallback models",
+  executionPolicyHint: "Ordered approved backups for quota errors; a safe checkpoint is required.",
+  policyDraftIncomplete: "Complete every fallback selection and explicitly approve the list, or remove unfinished entries.",
+  noAdditionalCost: "I confirm these models are allowed without additional payment",
+  addFallback: "+ Fallback model",
+  duplicateFallback: "Duplicate fallback model",
+  removeFallback: "Remove fallback",
+  fallbackOrderHint: (n: number) => `Fallback #${n}`,
   treeSummary: (roles: number, running: number, errors: number, open: number) =>
     `${roles} roles · ${running} working${errors ? ` · ${errors} in error` : ""} · ${open} packages`,
   pausedTag: "paused",
@@ -151,6 +229,10 @@ const RU: typeof EN = {
   sent: (n) => `Отправлено тредов: ${n}.`,
   added: (id) => `Пакет #${id} добавлен.`,
   failed: "Ошибка",
+  trackerAbsent: "Базы Beads ещё нет — пакеты некуда сохранять.",
+  createDatabase: "Создать базу",
+  databaseCreated: "База Beads создана.",
+  databaseReady: "База Beads уже есть.",
   tip: "Подсказка: bb team report рисует эту картину в чате; bb team doctor проверяет настройку.",
   newTeam: "+ Новая команда",
   createTeam: "Создать команду",
@@ -204,6 +286,28 @@ const RU: typeof EN = {
   details: "Роль подробно",
   helper: "помощник",
   notUnderLead: "Не дочерний тред руководителя — повторите create, чтобы восстановить связь",
+  selectModel: "Выбрать модель",
+  useDefault: "По умолчанию",
+  reasoningLevel: "Рассуждение",
+  serviceTier: "Тир",
+  starterPrompt: "Стартовый промпт",
+  insertStarter: "Вставить стартовый",
+  defaultTemplate: "Шаблон по умолчанию",
+  defaultSaved: "Шаблон по умолчанию сохранён.",
+  generatorSelection: "Модель черновиков",
+  generatorSelectionHint: "Провайдер и модель для ИИ-черновиков промптов. Хранится отдельно от моделей ролей.",
+  defaultTemplateMissing: (id: string) => `Шаблона по умолчанию «${id}» не существует.`,
+  resetEdits: "Сбросить правки",
+  generatorSaved: "Модель черновиков сохранена.",
+  settingsTitle: "Шаблоны команд",
+  executionPolicy: "Резервные модели",
+  executionPolicyHint: "Разрешённые резервы для ошибок квоты; требуется пригодный checkpoint.",
+  policyDraftIncomplete: "Заполните все резервные модели и явно подтвердите список либо удалите незавершённые строки.",
+  noAdditionalCost: "Я подтверждаю, что эти модели разрешены без дополнительной оплаты",
+  addFallback: "+ Резервная модель",
+  duplicateFallback: "Дублирующаяся резервная модель",
+  removeFallback: "Убрать резерв",
+  fallbackOrderHint: (n: number) => `Резерв ${n}`,
   treeSummary: (roles, running, errors, open) =>
     `ролей: ${roles} · в работе: ${running}${errors ? ` · с ошибкой: ${errors}` : ""} · пакетов: ${open}`,
   pausedTag: "пауза",
@@ -228,6 +332,14 @@ const RU: typeof EN = {
 type Labels = typeof EN;
 const LABELS: Record<Language, Labels> = { en: EN, ru: RU };
 
+export interface EditorSettings {
+  language: Language;
+  defaultTemplate: string;
+  defaultTemplateExists: boolean;
+  generatorSelection: GeneratorSelection | null;
+  reloadHint: string;
+}
+
 const NAME_RE = /^[a-z0-9][a-z0-9-]{0,31}$/;
 const ROLE_RE = /^[a-z0-9][a-z0-9-]*$/;
 
@@ -250,7 +362,9 @@ function cleanTemplate(template: TeamTemplate): TeamTemplate {
 
 /** RPC input must be strict JSON: drop fields left undefined by the editors. */
 function cleanRole(role: TemplateRole): TemplateRole {
-  return Object.fromEntries(Object.entries(role).filter(([, value]) => value !== undefined)) as TemplateRole;
+  const entries = Object.entries(role).filter(([, value]) => value !== undefined);
+  // executionPolicy is an object and must be preserved when present.
+  return Object.fromEntries(entries) as TemplateRole;
 }
 
 /* ──────────────────────── Small pieces ──────────────────────── */
@@ -331,6 +445,7 @@ function useTemplates() {
     templates: TeamTemplate[];
     kinds: Array<{ kind: string; title: string }>;
     language: Language;
+    defaultTemplate: string;
   } | null>(null);
   const refresh = useCallback(async () => {
     try {
@@ -345,6 +460,157 @@ function useTemplates() {
   return { data, refresh };
 }
 
+/* ──────────────────────── Execution policy editor ──────────────────────── */
+
+function fallbackToModel(fb: ExecutionFallbackSelection): ExecutionModel {
+  return {
+    providerId: fb.provider,
+    model: fb.model,
+    reasoningLevel: fb.reasoningLevel,
+    serviceTier: fb.serviceTier,
+  };
+}
+
+function modelToFallback(model: ExecutionModel): ExecutionFallbackSelection {
+  const fallback: ExecutionFallbackSelection = {
+    provider: model.providerId || "",
+    model: model.model || "",
+  };
+  if (model.reasoningLevel) fallback.reasoningLevel = model.reasoningLevel;
+  if (model.serviceTier) fallback.serviceTier = model.serviceTier;
+  return fallback;
+}
+
+function ExecutionPolicyEditor({
+  role,
+  policy,
+  onChange,
+  labels,
+  providers,
+  routing,
+  readOnly,
+  onValidityChange,
+}: {
+  role: TemplateRole;
+  policy: ExecutionPolicy | undefined;
+  onChange: (next: ExecutionPolicy | undefined) => void;
+  onValidityChange?: (problem: string | null) => void;
+  labels: Labels;
+  providers: { enabled: string[]; disabled: string[] };
+  routing?: ProjectModelRoutingState;
+  readOnly?: boolean;
+}) {
+  const lang = labels === LABELS.ru ? "ru" : "en";
+  // The editor owns the draft list, including not-yet-complete slots.
+  const [fallbacks, setFallbacks] = useState<ExecutionFallbackSelection[]>(policy?.fallbacks ?? []);
+  const [approved, setApproved] = useState<boolean>(policy?.noAdditionalCost === true);
+
+  const policyKey = JSON.stringify(policy ?? null);
+  useEffect(() => {
+    setFallbacks(policy?.fallbacks ?? []);
+    setApproved(policy?.noAdditionalCost === true);
+  }, [policyKey]);
+  const problemFor = (items: ExecutionFallbackSelection[], consent: boolean) => {
+    if (!items.length) return null;
+    if (items.some(item => !item.provider || !item.model) || !consent) return labels.policyDraftIncomplete;
+    const duplicate = findDuplicateFallback(items);
+    return duplicate ? `${labels.duplicateFallback}: ${duplicate.provider} · ${duplicate.model}` : null;
+  };
+  const problem = problemFor(fallbacks, approved);
+  useEffect(() => { onValidityChange?.(problem); }, [problem, onValidityChange]);
+  const emit = (next: ExecutionFallbackSelection[], consent: boolean) => {
+    const issue = problemFor(next, consent);
+    onValidityChange?.(issue);
+    // Invalid drafts stay visible locally; never silently save a partial/empty list.
+    if (!issue) onChange(next.length ? { noAdditionalCost: true, fallbacks: next } : undefined);
+  };
+  const addFallback = () => {
+    const next = [...fallbacks, { provider: "", model: "" }];
+    setFallbacks(next); setApproved(false); emit(next, false);
+  };
+  const updateFallback = (index: number, model: ExecutionModel | undefined) => {
+    if (!model) {
+      const next = fallbacks.filter((_, i) => i !== index);
+      setFallbacks(next); emit(next, approved); return;
+    }
+    const selection = modelToFallback(model);
+    const changed = JSON.stringify(selection) !== JSON.stringify(fallbacks[index]);
+    const next = fallbacks.map((fb, i) => i === index ? selection : fb);
+    const consent = changed ? false : approved;
+    setFallbacks(next); setApproved(consent); emit(next, consent);
+  };
+  const toggleApproved = (consent: boolean) => {
+    setApproved(consent); emit(fallbacks, consent);
+  };
+  const duplicate = findDuplicateFallback(fallbacks.filter(fb => fb.provider && fb.model));
+
+  return (
+    <div className="flex flex-col gap-1.5 rounded-md border border-border bg-background p-2 text-xs">
+      <div className="flex flex-wrap items-center justify-between gap-2 text-muted-foreground">
+        <span>
+          {labels.executionPolicy}: {role.name}
+        </span>
+        <span className="text-[10px] uppercase tracking-wide">{labels.executionPolicyHint}</span>
+      </div>
+      <div className="flex flex-col gap-1.5">
+        {fallbacks.map((fb, index) => {
+          const off = fb.provider && !providers.enabled.includes(fb.provider);
+          return (
+            <div key={index} className="flex flex-wrap items-start gap-2">
+              <span className="pt-1 text-muted-foreground">{labels.fallbackOrderHint(index + 1)}</span>
+              <div className="flex-1">
+                <ExecutionModelPicker
+                  value={fb.provider ? fallbackToModel(fb) : undefined}
+                  onChange={(next) => updateFallback(index, next)}
+                  routing={routing}
+                  disabled={readOnly}
+                  language={lang}
+                  defaultLabel={labels.defaultProvider}
+                  selectLabel={labels.selectModel}
+                  useDefaultLabel={labels.useDefault}
+                />
+                {off && (
+                  <div className="pt-1 text-[10px] text-destructive">{labels.providerOff(fb.provider)}</div>
+                )}
+              </div>
+              {!readOnly && (
+                <Button variant="ghost" onClick={() => updateFallback(index, undefined)}>
+                  {labels.removeFallback}
+                </Button>
+              )}
+            </div>
+          );
+        })}
+      </div>
+      {!readOnly && (
+        <label className="flex items-center gap-1.5 text-xs text-muted-foreground">
+          <input
+            type="checkbox"
+            checked={approved}
+            onChange={(event) => toggleApproved(event.target.checked)}
+            disabled={fallbacks.length === 0}
+          />
+          {labels.noAdditionalCost}
+        </label>
+      )}
+      {readOnly && approved && (
+        <div className="text-[11px] text-muted-foreground">{labels.noAdditionalCost}</div>
+      )}
+      {problem && !duplicate && <p role="alert" className="text-destructive">{problem}</p>}
+      {duplicate && (
+        <div className="text-[10px] text-destructive">
+          {labels.duplicateFallback}: {duplicate.provider} · {duplicate.model}
+        </div>
+      )}
+      {!readOnly && (
+        <Button variant="ghost" onClick={addFallback}>
+          {labels.addFallback}
+        </Button>
+      )}
+    </div>
+  );
+}
+
 /* ──────────────────────── Roles editor (wizard + template editor) ──────────────────────── */
 
 function RolesEditor({
@@ -354,14 +620,25 @@ function RolesEditor({
   kinds,
   providers,
   withPrompt,
+  readOnly,
+  routing,
+  onPolicyDraftValidityChange,
 }: {
   roles: TemplateRole[];
+  onPolicyDraftValidityChange?: (valid: boolean) => void;
   onChange: (roles: TemplateRole[]) => void;
   labels: Labels;
   kinds: Array<{ kind: string; title: string }>;
   providers: { enabled: string[]; disabled: string[] };
   withPrompt?: boolean;
+  readOnly?: boolean;
+  routing?: ProjectModelRoutingState;
 }) {
+  const [policyProblems, setPolicyProblems] = useState<Record<string, string | null>>({});
+  const policyValid = roles.every(role => !policyProblems[role.name]);
+  useEffect(() => { onPolicyDraftValidityChange?.(policyValid); }, [policyValid, onPolicyDraftValidityChange]);
+  const policyValidity = (name: string, problem: string | null) => setPolicyProblems(old =>
+    old[name] === problem ? old : { ...old, [name]: problem });
   const update = (index: number, patch: Partial<TemplateRole>) =>
     onChange(roles.map((role, i) => (i === index ? cleanRole({ ...role, ...patch }) : role)));
   const setLead = (index: number) =>
@@ -373,8 +650,6 @@ function RolesEditor({
     const title = kinds.find((k) => k.kind === kind)?.title ?? name;
     onChange([...roles, { name, kind, title }]);
   };
-  const providerOptions = [...new Set([...providers.enabled, ...providers.disabled, ...roles.map((r) => r.provider ?? "")])]
-    .filter(Boolean);
   return (
     <div className="flex flex-col gap-2">
       <table className="w-full text-xs">
@@ -384,8 +659,9 @@ function RolesEditor({
             <th className="pb-1 pr-1 font-medium">{labels.roleName}</th>
             <th className="pb-1 pr-1 font-medium">{labels.title}</th>
             <th className="pb-1 pr-1 font-medium">{labels.kind}</th>
-            <th className="pb-1 pr-1 font-medium">{labels.provider}</th>
-            <th className="pb-1 pr-1 font-medium">{labels.model}</th>
+            <th className="pb-1 pr-1 font-medium" colSpan={2}>
+              {labels.provider} · {labels.model}
+            </th>
             <th className="pb-1 pr-1 font-medium">{labels.enabled}</th>
             <th />
           </tr>
@@ -393,6 +669,15 @@ function RolesEditor({
         <tbody>
           {roles.map((role, index) => {
             const off = role.provider && !providers.enabled.includes(role.provider);
+            const modelValue: ExecutionModel | undefined =
+              role.provider || role.model || role.reasoningLevel || role.serviceTier
+                ? {
+                    providerId: role.provider,
+                    model: role.model,
+                    reasoningLevel: role.reasoningLevel,
+                    serviceTier: role.serviceTier,
+                  }
+                : undefined;
             return (
               <tr key={index} className="align-top">
                 <td className="py-1 pr-1">
@@ -401,12 +686,14 @@ function RolesEditor({
                     aria-label={`${labels.lead} ${role.name}`}
                     checked={role.lead === true || (!roles.some((r) => r.lead) && index === 0)}
                     onChange={() => setLead(index)}
+                    disabled={readOnly}
                   />
                 </td>
                 <td className="py-1 pr-1">
                   <input
                     aria-label={`${labels.roleName} ${index + 1}`}
                     value={role.name}
+                    disabled={readOnly}
                     onChange={(event) => update(index, { name: event.target.value.toLowerCase() })}
                     className={`${inputClass} w-28 ${ROLE_RE.test(role.name) ? "" : "border-destructive"}`}
                   />
@@ -415,6 +702,7 @@ function RolesEditor({
                   <input
                     aria-label={`${labels.title} ${index + 1}`}
                     value={role.title ?? ""}
+                    disabled={readOnly}
                     onChange={(event) => update(index, { title: event.target.value || undefined })}
                     className={`${inputClass} w-36`}
                   />
@@ -423,6 +711,7 @@ function RolesEditor({
                   <select
                     aria-label={`${labels.kind} ${index + 1}`}
                     value={role.kind ?? ""}
+                    disabled={readOnly}
                     onChange={(event) => update(index, { kind: event.target.value || undefined })}
                     className={inputClass}
                   >
@@ -434,75 +723,120 @@ function RolesEditor({
                     ))}
                   </select>
                 </td>
-                <td className="py-1 pr-1">
-                  <select
-                    aria-label={`${labels.provider} ${index + 1}`}
-                    value={role.provider ?? ""}
-                    onChange={(event) => update(index, { provider: event.target.value || undefined })}
-                    className={`${inputClass} ${off ? "border-destructive text-destructive" : ""}`}
-                  >
-                    <option value="">{labels.defaultProvider}</option>
-                    {providerOptions.map((id) => (
-                      <option key={id} value={id}>
-                        {providers.enabled.includes(id) ? id : `${id} ✕`}
-                      </option>
-                    ))}
-                  </select>
-                </td>
-                <td className="py-1 pr-1">
-                  <input
-                    aria-label={`${labels.model} ${index + 1}`}
-                    value={role.model ?? ""}
-                    onChange={(event) => update(index, { model: event.target.value || undefined })}
-                    className={`${inputClass} w-28`}
+                <td className="py-1 pr-1" colSpan={2}>
+                  <ExecutionModelPicker
+                    value={modelValue}
+                    onChange={(next) =>
+                      update(index, {
+                        provider: next?.providerId,
+                        model: next?.model,
+                        reasoningLevel: next?.reasoningLevel,
+                        serviceTier: next?.serviceTier,
+                      })
+                    }
+                    routing={routing}
+                    disabled={readOnly}
+                    language={labels === LABELS.ru ? "ru" : "en"}
+                    defaultLabel={labels.defaultProvider}
+                    selectLabel={labels.selectModel}
+                    useDefaultLabel={labels.useDefault}
                   />
+                  {off && (
+                    <div className="pt-1 text-[10px] text-destructive">
+                      {labels.providerOff(role.provider!)}
+                    </div>
+                  )}
                 </td>
                 <td className="py-1 pr-1">
                   <input
                     type="checkbox"
                     aria-label={`${labels.enabled} ${role.name}`}
                     checked={role.enabled !== false}
+                    disabled={readOnly}
                     onChange={(event) => update(index, { enabled: event.target.checked ? undefined : false })}
                   />
                 </td>
                 <td className="py-1">
-                  <Button variant="ghost" onClick={() => onChange(roles.filter((_, i) => i !== index))}>
-                    {labels.remove}
-                  </Button>
+                  {!readOnly && (
+                    <Button variant="ghost" onClick={() => onChange(roles.filter((_, i) => i !== index))}>
+                      {labels.remove}
+                    </Button>
+                  )}
                 </td>
               </tr>
             );
           })}
         </tbody>
       </table>
+      {roles.map((role, index) => (
+        <ExecutionPolicyEditor
+          key={role.name}
+          role={role}
+          policy={role.executionPolicy}
+          onValidityChange={problem => policyValidity(role.name, problem)}
+          onChange={(next) => update(index, { executionPolicy: next })}
+          labels={labels}
+          providers={providers}
+          routing={routing}
+          readOnly={readOnly}
+        />
+      ))}
       {withPrompt &&
-        roles.map((role, index) => (
-          <label key={`p${index}`} className="flex flex-col gap-1 text-xs text-muted-foreground">
-            {labels.prompt}: {role.name}
-            <textarea
-              value={role.prompt ?? ""}
-              placeholder={labels.promptHint}
-              rows={4}
-              onChange={(event) => update(index, { prompt: event.target.value || undefined })}
-              className="rounded-md border border-input bg-background px-2 py-1 font-mono text-xs text-foreground"
-            />
-          </label>
-        ))}
-      <div className="flex flex-wrap items-center gap-1.5">
-        <select
-          aria-label={labels.addRole}
-          value=""
-          onChange={(event) => event.target.value && addRole(event.target.value)}
-          className={inputClass}
-        >
-          <option value="">{labels.addRole}</option>
-          {kinds.map((k) => (
-            <option key={k.kind} value={k.kind}>
-              {k.title}
-            </option>
-          ))}
-        </select>
-      </div>
+        roles.map((role, index) => {
+          const starter = builtinPrompt(labels === RU ? "ru" : "en", role);
+          return (
+            <div key={`p${index}`} className="flex flex-col gap-1 rounded-md border border-border bg-background p-2 text-xs">
+              <div className="flex flex-wrap items-center justify-between gap-2 text-muted-foreground">
+                <span>
+                  {labels.prompt}: {role.name}
+                </span>
+                <span className="text-[10px] uppercase tracking-wide">{labels.starterPrompt}</span>
+              </div>
+              <textarea
+                aria-label={`${labels.prompt} ${role.name}`}
+                value={role.prompt ?? ""}
+                placeholder={labels.promptHint}
+                rows={4}
+                disabled={readOnly}
+                onChange={(event) => update(index, { prompt: event.target.value || undefined })}
+                className="rounded-md border border-input bg-background px-2 py-1 font-mono text-xs text-foreground disabled:opacity-60"
+              />
+              {!role.prompt && (
+                <div className="flex flex-col gap-1">
+                  <div className="rounded-md bg-muted px-2 py-1 text-[11px] text-muted-foreground">
+                    {starter}
+                  </div>
+                  {!readOnly && (
+                    <button
+                      type="button"
+                      onClick={() => update(index, { prompt: starter })}
+                      className="self-start rounded-md px-2 py-1 text-xs font-medium text-foreground hover:bg-accent"
+                    >
+                      {labels.insertStarter}
+                    </button>
+                  )}
+                </div>
+              )}
+            </div>
+          );
+        })}
+      {!readOnly && (
+        <div className="flex flex-wrap items-center gap-1.5">
+          <select
+            aria-label={labels.addRole}
+            value=""
+            onChange={(event) => event.target.value && addRole(event.target.value)}
+            className={inputClass}
+          >
+            <option value="">{labels.addRole}</option>
+            {kinds.map((k) => (
+              <option key={k.kind} value={k.kind}>
+                {k.title}
+              </option>
+            ))}
+          </select>
+        </div>
+      )}
     </div>
   );
 }
@@ -518,6 +852,10 @@ function rolesProblems(roles: TemplateRole[], providers: { enabled: string[] }, 
   }
   const off = [...new Set(active.map((r) => r.provider).filter((p): p is string => !!p && !providers.enabled.includes(p)))];
   if (off.length > 0) problems.push(labels.providerOff(off.join(", ")));
+  for (const role of active) {
+    const duplicate = role.executionPolicy ? findDuplicateFallback(role.executionPolicy.fallbacks) : undefined;
+    if (duplicate) problems.push(`${labels.duplicateFallback}: ${duplicate.provider} · ${duplicate.model} (${role.name})`);
+  }
   return problems;
 }
 
@@ -537,13 +875,16 @@ function CreateTeam({
   const rpc = useRpc<typeof rpcContract>();
   const { data } = useTemplates();
   const providers = useProviders();
+  const routing = useProjectModelRouting(projectId);
   const labels = LABELS[data?.language ?? "en"];
-  const [templateId, setTemplateId] = useState("dev");
+  const [selectedTemplateId, setTemplateId] = useState<string | null>(null);
+  const templateId = selectedTemplateId ?? data?.defaultTemplate ?? "dev";
   const [team, setTeam] = useState(existingTeams.length === 0 ? "main" : "");
   const [title, setTitle] = useState("");
   const [roles, setRoles] = useState<TemplateRole[]>([]);
   const [versioned, setVersioned] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [policyDraftValid, setPolicyDraftValid] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
@@ -559,7 +900,10 @@ function CreateTeam({
     : existingTeams.includes(team)
       ? labels.nameTaken
       : null;
-  const problems = [...(nameProblem ? [nameProblem] : []), ...rolesProblems(roles, providers, labels)];
+  const templateProblem = data && !data.templates.some((tpl) => tpl.id === templateId)
+    ? (data.language === "ru" ? `Шаблон «${templateId}» не найден. Выберите существующий шаблон.` : `Template "${templateId}" is missing. Select an existing template.`)
+    : null;
+  const problems = [...(nameProblem ? [nameProblem] : []), ...(templateProblem ? [templateProblem] : []), ...rolesProblems(roles, providers, labels), ...(!policyDraftValid ? [labels.policyDraftIncomplete] : [])];
 
   const create = async (event: FormEvent) => {
     event.preventDefault();
@@ -623,7 +967,7 @@ function CreateTeam({
           {data.templates.find((tpl) => tpl.id === templateId)?.description}
         </div>
       )}
-      <RolesEditor roles={roles} onChange={setRoles} labels={labels} kinds={data.kinds} providers={providers} />
+      <RolesEditor key={templateId} onPolicyDraftValidityChange={setPolicyDraftValid} roles={roles} onChange={setRoles} labels={labels} kinds={data.kinds} providers={providers} routing={routing} />
       {problems.map((problem) => (
         <Notice key={problem} tone="warn">
           {problem}
@@ -664,12 +1008,13 @@ function AddExecutor({
   const rpc = useRpc<typeof rpcContract>();
   const { data } = useTemplates();
   const providers = useProviders();
+  const routing = useProjectModelRouting(projectId);
   const [mode, setMode] = useState<"new" | "existing">("new");
   const [kind, setKind] = useState("junior");
   const [name, setName] = useState("");
   const [title, setTitle] = useState("");
-  const [provider, setProvider] = useState("");
-  const [model, setModel] = useState("");
+  const [executionModel, setExecutionModel] = useState<ExecutionModel | undefined>(undefined);
+  const [executionPolicy, setExecutionPolicy] = useState<ExecutionPolicy | undefined>(undefined);
   const [threadId, setThreadId] = useState("");
   const [free, setFree] = useState<Array<{ id: string; title: string; status: string; provider: string }>>([]);
   const [busy, setBusy] = useState(false);
@@ -689,9 +1034,17 @@ function AddExecutor({
   }, [kind, existingRoles]);
   const roleName = name || suggested;
   const kindTitle = data?.kinds.find((k) => k.kind === kind)?.title ?? roleName;
+  const [policyDraftValid, setPolicyDraftValid] = useState(true);
   const problems: string[] = [];
+  if (mode === "new" && !policyDraftValid) problems.push(labels.policyDraftIncomplete);
   if (!ROLE_RE.test(roleName) || existingRoles.includes(roleName)) problems.push(labels.nameInvalid);
-  if (mode === "new" && provider && !providers.enabled.includes(provider)) problems.push(labels.providerOff(provider));
+  if (mode === "new" && executionModel?.providerId && !providers.enabled.includes(executionModel.providerId)) {
+    problems.push(labels.providerOff(executionModel.providerId));
+  }
+  if (mode === "new" && executionPolicy) {
+    const duplicate = findDuplicateFallback(executionPolicy.fallbacks);
+    if (duplicate) problems.push(`${labels.duplicateFallback}: ${duplicate.provider} · ${duplicate.model}`);
+  }
   if (mode === "existing" && !threadId) problems.push(labels.noFreeThreads);
 
   const submit = async (event: FormEvent) => {
@@ -704,8 +1057,11 @@ function AddExecutor({
         name: roleName,
         ...(kind ? { kind } : {}),
         title: title || kindTitle,
-        ...(mode === "new" && provider ? { provider } : {}),
-        ...(mode === "new" && model ? { model } : {}),
+        ...(mode === "new" && executionModel?.providerId ? { provider: executionModel.providerId } : {}),
+        ...(mode === "new" && executionModel?.model ? { model: executionModel.model } : {}),
+        ...(mode === "new" && executionModel?.reasoningLevel ? { reasoningLevel: executionModel.reasoningLevel } : {}),
+        ...(mode === "new" && executionModel?.serviceTier ? { serviceTier: executionModel.serviceTier } : {}),
+        ...(mode === "new" && executionPolicy ? { executionPolicy } : {}),
       };
       await rpc.call("roleAdd", { projectId, team, role, ...(mode === "existing" ? { threadId } : {}) });
       onDone(labels.roleAdded(roleName));
@@ -760,23 +1116,15 @@ function AddExecutor({
           />
         </label>
         {mode === "new" ? (
-          <>
-            <label className="flex flex-col gap-1 text-xs text-muted-foreground">
-              {labels.provider}
-              <select aria-label={labels.provider} value={provider} onChange={(event) => setProvider(event.target.value)} className={inputClass}>
-                <option value="">{labels.defaultProvider}</option>
-                {[...providers.enabled, ...providers.disabled].map((id) => (
-                  <option key={id} value={id}>
-                    {providers.enabled.includes(id) ? id : `${id} ✕`}
-                  </option>
-                ))}
-              </select>
-            </label>
-            <label className="flex flex-col gap-1 text-xs text-muted-foreground">
-              {labels.model}
-              <input aria-label={labels.model} value={model} onChange={(event) => setModel(event.target.value)} className={`${inputClass} w-32`} />
-            </label>
-          </>
+          <ExecutionModelPicker
+            value={executionModel}
+            onChange={setExecutionModel}
+            routing={routing}
+            language={labels === LABELS.ru ? "ru" : "en"}
+            defaultLabel={labels.defaultProvider}
+            selectLabel={labels.selectModel}
+            useDefaultLabel={labels.useDefault}
+          />
         ) : (
           <label className="flex flex-col gap-1 text-xs text-muted-foreground">
             {labels.thread}
@@ -791,6 +1139,17 @@ function AddExecutor({
           </label>
         )}
       </div>
+      {mode === "new" && (
+        <ExecutionPolicyEditor
+          role={{ name: roleName }}
+          policy={executionPolicy}
+          onValidityChange={problem => setPolicyDraftValid(!problem)}
+          onChange={setExecutionPolicy}
+          labels={labels}
+          providers={providers}
+          routing={routing}
+        />
+      )}
       {problems.map((problem) => (
         <Notice key={problem} tone="warn">
           {problem}
@@ -891,7 +1250,7 @@ function TeamBlock({
   const threads = snapshot.roles.flatMap((role) => role.threads);
   const running = threads.filter((thread) => statusTone(thread.status) === "running").length;
   const errors = threads.filter((thread) => statusTone(thread.status) === "error").length;
-  const tasks = snapshot.roles.flatMap((role) => role.tasks).sort((a, b) => a.id - b.id);
+  const tasks = snapshot.roles.flatMap((role) => role.tasks).sort((a, b) => a.createdAtMs - b.createdAtMs);
   const lead = snapshot.roles.find((role) => role.lead);
   const leadThread = lead?.threads[0]?.threadId ?? null;
   const executors = snapshot.roles.filter((role) => !role.lead && (role.enabled || role.threads.length > 0));
@@ -924,6 +1283,7 @@ function TeamBlock({
           onClick={() => onSelect({ team, role: role.name })}
           badge={
             <>
+              {role.executionState && <Tag>{EXECUTION_LABELS[language][role.executionState.kind]}</Tag>}
               {role.threads.length > 1 && <Tag>×{role.threads.length}</Tag>}
               {task && (
                 <span className="max-w-48 truncate rounded-full bg-secondary px-1.5 py-0.5 text-[10px] text-secondary-foreground">
@@ -934,6 +1294,13 @@ function TeamBlock({
             </>
           }
         />
+        {role.executionState?.kind === "error" && (
+          <div role="alert" className="px-3 py-1 text-xs text-destructive">
+            {role.executionState.errorCode==="resource_hold"?(language==="ru"?"Работа ждёт решения по ресурсам.":"Work awaits a resource decision."):(language === "ru" ? "Передача сессии остановлена." : "Session handoff stopped.")}
+            {role.executionState.errorMessage && ` ${role.executionState.errorMessage}`}
+            {recoveryAction(language, role.name, role.executionState) && ` · ${recoveryAction(language, role.name, role.executionState)}`}
+          </div>
+        )}
         {role.helpers.map((helper, index) => (
           <TreeRow
             key={helper.threadId}
@@ -1060,6 +1427,7 @@ function TeamBlock({
               onCancel={() => onAdding(false)}
             />
           )}
+          <ResourcePanel snapshot={snapshot} language={language} onChanged={async()=>{await onAction(async()=>language==="ru"?"Решение по ресурсам сохранено.":"Resource decision saved.");}}/>
           <div className="flex flex-col">
             {lead && roleRow(lead, 0)}
             {executors.map((role, index) => roleRow(role, lead ? 1 : 0, index === executors.length - 1))}
@@ -1085,12 +1453,20 @@ function TeamBlock({
                 <div className="py-1 text-xs text-muted-foreground">{l.noTasks}</div>
               ) : (
                 <table className="mt-1 w-full text-xs">
+                  <thead>
+                    <tr className="text-left text-muted-foreground">
+                      <th scope="col" className="py-1 pr-2">ID</th>
+                      <th scope="col" className="py-1 pr-2">{language === "ru" ? "Назначена роли" : "Assigned role"}</th>
+                      <th scope="col" className="py-1 pr-2">{language === "ru" ? "Задача" : "Task"}</th>
+                      <th scope="col" className="py-1 text-right">{language === "ru" ? "Статус" : "Status"}</th>
+                    </tr>
+                  </thead>
                   <tbody>
                     {tasks.map((task) => (
                       <tr key={task.id} className="border-b border-border">
                         <td className="py-1 pr-2 text-muted-foreground">#{task.id}</td>
-                        <td className="py-1 pr-2 text-foreground">{task.role}</td>
-                        <td className="py-1 pr-2 text-foreground">{task.title}</td>
+                        <td className="py-1 pr-2 text-foreground" title={`${team} · ${task.role || "—"}`}>{task.role || (language === "ru" ? "Не назначена" : "Unassigned")}</td>
+                        <td className="py-1 pr-2 text-foreground"><TaskContext task={task} language={language} /></td>
                         <td className="py-1 text-right">
                           <TaskStatusSelect projectId={projectId} team={team} task={task} language={language} onAction={onAction} />
                         </td>
@@ -1104,6 +1480,20 @@ function TeamBlock({
       )}
     </div>
   );
+}
+
+function TaskContext({task,language}:{task:TeamTask;language:Language}) {
+  const ru=language==="ru";
+  const fields=[
+    [ru?"Описание":"Description",task.note],
+    [ru?"Критерии приёмки":"Acceptance criteria",task.criteria],
+    [ru?"Зависимости":"Dependencies",task.dependencies?.join(", ")],
+    [ru?"Решения":"Decisions",task.decisions],
+    [ru?"Результат":"Result",task.result],
+  ].filter(([,value])=>value);
+  return <details className="text-xs"><summary>{task.title}{task.priority!==undefined?` · P${task.priority}`:""}</summary>
+    {fields.map(([label,value])=><div key={label} className="mt-1 whitespace-pre-wrap"><strong>{label}: </strong>{value}</div>)}
+  </details>;
 }
 
 function TaskStatusSelect({
@@ -1121,16 +1511,22 @@ function TaskStatusSelect({
 }) {
   const rpc = useRpc<typeof rpcContract>();
   const l = reportLabels(language);
+  const [reviewOpen, setReviewOpen] = useState(false);
   return (
+    <div className="flex flex-col items-end gap-1">
     <select
       aria-label={`#${task.id}`}
       value={task.status}
-      onChange={(event) =>
+      onChange={(event) => {
+        const status = event.target.value as TaskStatus;
+        if (status === "done" || (task.status === "review" && (status === "todo" || status === "in-progress"))) {
+          setReviewOpen(true); return;
+        }
         void onAction(async () => {
-          const result = await rpc.call("taskUpdate", { projectId, team, id: task.id, status: event.target.value as TaskStatus });
+          const result = await rpc.call("taskUpdate", { projectId, team, id: task.id, status });
           return `#${result.task.id}: ${l.taskStatus[result.task.status] ?? result.task.status}`;
-        })
-      }
+        });
+      }}
       className="h-6 rounded-md border border-input bg-background px-1 text-xs text-foreground"
     >
       {TASK_STATUSES.map((status) => (
@@ -1139,10 +1535,50 @@ function TaskStatusSelect({
         </option>
       ))}
     </select>
+    <button type="button" onClick={() => setReviewOpen(value => !value)} className="text-xs underline">
+      {language === "ru" ? "Отчёт и приёмка" : "Report and acceptance"}
+    </button>
+    {reviewOpen && <div className="w-full min-w-64 rounded-md border border-border bg-card p-2 text-left">
+      <ReviewForm key={`${task.id}:${task.review?.submission?.id ?? "none"}`} projectId={projectId} team={team} task={task} language={language}
+        onChanged={() => onAction(async () => language === "ru" ? `Состояние задачи #${task.id} обновлено.` : `Task #${task.id} updated.`)} />
+      <button type="button" className="mt-2 text-xs underline" onClick={() => setReviewOpen(false)}>{language === "ru" ? "Закрыть отчёт" : "Close report"}</button>
+    </div>}
+    </div>
   );
 }
 
 /* ──────────────────────── Role details (actions) ──────────────────────── */
+
+function ExistingRolePolicy({projectId,team,role,labels,onAction}: {
+  projectId:string;team:string;role:string;labels:Labels;onAction:(action:()=>Promise<string>)=>Promise<void>;
+}) {
+  const rpc=useRpc<typeof rpcContract>(); const routing=useProjectModelRouting(projectId);
+  const [data,setData]=useState<{role:TemplateRole;source:string;revision:string}|null>(null);
+  const [providers,setProviders]=useState<{enabled:string[];disabled:string[]}>({enabled:[],disabled:[]});
+  const [policy,setPolicy]=useState<ExecutionPolicy|undefined>();
+  const [primary,setPrimary]=useState<ExecutionModel|undefined>();
+  const [problem,setProblem]=useState<string|null>(null);const [error,setError]=useState<string|null>(null);
+  const [busy,setBusy]=useState(false);
+  const ru=labels===LABELS.ru;
+  useEffect(()=>{let active=true;Promise.all([rpc.call("rolePolicy",{projectId,team,role}),rpc.call("providers",null)]).then(([d,p])=>{
+    if(active){setData(d);setPolicy(d.role.executionPolicy);setProviders(p);setPrimary({providerId:d.role.provider,model:d.role.model,reasoningLevel:d.role.reasoningLevel,serviceTier:d.role.serviceTier});}
+  },e=>{if(active)setError(errorText(e));});return()=>{active=false;};},[rpc,projectId,team,role]);
+  if(error) return <Notice>{error}</Notice>;
+  if(!data) return <p>{ru?"Загрузка профиля…":"Loading profile…"}</p>;
+  return <section aria-label={ru?"Профиль моделей сотрудника":"Employee model profile"} className="flex flex-col gap-2 border-t border-border pt-2 text-xs">
+    <p>{ru?"Источник: конфиг команды":"Source: team config"} · {data.source}</p>
+    <p>{ru?"Основная модель":"Primary model"}</p>
+    <ExecutionModelPicker value={primary} onChange={setPrimary} routing={routing} language={ru?"ru":"en"} defaultLabel={labels.defaultProvider} selectLabel={labels.selectModel} useDefaultLabel={labels.useDefault}/>
+
+    <p>{ru?"Шаблон скопирован при создании команды; последующие правки шаблона сюда не наследуются. Очистка списка означает отсутствие резервов, а не автоматический выбор модели.":"Templates are copied when creating a team; later template edits are not inherited. Clearing the list means no backups, not automatic model selection."}</p>
+    <ExecutionPolicyEditor role={data.role} policy={policy} onChange={setPolicy} onValidityChange={setProblem} providers={providers} routing={routing} labels={labels}/>
+    <p>{ru?"Сохранение переформатирует конфиг и удалит YAML-комментарии. Профиль получат новые и заменённые сессии; текущая сессия не меняется.":"Saving reformats the config and removes YAML comments. New and replacement sessions receive the profile; the current session is unchanged."}</p>
+    <Button disabled={busy||!!problem} onClick={()=>{setBusy(true);void onAction(async()=>{
+      const result=await rpc.call("rolePolicy",{projectId,team,role,primary:Object.fromEntries(Object.entries({provider:primary?.providerId,model:primary?.model,reasoningLevel:primary?.reasoningLevel,serviceTier:primary?.serviceTier}).filter(([,value])=>value!==undefined)),policy:policy??null,expectedRevision:data.revision});setData(result);
+      return ru?"Профиль сохранён для новых сессий.":"Profile saved for new sessions.";
+    }).finally(()=>setBusy(false));}}>{labels.save}</Button>
+  </section>;
+}
 
 function RoleDetails({
   snapshot,
@@ -1163,6 +1599,7 @@ function RoleDetails({
   const navigate = useBbNavigate();
   const l = reportLabels(language);
   const [mode, setMode] = useState<"none" | "message" | "package">("none");
+  const [editingPolicy,setEditingPolicy]=useState(false);
   const [text, setText] = useState("");
   const [note, setNote] = useState("");
   const [sendNow, setSendNow] = useState(true);
@@ -1245,6 +1682,16 @@ function RoleDetails({
           </Button>
         )}
       </div>
+      {role.inConfig && <Button onClick={()=>setEditingPolicy(value=>!value)}>{labels.executionPolicy}</Button>}
+      {editingPolicy && <ExistingRolePolicy key={`${projectId}:${team}:${role.name}`} projectId={projectId} team={team} role={role.name} labels={labels} onAction={onAction}/>}
+      <RoleSessionCard
+        key={`${projectId}:${team}:${role.name}:${role.threads.map(thread => thread.threadId).join(",")}`}
+        projectId={projectId} team={team} role={role.name}
+        threadId={role.threads.length === 1 ? role.threads[0]!.threadId : null}
+        revision={`${snapshot.paused}:${role.threads[0]?.updatedAtMs}:${role.executionState?.atMs}`}
+        language={language}
+        onChanged={() => onAction(async () => language === "ru" ? "Состояние передачи обновлено." : "Handoff state updated.")}
+      />
       {mode !== "none" && (
         <form onSubmit={submit} className="flex flex-col gap-1.5">
           {mode === "message" ? (
@@ -1289,10 +1736,10 @@ function RoleDetails({
           {role.tasks.map((task) => (
             <div key={task.id} className="flex items-center gap-2 text-xs text-foreground">
               <span className="text-muted-foreground">#{task.id}</span>
-              <span className="truncate">{task.title}</span>
-              <span className="ml-auto">
+              <TaskContext task={task} language={language} />
+              <div className="ml-auto">
                 <TaskStatusSelect projectId={projectId} team={team} task={task} language={language} onAction={onAction} />
-              </span>
+              </div>
             </div>
           ))}
         </div>
@@ -1428,6 +1875,38 @@ function ProjectOverview({
 
 /* ──────────────────────── Panel ──────────────────────── */
 
+function ProjectTracker({projectId, language, onChanged}: {projectId:string;language:Language;onChanged:()=>Promise<void>}) {
+  const rpc = useRpc<typeof rpcContract>();
+  const [config,setConfig] = useState<{kind:"beads"|"builtin";override:"beads"|"builtin"|null}|null>(null);
+  const [error,setError] = useState<string|null>(null);
+  const [busy,setBusy] = useState(false);
+  useEffect(()=> {
+    let active=true;
+    setConfig(null);setError(null);
+    void rpc.call("trackerConfig",{projectId}).then(value=>{if(active)setConfig(value);}).catch(cause=>{if(active)setError(errorText(cause));});
+    return ()=>{active=false;};
+  },[rpc,projectId]);
+  useRealtime("team-changed", (payload) => {
+    const changed = (payload as {projectId?:string} | null)?.projectId;
+    if (!changed || changed === projectId) {
+      void rpc.call("trackerConfig", {projectId}).then(setConfig).catch(cause=>setError(errorText(cause)));
+    }
+  });
+  const ru=language==="ru";
+  return <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
+    <label>{ru?"Трекер проекта":"Project tracker"} <select aria-label={ru?"Трекер проекта":"Project tracker"} disabled={busy||!config} value={config?.override ?? "default"} onChange={async event=>{
+      const kind=event.target.value;setBusy(true);setError(null);
+      try {await rpc.call("trackerSet",{projectId,kind:kind==="default"?null:kind as "beads"|"builtin"});setConfig(await rpc.call("trackerConfig",{projectId}));await onChanged();}
+      catch(cause){setError(errorText(cause));}finally{setBusy(false);}
+    }}>
+      <option value="default">{ru?"Настройка плагина":"Plugin default"}{config?` (${config.kind})`:""}</option>
+      <option value="beads">Beads</option><option value="builtin">{ru?"Встроенный":"Built-in"}</option>
+    </select></label>
+    <span>{ru?"Для всех команд проекта":"Applies to every team in the project"}</span>
+    {error&&<span role="alert">{error}</span>}
+  </div>;
+}
+
 function TeamPanel({ subPath }: { subPath: string }) {
   const context = useBbContext();
   const navigate = useBbNavigate();
@@ -1443,7 +1922,9 @@ function TeamPanel({ subPath }: { subPath: string }) {
   const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
   const [selection, setSelection] = useState<Selection | null>(null);
   const [adding, setAdding] = useState<string | null>(null);
+  const [preparing, setPreparing] = useState(false);
   const labels = LABELS[language];
+  const trackerIssue = snapshots?.find((snapshot) => snapshot.trackerError !== null && snapshot.trackerError !== undefined);
 
   const refresh = useCallback(async () => {
     if (!projectId) return;
@@ -1455,7 +1936,7 @@ function TeamPanel({ subPath }: { subPath: string }) {
       setProjectName(result.projectName);
     } catch (cause) {
       setFlash(errorText(cause));
-      setSnapshots((current) => current ?? []);
+      setSnapshots(null);
     } finally {
       setLoading(false);
     }
@@ -1508,6 +1989,31 @@ function TeamPanel({ subPath }: { subPath: string }) {
           </Button>
         </div>
       </div>
+      <ProjectTracker projectId={projectId} language={language} onChanged={refresh} />
+      {trackerIssue?.trackerError && (
+        <div className="flex flex-wrap items-center gap-2 rounded-md bg-muted px-3 py-2 text-sm">
+          <span role="alert" className="grow">
+            <span className="text-amber-600">{labels.trackerAbsent}</span>
+            <span className="block text-xs text-muted-foreground">{trackerIssue.trackerError.message}</span>
+          </span>
+          <Button
+            disabled={preparing}
+            onClick={async () => {
+              setPreparing(true);
+              try {
+                await onAction(async () => {
+                  const { status } = await rpc.call("trackerPrepare", { projectId, team: trackerIssue.team });
+                  return status === "created" ? labels.databaseCreated : labels.databaseReady;
+                });
+              } finally {
+                setPreparing(false);
+              }
+            }}
+          >
+            {preparing ? labels.loading : labels.createDatabase}
+          </Button>
+        </div>
+      )}
       {flash && (
         <div className="flex items-start gap-2 rounded-md bg-muted px-3 py-2 text-sm text-muted-foreground">
           <span className="grow">{flash}</span>
@@ -1516,7 +2022,7 @@ function TeamPanel({ subPath }: { subPath: string }) {
           </button>
         </div>
       )}
-      {projectId && snapshots === null && <Notice>{labels.loading}</Notice>}
+      {projectId && loading && snapshots === null && <Notice>{labels.loading}</Notice>}
       {projectId && snapshots !== null && (snapshots.length === 0 || creating) && (
         <>
           {snapshots.length === 0 && <Notice>{labels.noTeams}</Notice>}
@@ -1577,41 +2083,191 @@ function TeamPanel({ subPath }: { subPath: string }) {
 
 /* ──────────────────────── Settings: template editor ──────────────────────── */
 
+function useEditorSettings() {
+  const rpc = useRpc<typeof rpcContract>();
+  const [settings, setSettings] = useState<EditorSettings | null>(null);
+  const refresh = useCallback(async () => {
+    try {
+      setSettings(await rpc.call("editorSettings", null));
+    } catch {
+      setSettings(null);
+    }
+  }, [rpc]);
+  useEffect(() => {
+    void refresh();
+  }, [refresh]);
+  return { settings, setSettings, refresh };
+}
+
 function TemplatesSettings() {
   const rpc = useRpc<typeof rpcContract>();
-  const { data, refresh } = useTemplates();
+  const { data, refresh: refreshTemplates } = useTemplates();
+  const { settings, setSettings, refresh: refreshSettings } = useEditorSettings();
   const providers = useProviders();
-  const labels = LABELS[data?.language ?? "en"];
+  const language = settings?.language ?? data?.language ?? "en";
+  const labels = LABELS[language];
+  const settingLabels = stringsFor("defaultTemplate", language);
+  const generatorMeta = GENERATOR_SELECTION_META.generatorSelection[language];
   const [selected, setSelected] = useState<string | null>(null);
-  const [draft, setDraft] = useState<TeamTemplate | null>(null);
+  const [drafts, setDrafts] = useState<Record<string, TeamTemplate>>({});
   const [flash, setFlash] = useState<string | null>(null);
+  const [policyDraftValid, setPolicyDraftValid] = useState(true);
   const [newId, setNewId] = useState("");
   const [newTitle, setNewTitle] = useState("");
   const [newKinds, setNewKinds] = useState<string[]>(["lead", "developer", "junior", "tester"]);
 
+  // Initialize a draft for the selected template only when we do not already have one.
   useEffect(() => {
-    const template = data?.templates.find((tpl) => tpl.id === selected) ?? null;
-    setDraft(template ? structuredClone(template) : null);
+    if (!data || !selected) return;
+    const template = data.templates.find((tpl) => tpl.id === selected);
+    if (!template) {
+      setSelected(null);
+      return;
+    }
+    setDrafts((current) => {
+      if (current[selected]) return current;
+      return { ...current, [selected]: structuredClone(template) };
+    });
   }, [data, selected]);
+
+  // If the selected template disappears from the catalog, deselect it.
+  useEffect(() => {
+    if (!data || !selected) return;
+    if (!data.templates.some((tpl) => tpl.id === selected)) setSelected(null);
+  }, [data, selected]);
+
+  const draft = selected ? drafts[selected] ?? null : null;
+  const readOnly = Boolean(draft?.builtin);
+
+  const updateDraft = (patch: Partial<TeamTemplate> | ((prev: TeamTemplate) => TeamTemplate)) => {
+    if (!selected || !drafts[selected]) return;
+    setDrafts((current) => ({
+      ...current,
+      [selected]: typeof patch === "function" ? patch(current[selected]!) : { ...current[selected]!, ...patch },
+    }));
+  };
 
   const act = async (action: () => Promise<string>) => {
     try {
       setFlash(await action());
-      await refresh();
     } catch (cause) {
       setFlash(`${labels.failed}: ${errorText(cause)}`);
     }
   };
 
+  const saveDefaultTemplate = async (id: string) => {
+    try {
+      const next = await rpc.call("editorSettingsSet", { defaultTemplate: id });
+      setSettings(next);
+      await refreshTemplates();
+      setFlash(labels.defaultSaved);
+    } catch (cause) {
+      setFlash(`${labels.failed}: ${errorText(cause)}`);
+    }
+  };
+
+  const saveGeneratorSelection = async (next: ExecutionModel | undefined) => {
+    try {
+      const generatorSelection: GeneratorSelection | null = next
+        ? {
+            providerId: next.providerId ?? "",
+            model: next.model ?? "",
+            ...(next.reasoningLevel ? { reasoningLevel: next.reasoningLevel as GeneratorSelection["reasoningLevel"] } : {}),
+            ...(next.serviceTier ? { serviceTier: next.serviceTier } : {}),
+          }
+        : null;
+      const result = await rpc.call("editorSettingsSet", { generatorSelection });
+      setSettings(result);
+      setFlash(labels.generatorSaved);
+    } catch (cause) {
+      setFlash(`${labels.failed}: ${errorText(cause)}`);
+    }
+  };
+
+  const onSaveTemplate = async () => {
+    if (!draft) return;
+    if (!policyDraftValid || draft.roles.some(role => role.executionPolicy && findDuplicateFallback(role.executionPolicy.fallbacks))) {
+      setFlash(labels.policyDraftIncomplete); return;
+    }
+    const { builtin: _builtin, ...body } = draft;
+    void _builtin;
+    await act(async () => {
+      await rpc.call("templateSave", { template: cleanTemplate(body) });
+      return labels.saved(draft.id);
+    });
+    await refreshTemplates();
+  };
+
+  const onDeleteTemplate = async () => {
+    if (!draft || draft.builtin) return;
+    await act(async () => {
+      await rpc.call("templateDelete", { id: draft.id });
+      setSelected(null);
+      return labels.deleted(draft.id);
+    });
+    await refreshTemplates();
+    await refreshSettings();
+  };
+
+  const onDuplicateTemplate = async () => {
+    if (!draft) return;
+    if (!policyDraftValid || draft.roles.some(role => role.executionPolicy && findDuplicateFallback(role.executionPolicy.fallbacks))) { setFlash(labels.policyDraftIncomplete); return; }
+    const { builtin: _builtin, ...body } = draft;
+    void _builtin;
+    await act(async () => {
+      let id = `${draft.id}-copy`;
+      for (let n = 2; data?.templates.some((tpl) => tpl.id === id); n += 1) id = `${draft.id}-copy-${n}`;
+      await rpc.call("templateSave", { template: cleanTemplate({ ...body, id }) });
+      setSelected(id);
+      return labels.saved(id);
+    });
+    await refreshTemplates();
+  };
+
   if (!data) return <Notice>{labels.loading}</Notice>;
-  const readOnly = Boolean(draft?.builtin);
-  const { builtin: _builtin, ...draftBody } = draft ?? ({} as TeamTemplate);
-  void _builtin;
+
+  const defaultTemplateId = settings?.defaultTemplate ?? data.defaultTemplate;
+  const generatorValue: ExecutionModel | undefined = settings?.generatorSelection
+    ? {
+        providerId: settings.generatorSelection.providerId,
+        model: settings.generatorSelection.model,
+        reasoningLevel: settings.generatorSelection.reasoningLevel,
+        serviceTier: settings.generatorSelection.serviceTier,
+      }
+    : undefined;
 
   return (
     <div className="flex flex-col gap-3">
+      <h2 className="text-sm font-semibold text-foreground">{labels.settingsTitle}</h2>
       <div className="text-xs text-muted-foreground">{labels.templatesHint}</div>
       {flash && <Notice>{flash}</Notice>}
+
+      {/* Default template picker */}
+      <div className="flex flex-wrap items-end gap-2 rounded-lg border border-border bg-card p-3">
+        <label className="flex flex-col gap-1 text-xs text-muted-foreground">
+          {settingLabels.label}
+          <select
+            value={defaultTemplateId}
+            onChange={(event) => void saveDefaultTemplate(event.target.value)}
+            className={inputClass}
+          >
+            {data.templates.map((tpl) => (
+              <option key={tpl.id} value={tpl.id}>
+                {tpl.title}
+              </option>
+            ))}
+          </select>
+        </label>
+        {settings && !settings.defaultTemplateExists && (
+          <Notice tone="warn">{labels.defaultTemplateMissing(settings.defaultTemplate)}</Notice>
+        )}
+        {settings?.reloadHint && <Notice tone="warn">{settings.reloadHint}</Notice>}
+        {settingLabels.description && (
+          <div className="text-xs text-muted-foreground">{settingLabels.description}</div>
+        )}
+      </div>
+
+      {/* Template tabs */}
       <div className="flex flex-wrap gap-1">
         {data.templates.map((tpl) => (
           <button
@@ -1627,6 +2283,8 @@ function TemplatesSettings() {
           </button>
         ))}
       </div>
+
+      {/* Selected template editor (same form for builtin and user) */}
       {draft && (
         <div className="flex flex-col gap-2 rounded-lg border border-border bg-card p-3">
           <div className="flex flex-wrap gap-2">
@@ -1640,7 +2298,7 @@ function TemplatesSettings() {
                 aria-label={labels.title}
                 value={draft.title}
                 disabled={readOnly}
-                onChange={(event) => setDraft({ ...draft, title: event.target.value })}
+                onChange={(event) => updateDraft({ title: event.target.value })}
                 className={`${inputClass} w-56`}
               />
             </label>
@@ -1649,61 +2307,31 @@ function TemplatesSettings() {
               <input
                 value={draft.description ?? ""}
                 disabled={readOnly}
-                onChange={(event) => setDraft({ ...draft, description: event.target.value || undefined })}
+                onChange={(event) => updateDraft({ description: event.target.value || undefined })}
                 className={inputClass}
               />
             </label>
           </div>
-          {readOnly ? (
-            <div className="text-xs text-foreground">{draft.roles.map((role) => role.title ?? role.name).join(" · ")}</div>
-          ) : (
-            <RolesEditor
-              roles={draft.roles}
-              onChange={(roles) => setDraft({ ...draft, roles })}
-              labels={labels}
-              kinds={data.kinds}
-              providers={providers}
-              withPrompt
-            />
-          )}
+          <RolesEditor
+            key={selected}
+            onPolicyDraftValidityChange={setPolicyDraftValid}
+            roles={draft.roles}
+            onChange={(roles) => updateDraft({ roles })}
+            labels={labels}
+            kinds={data.kinds}
+            providers={providers}
+            withPrompt
+            readOnly={readOnly}
+          />
           <div className="flex gap-1.5">
             {readOnly ? (
-              <Button
-                onClick={() =>
-                  void act(async () => {
-                    let id = `${draft.id}-copy`;
-                    for (let n = 2; data.templates.some((tpl) => tpl.id === id); n += 1) id = `${draft.id}-copy-${n}`;
-                    await rpc.call("templateSave", { template: cleanTemplate({ ...draftBody, id }) });
-                    setSelected(id);
-                    return labels.saved(id);
-                  })
-                }
-              >
-                {labels.duplicate}
-              </Button>
+              <Button onClick={() => void onDuplicateTemplate()}>{labels.duplicate}</Button>
             ) : (
               <>
-                <Button
-                  variant="primary"
-                  onClick={() =>
-                    void act(async () => {
-                      await rpc.call("templateSave", { template: cleanTemplate(draftBody) });
-                      return labels.saved(draft.id);
-                    })
-                  }
-                >
+                <Button variant="primary" disabled={!policyDraftValid || Boolean(draft.roles.some(role => role.executionPolicy && findDuplicateFallback(role.executionPolicy.fallbacks)))} onClick={() => void onSaveTemplate()}>
                   {labels.save}
                 </Button>
-                <Button
-                  variant="ghost"
-                  onClick={() =>
-                    void act(async () => {
-                      await rpc.call("templateDelete", { id: draft.id });
-                      setSelected(null);
-                      return labels.deleted(draft.id);
-                    })
-                  }
-                >
+                <Button variant="ghost" onClick={() => void onDeleteTemplate()}>
                   {labels.delete}
                 </Button>
               </>
@@ -1711,6 +2339,24 @@ function TemplatesSettings() {
           </div>
         </div>
       )}
+
+      {/* Prompt-draft generator connection point */}
+      <div className="flex flex-col gap-2 rounded-lg border border-dashed border-border p-3">
+        <strong className="text-xs text-foreground">{generatorMeta.label}</strong>
+        {generatorMeta.description && (
+          <div className="text-xs text-muted-foreground">{generatorMeta.description}</div>
+        )}
+        <ExecutionModelPicker
+          value={generatorValue}
+          onChange={(next) => void saveGeneratorSelection(next)}
+          language={labels === LABELS.ru ? "ru" : "en"}
+                    defaultLabel={labels.defaultProvider}
+          selectLabel={labels.selectModel}
+          useDefaultLabel={labels.useDefault}
+        />
+      </div>
+
+      {/* Create new template */}
       <form
         onSubmit={(event) => {
           event.preventDefault();
@@ -1721,14 +2367,26 @@ function TemplatesSettings() {
             setNewId("");
             setNewTitle("");
             return labels.saved(newId);
-          });
+          }).then(() => refreshTemplates());
         }}
         className="flex flex-col gap-2 rounded-lg border border-dashed border-border p-3"
       >
         <strong className="text-xs text-foreground">{labels.newTemplate}</strong>
         <div className="flex flex-wrap gap-2">
-          <input aria-label={labels.templateId} placeholder={labels.templateId} value={newId} onChange={(event) => setNewId(event.target.value.toLowerCase())} className={inputClass} />
-          <input aria-label={labels.title} placeholder={labels.title} value={newTitle} onChange={(event) => setNewTitle(event.target.value)} className={`${inputClass} w-56`} />
+          <input
+            aria-label={labels.templateId}
+            placeholder={labels.templateId}
+            value={newId}
+            onChange={(event) => setNewId(event.target.value.toLowerCase())}
+            className={inputClass}
+          />
+          <input
+            aria-label={labels.title}
+            placeholder={labels.title}
+            value={newTitle}
+            onChange={(event) => setNewTitle(event.target.value)}
+            className={`${inputClass} w-56`}
+          />
         </div>
         <div className="text-xs text-muted-foreground">{labels.kinds}</div>
         <div className="flex flex-wrap gap-2">
@@ -1765,8 +2423,6 @@ export default definePluginApp((app) => {
   });
   app.slots.settingsSection({
     id: "templates",
-    title: "Team templates / Шаблоны команд",
-    description: "Teams to create from: roles, providers, models, prompts",
     component: TemplatesSettings,
   });
 });

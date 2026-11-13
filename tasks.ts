@@ -1,7 +1,8 @@
 // Work packages ("tasks") of a team: pure store operations.
 // The server keeps one store per project in bb.storage.kv under taskKey().
 
-import { TASK_STATUSES, isOpenTask, type TaskStatus, type TeamTask } from "./snapshot";
+import { TASK_STATUSES, isOpenTask, type TaskId, type TaskStatus, type TeamTask } from "./snapshot";
+import { mergeReviewRecord } from "./review";
 
 export interface TaskStore {
   nextId: number;
@@ -44,7 +45,7 @@ export function normalizeTaskStore(raw: unknown): TaskStore {
           (TASK_STATUSES as readonly string[]).includes(task.status),
       )
     : [];
-  const maxId = tasks.reduce((max, task) => Math.max(max, task.id), 0);
+  const maxId = tasks.reduce((max, task) => Math.max(max, Number(task.id)), 0);
   const nextId =
     typeof value.nextId === "number" && value.nextId > maxId ? value.nextId : maxId + 1;
   return { nextId, tasks };
@@ -119,7 +120,7 @@ export function addTask(
   };
 }
 
-export function findTask(store: TaskStore, id: number): TeamTask {
+export function findTask(store: TaskStore, id: TaskId): TeamTask {
   const task = store.tasks.find((item) => item.id === id);
   if (!task) throw new TaskError("task_not_found", `task #${id} not found`);
   return task;
@@ -127,7 +128,7 @@ export function findTask(store: TaskStore, id: number): TeamTask {
 
 export function updateTask(
   store: TaskStore,
-  id: number,
+  id: TaskId,
   patch: { status?: TaskStatus; title?: string; note?: string | null; role?: string },
   nowMs: number,
 ): { store: TaskStore; task: TeamTask; previous: TeamTask } {
@@ -150,7 +151,29 @@ export function updateTask(
   };
 }
 
-export function removeTask(store: TaskStore, id: number): { store: TaskStore; task: TeamTask } {
+/**
+ * Merge review/acceptance data into the task's own row (built-in tracker).
+ * Append-only through mergeReviewRecord: old decisions survive, an invalid
+ * or oversized append is an explicit error, nothing is silently dropped.
+ */
+export function applyTaskReview(
+  store: TaskStore,
+  id: TaskId,
+  patch: { submission?: unknown; decision?: unknown },
+): { store: TaskStore; task: TeamTask } {
+  const task = findTask(store, id);
+  const review = mergeReviewRecord(task.review, patch);
+  const updated: TeamTask = { ...task, review };
+  return {
+    store: {
+      nextId: store.nextId,
+      tasks: store.tasks.map((item) => (item.id === id ? updated : item)),
+    },
+    task: updated,
+  };
+}
+
+export function removeTask(store: TaskStore, id: TaskId): { store: TaskStore; task: TeamTask } {
   const task = findTask(store, id);
   return {
     store: { nextId: store.nextId, tasks: store.tasks.filter((item) => item.id !== id) },
@@ -165,11 +188,11 @@ export function listTasks(
   return store.tasks
     .filter((task) => (filter.role ? task.role === filter.role : true))
     .filter((task) => (filter.includeClosed ? true : isOpenTask(task.status)))
-    .sort((a, b) => a.id - b.id);
+    .sort((a, b) => a.createdAtMs - b.createdAtMs || String(a.id).localeCompare(String(b.id), undefined, { numeric: true }));
 }
 
 /** Open tasks of a role already in work: the "one active package" rule. */
-export function busyTasks(store: TaskStore, role: string, exceptId?: number): TeamTask[] {
+export function busyTasks(store: TaskStore, role: string, exceptId?: TaskId): TeamTask[] {
   return store.tasks.filter(
     (task) =>
       task.role === role &&

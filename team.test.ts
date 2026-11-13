@@ -11,6 +11,7 @@ import plugin, {
 } from "./server";
 import { escapeHtml, renderReportHtml, renderReportMarkdown } from "./report";
 import { layoutHierarchy, type TeamSnapshot } from "./snapshot";
+import { sessionHandoffPolicy, executorReviewPolicy } from "./messages";
 import {
   addTask,
   busyTasks,
@@ -45,6 +46,8 @@ interface FakeThread {
   title: string;
   archivedAt: number | null;
   notifyOn: string[];
+  extraMetadata?: Record<string,unknown>;
+  queuedInput?: {type:"text";text:string;mentions:[]}[];
 }
 
 const CONFIG = `
@@ -107,14 +110,14 @@ function makeHost(
       title: thread.title,
       archivedAt: thread.archivedAt,
       environmentId: "env_1",
+      queuedMessageCount: thread.queuedInput?1:0,
       updatedAt: Date.now() - 60_000,
     });
-  const metadataOf = (thread: FakeThread): Record<string, unknown> =>
-    thread.role
+  const metadataOf = (thread: FakeThread): Record<string, unknown> => ({...thread.extraMetadata, ...(thread.role
       ? { teamRole: thread.role, teamNotifyOn: thread.notifyOn, ...(thread.team ? { teamName: thread.team } : {}) }
       : thread.helperOf
         ? { teamHelperOf: thread.helperOf, ...(thread.team ? { teamName: thread.team } : {}) }
-        : {};
+        : {})});
   const project = (id: string, name: string, path: string) => ({
     id,
     name,
@@ -138,7 +141,12 @@ function makeHost(
 
   const { bb, harness } = createFakePluginHost({
     pluginId: "team",
-    settings: opts.settings ?? {},
+    settings: {defaultTracker: "builtin", ...opts.settings},
+    experimental_hostEntry: true,
+    experimental_callHostRpc: async ({method}) => {
+      if (method === "gitState") return {branch:"feat/demo",commit:"abc123",fingerprint:"dirty-content-hash",dirtyFiles:["src/profile.ts"]};
+      throw new Error(`Unexpected host call ${method}`);
+    },
     sdk: {
       system: { config: async () => ({ primaryHostId: "host_1" }) },
       projects: {
@@ -174,7 +182,7 @@ function makeHost(
             environmentProviderId: "project-checkout",
           },
         ],
-        get: async () => ({ id: "env_1", hostId: "host_1" }),
+        get: async () => ({ id: "env_1", hostId: "host_1", path: "/ws/demo", status:"ready" }),
       },
       providers: {
         list: async () => [{ id: "pi", available: true }],
@@ -185,6 +193,12 @@ function makeHost(
         create: async ({ name }: { name: string }) => ({ id: "sec_new", name }),
       },
       threads: {
+        queuedMessages:{list:async({threadId}:{threadId:string})=>threads.get(threadId)?.queuedInput?[{state:"waiting",originPluginId:"team",waitingOn:{kind:"plugin",pluginId:"team"},content:threads.get(threadId)!.queuedInput}]:[]},
+        experimental_listDescendants: async ({threadIds}:{threadIds:string[]}) => ({threads:threadIds.map(threadId=>{
+          const ids=new Set<string>();
+          for(let pass=0;pass<threads.size;pass++) for(const t of threads.values()) if(t.parentThreadId===threadId||(t.parentThreadId&&ids.has(t.parentThreadId))) ids.add(t.id);
+          return {threadId,descendantIds:[...ids]};
+        })}),
         list: async ({ offset, projectId }: { offset?: number; projectId?: string } = {}) =>
           (offset ?? 0) > 0 || (projectId && projectId !== "proj_1") ? [] : [...threads.values()].map(toResponse),
         experimental_listPluginMetadata: async ({ threadIds }: { threadIds: string[] }) => ({
@@ -203,6 +217,7 @@ function makeHost(
           return toResponse(thread);
         },
         spawn: async (args: Record<string, unknown>) => {
+          if (Array.isArray(args.input) && args.input.length===0) throw new Error("HTTP 400: input must contain at least one entry");
           spawnNo += 1;
           const meta = (args.pluginMetadata ?? {}) as {
             teamRole?: string;
@@ -212,12 +227,14 @@ function makeHost(
           const thread: FakeThread = {
             id: `thr_new${spawnNo}`,
             role: meta.teamRole ?? null,
-            status: "active",
+            status: (args.pluginMetadata as Record<string,unknown>)?.teamReplacement === true ? "idle" : "active",
             parentThreadId: (args.parentThreadId as string | undefined) ?? null,
             providerId: "pi",
             title: String(args.title ?? ""),
             archivedAt: null,
             notifyOn: meta.teamNotifyOn ?? [],
+            extraMetadata: args.pluginMetadata as Record<string,unknown> ?? {},
+            ...((args.pluginMetadata as Record<string,unknown>)?.teamReplacement?{status:"pending",queuedInput:args.input as {type:"text";text:string;mentions:[]}[]}:{}),
             ...(meta.teamName ? { team: meta.teamName } : {}),
           };
           threads.set(thread.id, thread);
@@ -251,6 +268,8 @@ function makeHost(
           remove?: string[];
         }) => {
           const thread = threads.get(threadId)!;
+          thread.extraMetadata = {...thread.extraMetadata, ...set};
+          for(const key of remove ?? []) delete thread.extraMetadata[key];
           if (set?.teamRole) thread.role = set.teamRole;
           if (set?.teamName) thread.team = set.teamName;
           if (set?.teamHelperOf) thread.helperOf = set.teamHelperOf;
@@ -274,8 +293,18 @@ function makeHost(
       },
     },
   });
+  const originalRecheck=bb.experimental_hooks.recheck;
+  bb.experimental_hooks.recheck=async hook=>{
+    await originalRecheck(hook);
+    for(const thread of threads.values()) if(thread.queuedInput) {
+      const decision=await harness.inspection.registrations.hooks["message.dispatch"]!({thread:toResponse(thread),initiator:"agent",originPluginId:"team"} as never);
+      if(decision.action==="proceed"){thread.queuedInput=undefined;thread.status="idle";}
+    }
+  };
   return { bb, harness, files, threads };
 }
+
+const CHECKPOINT_CONTENT = {goal:"Preserve profile changes",criteria:["Profile works"],progress:"Edited src/profile.ts",decisions:[{what:"Reuse environment",why:"Keep dirty changes"}],checks:[{what:"Targeted test",result:"pass"}],blockers:[],nextAction:"Finish profile",files:["src/profile.ts"]};
 
 const TEAM_THREADS = [
   { id: "thr_lead", role: "lead", title: "Lead" },
@@ -561,7 +590,7 @@ describe("bb team task", () => {
     expect(send!.threadId).toBe("thr_dev");
     expect(send!.text).toContain("Work package #1: Login form");
     expect(send!.text).toContain("Use the design");
-    expect(send!.text).toContain("@thread:thr_lead");
+    expect(send!.text).toContain("bb team tell lead");
     const second = await harness.behavior.runCli([
       "task", "add", "developer", "Profile", "--send", "--project", "demo",
     ]);
@@ -574,7 +603,7 @@ describe("bb team task", () => {
     await harness.behavior.runCli(["task", "add", "tester", "Smoke", "--project", "demo"]);
     const list = await harness.behavior.runCli(["task", "list", "--project", "demo"]);
     expect(list.stdout).toContain("#1 [todo] tester — Smoke");
-    const done = await harness.behavior.runCli(["task", "done", "#1", "--project", "demo"]);
+    const done = await harness.behavior.runCli(["task", "done", "#1", "--reason", "Manual acceptance of the fixture package", "--project", "demo"]);
     expect(done.stdout).toContain("todo → done");
     expect((await harness.behavior.runCli(["task", "list", "--project", "demo"])).stdout).toContain(
       "No open work packages",
@@ -797,16 +826,25 @@ describe("bb team stop", () => {
 
 describe("bb team replace", () => {
   it("исполнитель: новый тред с передачей дел, старый отвязан и архивирован", async () => {
-    const { bb, harness, threads } = makeHost({ threads: TEAM_THREADS });
+    const { bb, harness, threads, files } = makeHost({ threads: TEAM_THREADS });
     await plugin(bb);
     await harness.behavior.runCli(["task", "add", "developer", "Profile page", "--project", "demo"]);
+    files.set("/ws/demo/checkpoint.json", JSON.stringify(CHECKPOINT_CONTENT));
+    const saved = await harness.behavior.runCli(["checkpoint","1","--file","checkpoint.json","--project","demo"]);
+    expect(saved.exitCode, saved.stderr).toBe(0);
     const result = await harness.behavior.runCli(["replace", "developer", "--project", "demo"]);
     expect(result.exitCode).toBe(0);
     const spawn = harness.inspection.sdk.callsTo("threads.spawn")[0]![0] as Record<string, unknown>;
     expect(spawn.parentThreadId).toBe("thr_lead");
-    expect(String(spawn.prompt)).toContain("@thread:thr_dev");
-    expect(String(spawn.prompt)).toContain("Finished package #1: login form.");
-    expect(String(spawn.prompt)).toContain("#1 Profile page");
+    expect(spawn.environment).toEqual({type:"reuse",environmentId:"env_1"});
+    expect((spawn.input as {text:string}[])).toHaveLength(1);
+    expect(spawn.prompt).toBeUndefined();
+    const handoff={text:(spawn.input as {text:string}[])[0]!.text};
+    expect(harness.inspection.recheckCount).toBeGreaterThan(0);
+    expect(handoff.text).toContain("@thread:thr_dev");
+    expect(handoff.text).toContain("Preserve profile changes");
+    expect(handoff.text).toContain("#1 Profile page");
+    expect(handoff.text).not.toContain("Finished package #1: login form.");
     expect(threads.get("thr_dev")!.role).toBeNull();
     expect(threads.get("thr_dev")!.archivedAt).not.toBeNull();
     const notice = sendsOf(harness).find((s) => s.threadId === "thr_lead");
@@ -814,8 +852,11 @@ describe("bb team replace", () => {
   });
 
   it("руководитель: исполнители переезжают под новый тред; --keep не архивирует", async () => {
-    const { bb, harness, threads } = makeHost({ threads: TEAM_THREADS });
+    const { bb, harness, threads, files } = makeHost({ threads: TEAM_THREADS });
     await plugin(bb);
+    await harness.behavior.runCli(["task","add","lead","Coordination","--project","demo"]);
+    files.set("/ws/demo/checkpoint.json",JSON.stringify(CHECKPOINT_CONTENT));
+    expect((await harness.behavior.runCli(["checkpoint","1","--file","checkpoint.json","--project","demo"])).exitCode).toBe(0);
     const result = await harness.behavior.runCli(["replace", "lead", "--keep", "--project", "demo", "--json"]);
     const data = JSON.parse(result.stdout) as { newThreadId: string; reparented: number; archived: boolean };
     expect(data.reparented).toBe(2);
@@ -859,7 +900,9 @@ describe("bb team init: шаблоны и --from", () => {
     expect(result.exitCode).toBe(0);
     expect(result.stdout).toContain("removed 1 threadId");
     expect(files.get("/ws/demo/.bb/teams/main.yaml")).not.toContain("thr_old");
-    expect(files.get("/ws/demo/.bb/teams/main/dev.md")).toBe("Dev prompt\n");
+    expect(files.get("/ws/demo/.bb/teams/main/dev.md")).toContain(`Dev prompt\n\n${executorReviewPolicy("en")}`);
+    expect(files.get("/ws/demo/.bb/teams/main/dev.md")).toContain(sessionHandoffPolicy("en"));
+    expect(files.get("/ws/other/.bb/team/roles/dev.md")).toBe("Dev prompt");
   });
 });
 
@@ -1102,10 +1145,12 @@ describe("добавление исполнителя", () => {
     await harness.behavior.callRpc("roleAdd", {
       projectId: "proj_1",
       team: "core",
-      role: { name: "reviewer", kind: "reviewer", title: "Reviewer" },
+      role: { name: "reviewer", kind: "reviewer", title: "Reviewer", provider: "pi", model: "ollama-cloud/glm-5.3", reasoningLevel: "high", serviceTier: "fast", executionPolicy:{noAdditionalCost:true,fallbacks:[{provider:"pi",model:"approved-backup"}]} },
       threadId: "thr_free",
     });
     expect(files.get("/ws/demo/.bb/teams/core.yaml")).toContain("threadId: thr_free");
+    expect(files.get("/ws/demo/.bb/teams/core.yaml")).toContain("serviceTier: fast");
+    expect(files.get("/ws/demo/.bb/teams/core.yaml")).toContain("model: approved-backup");
     expect(threads.get("thr_free")!.role).toBe("reviewer");
     expect(threads.get("thr_free")!.team).toBe("core");
     expect(threads.get("thr_free")!.parentThreadId).toBe("thr_cl");
@@ -1251,7 +1296,7 @@ describe("шаблоны команд", () => {
   });
 
   it("сохранить текущую команду как шаблон и создать по нему новую", async () => {
-    const { bb, harness, files } = makeHost();
+    const { bb, harness, files } = makeHost({ config: CONFIG.replace("    prompt: Report to", "    model: ollama-cloud/glm-5.3\n    reasoningLevel: high\n    serviceTier: fast\n    executionPolicy:\n      noAdditionalCost: true\n      fallbacks:\n        - provider: pi\n          model: approved-backup\n    prompt: Report to") });
     await plugin(bb);
     const saved = await harness.behavior.runCli(["template", "save", "mine", "--from-team", "main", "--project", "demo"]);
     expect(saved.exitCode).toBe(0);
@@ -1260,6 +1305,10 @@ describe("шаблоны команд", () => {
     const copied = files.get("/ws/demo/.bb/teams/copy.yaml")!;
     expect(copied).toContain("name: developer");
     expect(copied).toContain("notifyOn:");
+    expect(copied).toContain("model: ollama-cloud/glm-5.3");
+    expect(copied).toContain("reasoningLevel: high");
+    expect(copied).toContain("serviceTier: fast");
+    expect(copied).toContain("model: approved-backup");
     expect(files.get("/ws/demo/.bb/teams/copy/developer.md")).toContain("Report to {{leadThreadRef}}.");
   });
 
@@ -1329,12 +1378,14 @@ describe("приёмка пакетов", () => {
     const self = await harness.behavior.runCli(["task", "done", "1"], { projectId: "proj_1", threadId: "thr_test" });
     expect(self.exitCode).not.toBe(0);
     expect(self.stderr).toContain("only the lead accepts");
-    const review = await harness.behavior.runCli(["task", "update", "1", "--status", "review"], {
+    const review = await harness.behavior.runCli(["task", "update", "1", "--status", "review", "--review", JSON.stringify({result:"Smoke passed", checks:[{what:"Smoke criteria",result:"All met"}]})], {
       projectId: "proj_1",
       threadId: "thr_test",
     });
     expect(review.exitCode).toBe(0);
-    const accepted = await harness.behavior.runCli(["task", "done", "1"], { projectId: "proj_1", threadId: "thr_lead" });
+    const listed = await harness.behavior.runCli(["task", "list", "--all", "--json", "--project", "demo"]);
+    const submissionId = JSON.parse(listed.stdout).tasks[0].review.submission.id;
+    const accepted = await harness.behavior.runCli(["task", "done", "1", "--reason", "Compared the report with smoke criteria", "--expected-submission", submissionId], { projectId: "proj_1", threadId: "thr_lead" });
     expect(accepted.exitCode).toBe(0);
   });
 });
@@ -1367,4 +1418,125 @@ describe("examples/teams", () => {
     expect(lead.name).toBe("lead");
     expect(roles.map((r) => r.name)).toEqual(["lead", "developer", "junior", "tester"]);
   });
+});
+
+describe("manual replacement recovery",()=>{
+  it("aborts before switch and restores helpers without launching a model",async()=>{
+    const {bb,harness,threads}=makeHost({threads:[...TEAM_THREADS,{id:"thr_candidate",role:null,parentThreadId:"thr_lead",queuedInput:[{type:"text",text:"handoff",mentions:[]}],extraMetadata:{teamReplacement:true,teamReplacementRole:"developer",teamReplacementTeam:"main"}},{id:"thr_helper",role:null,helperOf:"developer",parentThreadId:"thr_candidate"}]});
+    await plugin(bb);
+    await bb.storage.kv.set("replacement:proj_1:main:developer",{oldThreadId:"thr_dev",newThreadId:"thr_candidate",environmentId:"env_1",keep:false,stage:"spawning",delivery:"pending",reparented:1,resumed:false,startedAt:0});
+    const result=await harness.behavior.runCli(["replace","developer","--abort","--project","demo","--json"]);
+    expect(result.exitCode,result.stderr).toBe(0);
+    expect(JSON.parse(result.stdout).aborted).toBe(true);
+    expect(threads.get("thr_dev")!.role).toBe("developer");
+    expect(threads.get("thr_dev")!.archivedAt).toBeNull();
+    expect(threads.get("thr_helper")!.parentThreadId).toBe("thr_dev");
+    expect(threads.get("thr_candidate")!.archivedAt).not.toBeNull();
+    expect(harness.inspection.sdk.callsTo("threads.spawn")).toHaveLength(0);
+    expect(harness.inspection.sdk.callsTo("threads.send")).toHaveLength(0);
+  });
+  it("refuses abort after the canonical role switched",async()=>{
+    const {bb,harness}=makeHost({threads:TEAM_THREADS});await plugin(bb);
+    await bb.storage.kv.set("active-session:proj_1:main:developer","thr_fresh");
+    await bb.storage.kv.set("replacement:proj_1:main:developer",{oldThreadId:"thr_dev",newThreadId:"thr_fresh",environmentId:"env_1",keep:false,stage:"switching",delivery:"pending",reparented:0,resumed:false,startedAt:0});
+    const result=await harness.behavior.runCli(["replace","developer","--abort","--project","demo"]);
+    expect(result.exitCode).not.toBe(0);expect(result.stderr).toContain("already switched");
+    expect(harness.inspection.sdk.callsTo("threads.archive")).toHaveLength(0);
+  });
+});
+
+describe("held replacement prompt",()=>{
+  it("holds preparation and partial switch, then releases only the canonical session",async()=>{
+    const {bb,harness,threads}=makeHost({threads:[...TEAM_THREADS,{id:"thr_candidate",role:null,extraMetadata:{teamReplacement:true,teamReplacementRole:"developer",teamReplacementTeam:"main"}}]});
+    await plugin(bb);
+    const hook=harness.inspection.registrations.hooks["message.dispatch"]!;
+    const dispatch=(id:string)=>hook({thread:{id,projectId:"proj_1"},initiator:"agent",originPluginId:"team"} as never);
+    expect(await dispatch("thr_candidate")).toMatchObject({action:"wait"});
+    const candidate=threads.get("thr_candidate")!;candidate.role="developer";candidate.team="main";candidate.extraMetadata={teamReplacement:false};
+    await bb.storage.kv.set("active-session:proj_1:main:developer","thr_candidate");
+    const intent={oldThreadId:"thr_dev",newThreadId:"thr_candidate",environmentId:"env_1",keep:false,stage:"switching",delivery:"pending",reparented:0,resumed:false,startedAt:0};
+    await bb.storage.kv.set("replacement:proj_1:main:developer",intent);
+    expect(await dispatch("thr_candidate")).toMatchObject({action:"wait"});
+    expect(await dispatch("thr_dev")).toMatchObject({action:"wait"});
+    await bb.storage.kv.set("replacement:proj_1:main:developer",{...intent,stage:"complete",delivery:"sent"});
+    expect(await dispatch("thr_candidate")).toEqual({action:"proceed"});
+  });
+});
+
+describe("doctor after adopted-role replacement",()=>{
+  it("uses the canonical session instead of requiring the old configured thread",async()=>{
+    const {bb,harness}=makeHost({threads:TEAM_THREADS,config:CONFIG.replace('    title: Developer','    title: Developer\n    threadId: thr_previous')});
+    await plugin(bb);
+    await bb.storage.kv.set('active-session:proj_1:main:developer','thr_dev');
+    const result=await harness.behavior.runCli(['doctor','--project','demo','--json']);
+    expect(result.exitCode,result.stdout+result.stderr).toBe(0);
+    expect(result.stdout).toContain('current session overrides initial threadId');
+  });
+});
+
+describe('review feedback keeps the task session',()=>{
+  it('returns the same package to in-progress while keeping the next package queued',async()=>{
+    const {bb,harness}=makeHost({threads:TEAM_THREADS});await plugin(bb);
+    const run=(args:string[])=>harness.behavior.runCli([...args,'--project','demo','--json']);
+    expect((await run(['task','add','developer','Fix current','--send'])).exitCode).toBe(0);
+    expect((await run(['task','update','1','--status','review'])).exitCode).toBe(0);
+    const feedback=await run(['task','update','1','--status','in-progress','--return-reason','Add the missing smoke check']);
+    expect(feedback.exitCode,feedback.stderr).toBe(0);
+    const next=JSON.parse((await run(['task','add','developer','Next package','--send'])).stdout);
+    expect(next.task.status).toBe('todo');expect(next.sentTo).toBeNull();
+    expect(harness.inspection.sdk.callsTo('threads.spawn')).toHaveLength(0);
+    expect(sendsOf(harness).filter(x=>x.threadId==='thr_dev')).toHaveLength(2);
+    const repeat=await run(['task','update','1','--status','in-progress','--return-reason','Add the missing smoke check']);
+    expect(repeat.exitCode,repeat.stderr).toBe(0);
+    expect(sendsOf(harness).filter(x=>x.threadId==='thr_dev')).toHaveLength(2);
+    expect(await bb.storage.kv.get('session-task:proj_1:main:thr_dev')).toBe(1);
+  });
+});
+
+describe('tracker changes preserve execution references',()=>{
+  it('rejects switching a consumed session to another backend while allowing an explicit pin of the current one',async()=>{
+    const {bb,harness}=makeHost({threads:TEAM_THREADS.map(t=>({...t,status:'idle'}))});await plugin(bb);
+    await harness.behavior.runCli(['task','add','developer','Complete package','--send','--project','demo']);
+    await harness.behavior.runCli(['task','done','1','--reason','Manual acceptance of the fixture package','--project','demo']);
+    const denied=await harness.behavior.runCli(['tracker','beads','--project','demo']);
+    expect(denied.exitCode).not.toBe(0);expect(denied.stderr).toContain('replace completed role sessions');
+    const pin=await harness.behavior.runCli(['tracker','builtin','--project','demo','--json']);
+    expect(pin.exitCode,pin.stderr).toBe(0);expect(JSON.parse(pin.stdout).override).toBe('builtin');
+    expect(await bb.storage.kv.get('session-task:proj_1:main:thr_dev')).toBe(1);
+  });
+});
+
+ it("keeps uncertain rework delivery visible on retry without resending", async()=>{
+   const {bb,harness}=makeHost({threads:TEAM_THREADS});await plugin(bb);
+   const run=(args:string[])=>harness.behavior.runCli([...args,"--project","demo","--json"]);
+   await run(["task","add","developer","Fix","--send"]);
+   await run(["task","update","1","--status","review"]);
+   harness.sdk.stub("threads.send",async()=>{throw new Error("transport interrupted");});
+   const args=["task","update","1","--status","in-progress","--return-reason","Add missing check"];
+   const first=await run(args);expect(first.exitCode).not.toBe(0);expect(first.stderr).toContain("uncertain");
+   const sends=harness.inspection.sdk.callsTo("threads.send").length;
+   const retry=await run(args);expect(retry.exitCode).not.toBe(0);expect(retry.stderr).toContain("uncertain");
+   expect(harness.inspection.sdk.callsTo("threads.send")).toHaveLength(sends);
+   const tasks=JSON.parse((await run(["task","list","--all"])).stdout).tasks;
+   expect(tasks[0].status).toBe("in-progress");expect(tasks[0].review.decisions).toHaveLength(1);
+ });
+
+it("edits an existing role profile without spawning, rejects stale saves, and supplies it at spawn",async()=>{
+ const {bb,harness,files}=makeHost({threads:[]});await plugin(bb);
+ const scope={projectId:"proj_1",team:"main",role:"developer"};
+ const before=await harness.behavior.callRpc("rolePolicy",scope) as {revision:string};
+ const policy={noAdditionalCost:true,fallbacks:[{provider:"pi",model:"approved-backup",reasoningLevel:"future-reasoning",serviceTier:"future-tier"}]};
+ await harness.behavior.callRpc("rolePolicy",{...scope,primary:{provider:"pi",model:"qwen",serviceTier:"explicit-tier"},policy,expectedRevision:before.revision});
+ expect(files.get("/ws/demo/.bb/team.yaml")).toContain("approved-backup");
+ expect(files.get("/ws/demo/.bb/team.yaml")).toContain("explicit-tier");
+ expect(harness.inspection.sdk.callsTo("threads.spawn")).toHaveLength(0);
+ await expect(harness.behavior.callRpc("rolePolicy",{...scope,policy:null,expectedRevision:before.revision})).rejects.toThrow(/changed/);
+ const reread=await harness.behavior.callRpc("rolePolicy",scope) as {role:{executionPolicy:unknown};revision:string};
+ expect(reread.role.executionPolicy).toEqual(policy);
+ const created=await harness.behavior.runCli(["create","--project","demo"]);expect(created.exitCode,created.stderr).toBe(0);
+ const spawns=harness.inspection.sdk.callsTo("threads.spawn").map(call=>call[0] as {prompt:string;pluginMetadata:{teamRole:string}});
+ expect(spawns.find(row=>row.pluginMetadata.teamRole==="lead")!.prompt).toContain("approved-backup");
+ expect(spawns.find(row=>row.pluginMetadata.teamRole==="developer")!.prompt).toContain("future-tier");
+ await harness.behavior.callRpc("rolePolicy",{...scope,policy:null,expectedRevision:reread.revision});
+ expect(files.get("/ws/demo/.bb/team.yaml")).not.toContain("approved-backup");
 });

@@ -5,6 +5,8 @@
 import { PluginCliError, type BbPluginApi } from "@get-bb/plugin-sdk";
 import { load as loadYaml } from "js-yaml";
 import { z } from "zod";
+import { executionPolicySchema } from "./execution-policy";
+import { hasLeadPolicy, leadAutonomyPolicy, sessionHandoffPolicy, executorReviewPolicy } from "./messages";
 import type { Language } from "./snapshot";
 import type { Strings } from "./strings";
 import {
@@ -61,6 +63,7 @@ export const roleSchema = z.object({
   notifyOn: z.array(z.enum(NOTIFY_EVENTS)).optional(),
   prompt: z.string().optional(),
   promptFile: z.string().optional(),
+  executionPolicy: executionPolicySchema.optional(),
 });
 
 export const teamConfigSchema = z.object({
@@ -505,7 +508,18 @@ export function roleEnvironmentSpec(role: Role, config: TeamConfig): string {
   return applyVars(raw, config.vars);
 }
 
-/** The role prompt: inline, from its file, else the built-in prompt of its kind. */
+function hasExecutorReviewPolicy(text: string, lang: Language): boolean {
+  return (
+    text.includes("Отчёт и приёмка пакета Team:") ||
+    text.includes("Team package review and acceptance:")
+  );
+}
+
+/** The role prompt: inline, from its file, else the built-in prompt of its kind.
+ * For the lead role, the common autonomous lead policy is appended once if it
+ * is not already present (built-in/generated prompts already include it). User
+ * prompt files and inline prompts are preserved verbatim; the policy is added
+ * in memory at the single point used by both spawn and replace. */
 export async function loadRolePrompt(
   bb: BbPluginApi,
   workspace: Workspace,
@@ -514,22 +528,38 @@ export async function loadRolePrompt(
   lang: Language,
   t: Strings,
 ): Promise<string> {
-  if (role.prompt) return role.prompt;
-  if (!role.promptFile) return builtinPrompt(lang, { ...role, lead });
-  const abs = joinPath(workspace.path, role.promptFile);
-  requireInsideWorkspace(workspace.path, abs);
-  try {
-    const file = await bb.sdk.files.read({
-      hostId: workspace.hostId,
-      path: abs,
-      rootPath: workspace.path,
-    });
-    return file.content;
-  } catch {
-    throw new PluginCliError(t.promptFileMissing(role.name, role.promptFile), {
-      code: "prompt_file_missing",
-    });
+  let prompt: string;
+  if (role.prompt) {
+    prompt = role.prompt;
+  } else if (role.promptFile) {
+    const abs = joinPath(workspace.path, role.promptFile);
+    requireInsideWorkspace(workspace.path, abs);
+    try {
+      const file = await bb.sdk.files.read({
+        hostId: workspace.hostId,
+        path: abs,
+        rootPath: workspace.path,
+      });
+      prompt = file.content;
+    } catch {
+      throw new PluginCliError(t.promptFileMissing(role.name, role.promptFile), {
+        code: "prompt_file_missing",
+      });
+    }
+  } else {
+    prompt = builtinPrompt(lang, { ...role, lead });
   }
+
+  if (lead && !hasLeadPolicy(prompt, lang)) {
+    prompt = `${prompt}\n\n${leadAutonomyPolicy(lang)}\n\nThis lead policy applies together with the prompt above and must be preserved across session replacements.`;
+  }
+  if (!lead && !hasExecutorReviewPolicy(prompt, lang)) {
+    prompt = `${prompt}\n\n${executorReviewPolicy(lang)}\n\nThis review policy applies to executor packages and must be preserved across session replacements.`;
+  }
+  if (!prompt.includes("Team session handoff:") && !prompt.includes("Передача сессии Team:")) {
+    prompt = `${prompt}\n\n${sessionHandoffPolicy(lang)}`;
+  }
+  return prompt;
 }
 
 /* ──────────────────────── Threads: roles and helpers ──────────────────────── */
@@ -597,6 +627,7 @@ export async function scanTeamThreads(bb: BbPluginApi, projectId: string): Promi
   const active = await listProjectThreads(bb, projectId);
   const byId = new Map(active.map((thread) => [thread.id, thread]));
   const marks = new Map<string, { team: string; role: string; helper: boolean }>();
+  const retired = new Set<string>();
   for (let index = 0; index < active.length; index += THREAD_PAGE) {
     const batch = active.slice(index, index + THREAD_PAGE);
     if (batch.length === 0) break;
@@ -604,9 +635,16 @@ export async function scanTeamThreads(bb: BbPluginApi, projectId: string): Promi
       threadIds: batch.map((thread) => thread.id),
     });
     for (const entry of meta.threads) {
+      if (entry.metadata?.teamRetired === true || entry.metadata?.teamReplacement === true) { retired.add(entry.threadId); continue; }
       const mark = readTeamMark(entry.metadata as Record<string, unknown>);
       if (mark) marks.set(entry.threadId, mark);
     }
+  }
+  // A replacement has one durable destination even during partial metadata updates.
+  for (const [id, mark] of marks) {
+    if (mark.helper) continue;
+    const canonical = await bb.storage.kv.get<string>(`active-session:${projectId}:${mark.team}:${mark.role}`);
+    if (canonical && canonical !== id) { marks.delete(id); retired.add(id); }
   }
   // Unmarked nested threads inherit the nearest team ancestor's role as helpers.
   const resolve = (id: string, depth = 0): { team: string; role: string } | null => {
@@ -619,6 +657,7 @@ export async function scanTeamThreads(bb: BbPluginApi, projectId: string): Promi
   const rows: TeamThreadRow[] = [];
   const free: ThreadDto[] = [];
   for (const thread of active) {
+    if (retired.has(thread.id)) continue;
     const own = marks.get(thread.id);
     const inherited = own ? null : thread.parentThreadId ? resolve(thread.parentThreadId) : null;
     const mark = own ?? (inherited ? { ...inherited, helper: true } : null);

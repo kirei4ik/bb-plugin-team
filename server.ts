@@ -1,3 +1,6 @@
+import { verifyQuotaBoundary } from "./checkpoint";
+import { ResourceControl, resourcePolicySchema, withResourceResults, confirmedQuota, type ResourceOwner, type ResourceSummary } from "./resource-control";
+import { executionPolicySchema, withExecutionProfile, type ExecutionFallbackSelection } from "./execution-policy";
 // bb-plugin-team — role-based agent teams for a project.
 //
 // A project may hold several teams; each team is a lead plus executors,
@@ -19,11 +22,14 @@ import {
   cliCommand,
   defineCli,
   defineRpcContract,
+  experimental_PluginRpcRefusal,
   type BbPluginApi,
   type PluginMentionItem,
 } from "@get-bb/plugin-sdk";
-import { dump as dumpYaml } from "js-yaml";
+import { dump as dumpYaml, load as loadYaml } from "js-yaml";
 import { z } from "zod";
+import { createHash } from "node:crypto";
+import { contextView, sessionViewSchema, type SessionView } from "./session-view";
 import * as core from "./core";
 import {
   ensureSection,
@@ -58,19 +64,35 @@ import {
   type Workspace,
 } from "./core";
 import { messages, type Messages } from "./messages";
+import {
+  GENERATOR_SELECTION_KV_KEY,
+  generalSettingDescriptors,
+  generatorSelectionSchema,
+  languageSettingDescriptor,
+  parseGeneratorSelection,
+  settingsMessages,
+  type GeneratorSelection,
+} from "./settings-localization";
 import { renderReportHtml, renderReportMarkdown } from "./report";
 import {
   TASK_STATUSES,
   currentTask,
+  deriveExecutionState,
   relativeAgo,
+  type AutoContinueStage,
   type Language,
   type SnapshotRole,
   type SnapshotThread,
+  type TaskId,
   type TaskStatus,
   type TeamSnapshot,
   type TeamTask,
 } from "./snapshot";
 import { strings, type Strings } from "./strings";
+import { createTaskTracker, isTrackerAbsentError } from "./tracker";
+import { captureCheckpoint, verifyCheckpoint, workCheckpointSchema } from "./checkpoint";
+import { acceptanceGate, latestDecision, type AcceptanceCaller, type AcceptanceDecision } from "./review";
+import { replaceSession, readReplacementIntent, isPreparedReplacement, activeSessionKey, type ReplacementIntent, type ReplacementResult } from "./sessions";
 import {
   TaskError,
   addTask,
@@ -188,14 +210,11 @@ export function stripThreadIds(yamlText: string): { text: string; stripped: numb
   return { text, stripped };
 }
 
-export function parseTaskId(value: string): number {
-  const id = Number(value.replace(/^#/, ""));
-  if (!Number.isInteger(id) || id <= 0) {
-    throw new PluginCliError(`task id must be a positive number: "${value}"`, {
-      code: "invalid_value",
-    });
-  }
-  return id;
+export function parseTaskId(value: string): TaskId {
+  const raw = value.replace(/^#/, "");
+  if (/^[1-9][0-9]*$/.test(raw) && Number.isSafeInteger(Number(raw))) return Number(raw);
+  if (/^[A-Za-z][A-Za-z0-9_]*-[A-Za-z0-9][A-Za-z0-9._-]{0,180}$/.test(raw)) return raw;
+  throw new PluginCliError(`invalid task id: "${value}"`, { code: "invalid_value" });
 }
 
 export type DoctorLevel = "ok" | "warn" | "fail";
@@ -241,6 +260,19 @@ const teamSchema = z.string().regex(/^[a-z0-9][a-z0-9-]{0,31}$/);
 
 /** The Team panel's and template editor's data plane (app.tsx imports the type). */
 export const rpcContract = defineRpcContract({
+  trackerConfig: {
+    input: z.object({ projectId: projectIdSchema }).strict(),
+    output: z.object({kind: z.enum(["beads", "builtin"]), override: z.enum(["beads", "builtin"]).nullable()}),
+  },
+  trackerSet: {
+    input: z.object({ projectId: projectIdSchema, kind: z.enum(["beads", "builtin"]).nullable() }).strict(),
+    output: z.object({ok: z.boolean()}),
+  },
+  /** Create the selected tracker's missing storage (Beads: the one bd init). */
+  trackerPrepare: {
+    input: z.object({ projectId: projectIdSchema, team: teamSchema }).strict(),
+    output: z.object({ status: z.enum(["ready", "created"]) }),
+  },
   projects: {
     input: z.null(),
     output: z.object({ projects: z.array(z.object({ id: z.string(), name: z.string() })) }),
@@ -287,6 +319,14 @@ export const rpcContract = defineRpcContract({
     input: z.object({ projectId: projectIdSchema, team: teamSchema }).strict(),
     output: z.object({ spawned: z.number() }),
   },
+  sessionView: {
+    input: z.object({ projectId: projectIdSchema, team: teamSchema, role: z.string().min(1).max(100) }).strict(),
+    output: sessionViewSchema,
+  },
+  sessionRotate: {
+    input: z.object({ projectId: projectIdSchema, team: teamSchema, role: z.string().min(1).max(100), expectedThreadId: z.string().min(1).max(200) }).strict(),
+    output: sessionViewSchema,
+  },
   /** Stop a role's running threads (bb team stop <role>). */
   stop: {
     input: z.object({ projectId: projectIdSchema, team: teamSchema, role: z.string().min(1).max(100) }).strict(),
@@ -310,15 +350,49 @@ export const rpcContract = defineRpcContract({
       templates: z.array(templateOutSchema),
       kinds: z.array(z.object({ kind: z.string(), title: z.string() })),
       language: z.enum(["en", "ru"]),
+      defaultTemplate: z.string(),
     }),
   },
   templateSave: {
     input: z.object({ template: templateSchema }).strict(),
     output: z.object({ ok: z.boolean() }),
   },
+  /** Delete one of your templates. */
   templateDelete: {
     input: z.object({ id: teamSchema }).strict(),
     output: z.object({ ok: z.boolean() }),
+  },
+  /**
+   * General Team settings for the Settings → Team editor UI. `language` and
+   * `defaultTemplate` live in the plugin settings handle (single source);
+   * `generatorSelection` is a standalone setting in one kv key.
+   */
+  editorSettings: {
+    input: z.null(),
+    output: z.object({
+      language: z.enum(["en", "ru"]),
+      defaultTemplate: z.string(),
+      defaultTemplateExists: z.boolean(),
+      generatorSelection: generatorSelectionSchema.nullable(),
+      reloadHint: z.string(),
+    }),
+  },
+  /** Persist a partial update; returns the effective values after the write. */
+  editorSettingsSet: {
+    input: z
+      .object({
+        language: z.enum(["en", "ru"]).optional(),
+        defaultTemplate: z.string().min(1).max(200).optional(),
+        generatorSelection: generatorSelectionSchema.nullable().optional(),
+      })
+      .strict(),
+    output: z.object({
+      language: z.enum(["en", "ru"]),
+      defaultTemplate: z.string(),
+      defaultTemplateExists: z.boolean(),
+      generatorSelection: generatorSelectionSchema.nullable(),
+      reloadHint: z.string(),
+    }),
   },
   templateNew: {
     input: z
@@ -355,6 +429,14 @@ export const rpcContract = defineRpcContract({
       .strict(),
     output: z.object({ role: z.string(), threadId: z.string().nullable() }),
   },
+  rolePolicy: {
+    input:z.object({projectId:projectIdSchema,team:teamSchema,role:z.string(),primary:templateRoleSchema.pick({provider:true,model:true,reasoningLevel:true,serviceTier:true}).strict().optional(),policy:executionPolicySchema.nullable().optional(),expectedRevision:z.string().optional()}).strict(),
+    output:z.object({role:templateRoleSchema,source:z.string(),revision:z.string()}),
+  },
+  resources: {
+    input:z.object({projectId:projectIdSchema,team:teamSchema,reason:z.string().trim().min(1).max(4000).optional(),role:z.string().optional(),policy:resourcePolicySchema.optional(),taskId:z.union([z.number().int().positive(),z.string().min(1).max(200)]).optional()}).strict(),
+    output:z.custom<ResourceSummary>(),
+  },
   setVersioned: {
     input: z.object({ projectId: projectIdSchema, team: teamSchema, versioned: z.boolean() }).strict(),
     output: z.object({ versioned: z.boolean(), blocked: z.boolean() }),
@@ -388,8 +470,14 @@ export const rpcContract = defineRpcContract({
       .object({
         projectId: projectIdSchema,
         team: teamSchema,
-        id: z.number().int().positive(),
+        id: z.union([z.number().int().positive(), z.string().min(1).max(200)]),
         status: z.enum(TASK_STATUSES),
+        /** bbt-iwi.2: review submission / acceptance grounds (manual path from the panel). */
+        review: z.unknown().optional(),
+        acceptReason: z.string().max(4000).optional(),
+        returnReason: z.string().max(4000).optional(),
+        /** bbt-iwi.2 fix: the id of the submission the caller reviewed; a mismatch is a conflict with no writes. */
+        expectedSubmissionId: z.string().min(1).max(100).nullable().optional(),
       })
       .strict(),
     output: z.object({ task: taskSchema }),
@@ -405,34 +493,66 @@ export const rpcContract = defineRpcContract({
 export default async function plugin(bb: BbPluginApi) {
   bb.log.info("loaded");
 
-  const settings = bb.settings.define({
-    language: {
-      type: "select",
-      options: ["en", "ru"],
-      default: "en",
-      label: "Language / Язык",
-      description: "CLI output, panel and template language: en (English) or ru (Русский)",
-    },
-    teamSection: {
-      type: "boolean",
-      default: true,
-      label: "Team sidebar sections",
-      description: "Keep each team's threads in its own sidebar section (Team · <name>)",
-    },
-    roster: {
-      type: "boolean",
-      default: true,
-      label: "Send team roster",
-      description: "Send the team roster message to the lead after bb team create",
-    },
-    titleFormat: {
-      type: "string",
-      default: DEFAULT_TITLE_FORMAT,
-      label: "Thread title format",
-      description:
-        "Title of team threads: {team} and {role} placeholders; {team} is dropped while the project has one team",
-    },
+  /*
+   * Settings, two-phase: `language` is defined first and read from the same
+   * settings store (load-safe inside the factory), then the rest register with
+   * RU-only or EN-only labels. The SDK has no runtime metadata update and
+   * `bb.sdk.plugins.getSettings` 404s until the factory has run, so the label
+   * language is fixed at load; switching language shows new native labels
+   * after `bb plugin reload team` (surfaced as reloadHint in editorSettings).
+   */
+  const languageSettings = bb.settings.define({
+    language: languageSettingDescriptor(),
   });
+  let nativeLang = "en" as "en" | "ru";
+  try {
+    nativeLang = (await languageSettings.get()).language === "ru" ? "ru" : "en";
+  } catch {
+    // settings unavailable at load — English until the first command
+  }
+  const generalSettings = bb.settings.define(generalSettingDescriptors(nativeLang));
+
+  /** Combined view of both handles — the same settings store, split only by key. */
+  type SettingsValues = {
+    defaultTracker: string;
+    defaultTemplate: string;
+    language: string;
+    teamSection: boolean;
+    roster: boolean;
+    titleFormat: string;
+  };
+  const settings = {
+    async get(): Promise<SettingsValues> {
+      const [languageValues, generalValues] = await Promise.all([
+        languageSettings.get(),
+        generalSettings.get(),
+      ]);
+      return { ...languageValues, ...generalValues } as SettingsValues;
+    },
+    async experimental_set(
+      values: Partial<{
+        language: "en" | "ru" | null;
+        defaultTracker: "beads" | "builtin" | null;
+        defaultTemplate: string | null;
+        teamSection: boolean | null;
+        roster: boolean | null;
+        titleFormat: string | null;
+      }>,
+    ) {
+      const { language, ...general } = values;
+      const merged: Record<string, string | number | boolean> = {};
+      if (language !== undefined) {
+        Object.assign(merged, await languageSettings.experimental_set({ language }));
+      }
+      const generalPatch = Object.fromEntries(
+        Object.entries(general).filter(([, value]) => value !== undefined),
+      );
+      if (Object.keys(generalPatch).length > 0) {
+        Object.assign(merged, await generalSettings.experimental_set(generalPatch));
+      }
+      return merged;
+    },
+  };
 
   let currentLang: Language = "en";
   const loadLang = async (): Promise<{ lang: Language; t: Strings; m: Messages }> => {
@@ -542,6 +662,20 @@ export default async function plugin(bb: BbPluginApi) {
   /* ── Templates (server-wide, in plugin storage) ── */
 
   const TEMPLATES_KEY = "templates";
+
+  /* Generator selection: one standalone kv setting, separate from role models. */
+  const readGeneratorSelection = async (): Promise<GeneratorSelection | null> =>
+    parseGeneratorSelection(await bb.storage.kv.get(GENERATOR_SELECTION_KV_KEY));
+  const writeGeneratorSelection = async (
+    selection: GeneratorSelection | null,
+  ): Promise<void> => {
+    if (selection === null) {
+      await bb.storage.kv.delete(GENERATOR_SELECTION_KV_KEY);
+      return;
+    }
+    await bb.storage.kv.set(GENERATOR_SELECTION_KV_KEY, selection);
+  };
+
   const readUserTemplates = async (): Promise<TeamTemplate[]> => {
     const raw = await bb.storage.kv.get<unknown[]>(TEMPLATES_KEY);
     if (!Array.isArray(raw)) return [];
@@ -563,6 +697,13 @@ export default async function plugin(bb: BbPluginApi) {
     if (builtinTemplates("en").some((tpl) => tpl.id === id)) {
       const err = m.templateBuiltin(id);
       throw new PluginCliError(err.message, { code: "template_builtin", hint: err.hint });
+    }
+    // The saved default template must not disappear behind the user's back:
+    // refuse with a clear, localized error instead of a silent fallback.
+    if ((await settings.get()).defaultTemplate === id) {
+      const { lang } = await loadLang();
+      const err = settingsMessages(lang).templateIsDefault(id);
+      throw new PluginCliError(err.message, { code: "template_is_default", hint: err.hint });
     }
     const list = await readUserTemplates();
     if (!list.some((tpl) => tpl.id === id)) {
@@ -618,6 +759,8 @@ export default async function plugin(bb: BbPluginApi) {
           ...(role.provider ? { provider: role.provider } : {}),
           ...(role.model ? { model: role.model } : {}),
           ...(role.reasoningLevel ? { reasoningLevel: role.reasoningLevel } : {}),
+          ...(role.serviceTier ? { serviceTier: role.serviceTier } : {}),
+          ...(role.executionPolicy ? { executionPolicy: role.executionPolicy } : {}),
           ...(role.environment ? { environment: role.environment } : {}),
           ...(role.name === lead.name ? { lead: true } : {}),
           ...(role.enabled === false ? { enabled: false } : {}),
@@ -650,12 +793,11 @@ export default async function plugin(bb: BbPluginApi) {
 
   /* ── Work packages: one kv store per project team ── */
 
-  const readTasks = async (scope: Scope): Promise<TaskStore> =>
-    normalizeTaskStore(await bb.storage.kv.get(taskKey(scope.projectId, scope.team)));
-  const writeTasks = async (scope: Scope, store: TaskStore): Promise<void> => {
-    await bb.storage.kv.set(taskKey(scope.projectId, scope.team), store);
-    publishChange(scope.projectId);
-  };
+  const tracker = createTaskTracker(bb, {
+    defaultTracker: async () => (await settings.get()).defaultTracker === "builtin" ? "builtin" : "beads",
+    publish: publishChange,
+  });
+  const readTasks = (scope: Scope) => tracker.read(scope);
 
   // Serialize read-modify-write cycles per project/team. Two concurrent
   // taskAdd/taskUpdate calls must not read the same snapshot and then have the
@@ -664,7 +806,7 @@ export default async function plugin(bb: BbPluginApi) {
   // mutations (addRole, create) and pause state.
   const scopeLocks = new Map<string, Promise<void>>();
   const withScopeLock = async <T>(scope: Scope, fn: () => Promise<T>): Promise<T> => {
-    const key = `${scope.projectId}:${scope.team}`;
+    const key = scope.projectId;
     const previous = scopeLocks.get(key) ?? Promise.resolve();
     let release!: () => void;
     const gate = new Promise<void>((resolve) => (release = resolve));
@@ -678,20 +820,36 @@ export default async function plugin(bb: BbPluginApi) {
       if (scopeLocks.get(key) === chain) scopeLocks.delete(key);
     }
   };
-  const mutateTasks = async <T>(
-    scope: Scope,
-    fn: (store: TaskStore) => { store: TaskStore; value: T },
-  ): Promise<T> =>
-    withScopeLock(scope, async () => {
-      const current = await readTasks(scope);
-      const { store, value } = fn(current);
-      await writeTasks(scope, store);
-      return value;
-    });
   const asCliError = (error: unknown): never => {
     if (error instanceof TaskError) throw new PluginCliError(error.message, { code: error.code });
     throw error;
   };
+
+  const setProjectTracker = async (workspace: Workspace, kind: "beads" | "builtin" | null) =>
+    withScopeLock({...workspace, team: DEFAULT_TEAM}, async () => {
+      const current=await tracker.getConfig(workspace);
+      const effective=kind ?? ((await settings.get()).defaultTracker==="builtin"?"builtin":"beads");
+      if(current.kind===effective){await tracker.setConfig(workspace,kind);publishChange(workspace.projectId);return;}
+      const scan = await scanTeamThreads(bb, workspace.projectId);
+      if (scan.rows.some(row => RUNNING.includes(row.status))) throw new PluginCliError("Stop or finish active team work before changing the project tracker", {code: "role_busy"});
+      for(const row of scan.rows.filter(row=>!row.helper)) {
+        if(await bb.storage.kv.get(sessionTaskKey({...workspace,team:row.team},row.threadId))!==undefined) throw new PluginCliError("Save final checkpoints and replace completed role sessions before changing trackers; old execution references stay in their original tracker",{code:"session_consumed"});
+      }
+      for (const team of await allTeams(workspace, scan)) {
+        const scope = {...workspace, team};
+        // Missing database is still an explicit error on reads, but it must not
+        // prevent the human from explicitly selecting the built-in tracker.
+        let tasks: TaskStore;
+        try { tasks = await readTasks(scope); }
+        catch (error) {
+          if (kind === "builtin") continue;
+          throw error;
+        }
+        if (tasks.tasks.some(task => task.status === "in-progress" || task.status === "review")) throw new PluginCliError("Accept or drop active packages before switching trackers", {code: "role_busy"});
+      }
+      await tracker.setConfig(workspace, kind);
+      publishChange(workspace.projectId);
+    });
 
   /* ── Pause: executor threads whose agent messages wait in their queues ── */
 
@@ -712,15 +870,37 @@ export default async function plugin(bb: BbPluginApi) {
     bb.log.warn(`pause state not restored: ${(error as Error).message}`);
   }
 
-  bb.experimental_hooks.on("message.dispatch", (ctx) =>
-    pauseDecision(
-      ctx.thread.id,
-      { initiator: ctx.initiator, originPluginId: ctx.originPluginId },
-      bb.pluginId,
-      pausedThreads,
-      messages(currentLang).pauseWaitReason,
-    ),
-  );
+  const resourceOwner = async (threadId:string):Promise<ResourceOwner|null> => {
+    let id=threadId;const seen=new Set<string>();let first:Awaited<ReturnType<typeof bb.sdk.threads.get>>|null=null;
+    let mark:ReturnType<typeof readTeamMark>=null;let bound:TaskId|undefined;let ownerThreadId=threadId;
+    for(let depth=0;depth<20&&!seen.has(id);depth++){
+      seen.add(id);const thread=await bb.sdk.threads.get({threadId:id});first??=thread;
+      const meta=await bb.sdk.threads.getPluginMetadata({threadId:id}) as Record<string,unknown>;
+      mark??=readTeamMark(meta);
+      if(mark){bound=await bb.storage.kv.get<TaskId>(`session-task:${thread.projectId}:${mark.team}:${id}`);if(bound!==undefined){ownerThreadId=id;break;}if(!mark.helper){ownerThreadId=id;break;}}
+      if(!thread.parentThreadId)break;id=thread.parentThreadId;
+    }
+    if(!mark||!first)return null;
+    let hostId:string|null=null;
+    if(first.environmentId)hostId=(await bb.sdk.environments.get({environmentId:first.environmentId})).hostId;
+    return {projectId:first.projectId,team:mark.team,role:mark.role,taskId:bound??null,ownerThreadId,hostId};
+  };
+  const resources=new ResourceControl(bb,resourceOwner,publishChange);
+
+  bb.experimental_hooks.on("message.dispatch", async (ctx) => {
+    const meta = await bb.sdk.threads.getPluginMetadata({threadId:ctx.thread.id}) as Record<string,unknown>;
+    if (meta.teamReplacement === true) return {action:"wait" as const,reason:"Team is preparing this replacement session; the initial prompt stays queued until the role switch completes."};
+    const mark=readTeamMark(meta);
+    if (mark && !mark.helper) {
+      const replacement=await readReplacementIntent(bb,ctx.thread.projectId,mark.team,mark.role);
+      if (replacement && replacement.newThreadId===ctx.thread.id && replacement.stage!=="complete") return {action:"wait" as const,reason:"Team is finishing the role switch before releasing this session."};
+    }
+    const canonical=mark&&!mark.helper?await bb.storage.kv.get<string>(`active-session:${ctx.thread.projectId}:${mark.team}:${mark.role}`):null;
+    if (meta.teamRetired === true || (canonical && canonical!==ctx.thread.id)) return {action:"wait" as const,reason:"This session was replaced. Address the current role using bb team tell <role>."};
+    const paused=pauseDecision(ctx.thread.id,{initiator:ctx.initiator,originPluginId:ctx.originPluginId},bb.pluginId,pausedThreads,messages(currentLang).pauseWaitReason);
+    if(paused.action!=="proceed")return paused;
+    return resources.admit(ctx);
+  });
 
   /** Team context: config (if any), lead, role threads and helpers. */
   const teamContext = async (scope: Scope, t: Strings) => {
@@ -742,6 +922,14 @@ export default async function plugin(bb: BbPluginApi) {
     return { loaded, configError, lead, scan, rows, helpers };
   };
 
+  const notifyResource = async (scope:Scope,role:string,reason:string) => {
+    if(!await resources.notice(scope,`${role}:${reason}`))return;
+    const {t}=await loadLang();const {rows,lead}=await teamContext(scope,t);
+    const target=lead&&lead!==role?rows.get(lead)?.[0]:null;if(!target)return;
+    const text=currentLang==="ru"?`[team] Ресурсы/продолжение ${role} требуют решения: ${reason}. Смотри ресурсы Team или bb team report; не обходи блокировку новой задачей/тредом.`:`[team] ${role} needs a resource/continuation decision: ${reason}. Inspect Team resources or bb team report; do not bypass the hold with another task/thread.`;
+    try{await bb.sdk.threads.send({originPluginId:bb.pluginId,threadId:target.threadId,mode:"queue-if-active",input:[{type:"text",text,mentions:[]}]});}catch{bb.log.warn("Team resource notice could not be delivered; it remains visible in the resource panel");}
+  };
+
   const pause = async (scope: Scope, t: Strings): Promise<{ count: number; already: boolean }> => {
     const existing = await readPause(scope);
     if (existing) return { count: existing.threadIds.length, already: true };
@@ -756,15 +944,22 @@ export default async function plugin(bb: BbPluginApi) {
     return { count: threadIds.length, already: false };
   };
 
-  const resume = async (scope: Scope): Promise<number | null> => {
+  const resume = async (scope: Scope): Promise<number | null> => withScopeLock(scope, async () => {
     const existing = await readPause(scope);
-    if (!existing) return null;
-    await bb.storage.kv.delete(pauseKey(scope));
-    for (const id of existing.threadIds) pausedThreads.delete(id);
+    if (existing) {
+      await bb.storage.kv.delete(pauseKey(scope));
+      for (const id of existing.threadIds) pausedThreads.delete(id);
+    }
     await bb.experimental_hooks.recheck("message.dispatch");
+    const {t} = await loadLang();
+    const {rows} = await teamContext(scope,t);
+    for (const role of rows.keys()) {
+      if (await readAutoContinue(scope, role)) await runAutoContinue(scope, role, t);
+      else await dispatchNextPackage(scope,role,t);
+    }
     publishChange(scope.projectId);
-    return existing.threadIds.length;
-  };
+    return existing?.threadIds.length ?? null;
+  });
 
   /* ── Messages to roles ── */
 
@@ -774,8 +969,11 @@ export default async function plugin(bb: BbPluginApi) {
     text: string,
     t: Strings,
     senderThreadId?: string,
-  ) => {
-    const { rows } = await teamContext(scope, t);
+  ) => withScopeLock(scope, async () => {
+    const { rows, lead } = await teamContext(scope, t);
+    if (wantedRole === "lead" && lead) wantedRole = lead;
+    if (wantedRole !== "all") await assertRoleAvailable(scope, wantedRole);
+    else for (const role of rows.keys()) await assertRoleAvailable(scope, role);
     const targets: Array<[string, TeamThreadRow]> = [];
     if (wantedRole === "all") {
       // "all" never echoes the message back into the sender's own thread.
@@ -788,6 +986,7 @@ export default async function plugin(bb: BbPluginApi) {
         const err = t.tellRoleNotFound(wantedRole);
         throw new PluginCliError(err.message, { code: "role_not_found", hint: err.hint });
       }
+      if (list.length !== 1) throw new PluginCliError("Role has several sessions; select its canonical session with bb team replace --thread", {code:"thread_ambiguous"});
       for (const row of list) targets.push([wantedRole, row]);
     }
     const sent: Array<{ role: string; threadId: string }> = [];
@@ -807,99 +1006,310 @@ export default async function plugin(bb: BbPluginApi) {
       }
     }
     return { sent, failed };
-  };
+  });
 
   /* ── Work package operations (CLI + panel) ── */
+
+  const executionKey = (scope: Scope, id: TaskId) => `execution:${scope.projectId}:${scope.team}:${id}`;
+  const sessionTaskKey = (scope: Scope, threadId: string) => `session-task:${scope.projectId}:${scope.team}:${threadId}`;
+  const checkpointRefKey = (scope: Scope, role: string) => `checkpoint-ref:${scope.projectId}:${scope.team}:${role}`;
+  const assertRoleAvailable = async (scope: Scope, role: string) => {
+    const pending = await bb.storage.kv.get<{stage?: string}>(`replacement:${scope.projectId}:${scope.team}:${role}`);
+    if (pending && pending.stage !== "complete") {
+      throw new PluginCliError(`Role ${role} has an unfinished session replacement; repeat bb team replace ${role} before sending work`, { code: "replacement_pending" });
+    }
+  };
+  const deliverPackage = async (scope: Scope, task: TeamTask, target: TeamThreadRow, lead: string | null, senderThreadId?: string) => {
+    await assertRoleAvailable(scope, task.role);
+    const key = executionKey(scope, task.id);
+    const prior = await bb.storage.kv.get<{ delivery: string }>(key);
+    if (prior) throw new PluginCliError(`Task ${task.id} already has a delivery record (${prior.delivery}); inspect its thread before sending another message`, { code: "delivery_exists" });
+    const assigned = await bb.storage.kv.get<TaskId>(sessionTaskKey(scope,target.threadId));
+    if (assigned !== undefined && assigned !== null && assigned !== task.id) throw new PluginCliError("This session already executed another package; replace it before starting the next",{code:"session_consumed"});
+    await bb.storage.kv.set(sessionTaskKey(scope,target.threadId),task.id);
+    const record = { taskId: task.id, role: task.role, threadId: target.threadId, environmentId: target.environmentId, atMs: Date.now(), delivery: "sending" };
+    await bb.storage.kv.set(key, record);
+    try {
+      const { m } = await loadLang();
+      await bb.sdk.threads.send({
+        originPluginId: bb.pluginId,
+        ...(senderThreadId && senderThreadId !== target.threadId ? { senderThreadId } : {}),
+        threadId: target.threadId, mode: "auto",
+        input: [{type: "text", text: m.taskBody(task.id, task.title, [task.note,task.criteria && `Acceptance criteria: ${task.criteria}`,task.priority !== undefined && `Priority: ${task.priority}`,task.dependencies?.length && `Dependencies: ${task.dependencies.join(", ")}`,task.decisions && `Decisions: ${task.decisions}`,task.result && `Result: ${task.result}`].filter(Boolean).join("\n\n") || null, lead), mentions: []}],
+      });
+    } catch (error) {
+      await bb.storage.kv.set(key, {...record, delivery: "uncertain", error: (error as Error).message});
+      throw error;
+    }
+    await bb.storage.kv.set(key, {...record, delivery: "sent"});
+  };
+  const notifyRework = async (scope: Scope, task: TeamTask, target: TeamThreadRow, decision: AcceptanceDecision) => {
+    const ref = createHash("sha256").update(JSON.stringify(decision)).digest("hex");
+    const key = `review-feedback:${scope.projectId}:${scope.team}:${task.id}:${ref}`;
+    const previous = await bb.storage.kv.get<{delivery: string}>(key);
+    if (previous) {
+      if (previous.delivery !== "sent") throw new PluginCliError("Rework is recorded, but earlier delivery is uncertain; inspect the employee thread before sending another message", {code:"review_delivery_uncertain"});
+      return;
+    }
+    const record = {taskId:task.id, threadId:target.threadId, delivery:"uncertain"};
+    await bb.storage.kv.set(key, record);
+    const {lang} = await loadLang();
+    const text = lang === "ru"
+      ? `[team] Задача #${task.id} возвращена на доработку. Замечание: ${decision.reason}\nПродолжай эту же задачу в текущем окружении; не создавай новый пакет или worktree. После исправления сохрани checkpoint и подай новый --review отчёт.`
+      : `[team] Task #${task.id} needs rework. Remark: ${decision.reason}\nContinue this same task in the current environment; do not create another package or worktree. Save a checkpoint and submit a new --review report after fixing it.`;
+    try {
+      await bb.sdk.threads.send({originPluginId:bb.pluginId,threadId:target.threadId,mode:"queue-if-active",input:[{type:"text",text,mentions:[]}]});
+    } catch {
+      throw new PluginCliError(lang === "ru" ? "Возврат сохранён, но доставка замечания не подтверждена. Проверьте тред сотрудника; автоматического повтора нет." : "Rework is recorded, but remark delivery is uncertain. Inspect the employee thread; it will not be resent automatically.", {code:"review_delivery_uncertain"});
+    }
+    await bb.storage.kv.set(key, {...record, delivery:"sent"});
+  };
+
+  // Called with the project lock held. Task readiness belongs to the tracker.
+  const dispatchNextPackage = async (scope: Scope, role: string, t: Strings): Promise<void> => {
+    if (await readPause(scope)) return;
+    await assertRoleAvailable(scope, role);
+    const store = await readTasks(scope);
+    if (busyTasks(store, role).length) return;
+    const ready = new Set(await tracker.ready(scope));
+    const next = listTasks(store, {role}).find(task => task.status === "todo" && ready.has(task.id));
+    if (!next) return;
+    const {rows, lead} = await teamContext(scope, t);
+    if ((rows.get(role)?.length ?? 0)>1) throw new PluginCliError("Role has several sessions",{code:"thread_ambiguous"});
+    const target = rows.get(role)?.[0];
+    if (!target || RUNNING.includes(target.status)) return;
+    if (await bb.storage.kv.get(sessionTaskKey(scope,target.threadId)) !== undefined) return;
+    const {task} = await tracker.update(scope, next.id, {status: "in-progress"});
+    await deliverPackage(scope, task, target, lead);
+  };
 
   const addPackage = async (
     scope: Scope,
     input: { role: string; title: string; note: string | null; send: boolean },
-    t: Strings,
-    m: Messages,
-    senderThreadId?: string,
-  ): Promise<{ task: TeamTask; sentTo: string | null; busy: TeamTask[]; sendError: string | null }> => {
-    const { loaded, rows, lead } = await teamContext(scope, t);
-    const roles = new Set([...rows.keys(), ...(loaded?.config.roles.map((r) => r.name) ?? [])]);
-    if (!roles.has(input.role)) {
-      const err = m.taskRoleUnknown(input.role);
-      throw new PluginCliError(err.message, { code: "role_not_found", hint: err.hint });
-    }
-    const target = rows.get(input.role)?.[0] ?? null;
-    if (input.send && !target) {
-      const err = m.taskNoThread(input.role);
-      throw new PluginCliError(err.message, { code: "role_not_found", hint: err.hint });
-    }
-    let task: TeamTask;
-    let busy: TeamTask[];
-    try {
-      // busy is computed under the lock so a concurrent add for the same role
-      // sees this package and the "one active package" note stays truthful.
-      ({ task, busy } = await mutateTasks(scope, (current) => {
-        const busy = busyTasks(current, input.role);
-        const result = addTask(
-          current,
-          {
-            role: input.role,
-            title: input.title,
-            note: input.note,
-            status: input.send ? "in-progress" : "todo",
-          },
-          Date.now(),
-        );
-        return { store: result.store, value: { task: result.task, busy } };
-      }));
-    } catch (error) {
-      return asCliError(error);
-    }
-    let sentTo: string | null = null;
-    let sendError: string | null = null;
-    if (input.send && target) {
-      const leadThread = lead && lead !== input.role ? rows.get(lead)?.[0]?.threadId : null;
-      try {
-        await bb.sdk.threads.send({
-          originPluginId: bb.pluginId,
-          ...(senderThreadId && senderThreadId !== target.threadId ? { senderThreadId } : {}),
-          threadId: target.threadId,
-          mode: "auto",
-          input: [
-            {
-              type: "text",
-              text: m.taskBody(task.id, task.title, task.note, leadThread ? `@thread:${leadThread}` : null),
-              mentions: [],
-            },
-          ],
-        });
-        sentTo = target.threadId;
-      } catch (error) {
-        // The package is already persisted; report the partial state instead
-        // of failing the whole command (which would prompt a duplicate retry).
-        sendError = (error as Error).message;
+    t: Strings, m: Messages, senderThreadId?: string,
+  ): Promise<{ task: TeamTask; sentTo: string | null; busy: TeamTask[]; sendError: string | null }> =>
+    withScopeLock(scope, async () => {
+      await assertRoleAvailable(scope, input.role);
+      const {loaded, rows, lead} = await teamContext(scope, t);
+      const roles = new Set([...rows.keys(), ...(loaded?.config.roles.map(r => r.name) ?? [])]);
+      if (!roles.has(input.role)) throw new PluginCliError(m.taskRoleUnknown(input.role).message, {code: "role_not_found"});
+      if (input.send && (rows.get(input.role)?.length ?? 0)>1) throw new PluginCliError("Role has several sessions",{code:"thread_ambiguous"});
+      const target = rows.get(input.role)?.[0];
+      if (input.send && !target) {const err=m.taskNoThread(input.role);throw new PluginCliError(err.message, {code: "role_not_found",hint:err.hint});}
+      const busy = busyTasks(await readTasks(scope), input.role);
+      const consumed = target ? await bb.storage.kv.get(sessionTaskKey(scope,target.threadId)) : undefined;
+      const send = input.send && target && consumed === undefined && busy.length === 0 && !RUNNING.includes(target.status) && !(await readPause(scope));
+      const task = await tracker.add(scope, {...input, status: send ? "in-progress" : "todo"});
+      let sentTo: string | null = null, sendError: string | null = null;
+      if (send && target) {
+        try { await deliverPackage(scope, task, target, lead, senderThreadId); sentTo = target.threadId; }
+        catch (error) { sendError = (error as Error).message; }
       }
+      // A new package can make replacing a consumed session worthwhile;
+      // no record → no-op.
+      if (await readAutoContinue(scope, input.role)) {
+        await runAutoContinue(scope, input.role, t);
+        const fresh = (await readTasks(scope)).tasks.find((x) => x.id === task.id);
+        if (fresh) return {task: fresh, busy, sentTo, sendError};
+      }
+      return {task, busy, sentTo, sendError};
+    });
+
+  /**
+   * Who is changing the task, from the caller thread's real team mark and
+   * project:
+   * "lead" — this team's lead role in THIS project (a lead's helper is NOT
+   * the lead; a same-named team in another project is a foreign agent);
+   * "executor" — any other team-marked thread, including helpers and threads
+   * marked for another team or project (an agent, never the user);
+   * "manual" — no team thread at all: the explicit manual path (the user's
+   * interface — not a proof that a human acted, so records say "manual").
+   * A failing mark/thread read never degrades a known caller to "manual":
+   * it is an explicit error and nothing is written.
+   */
+  const classifyCaller = async (
+    scope: Scope,
+    callerThreadId: string | undefined,
+    t: Strings,
+  ): Promise<{ caller: AcceptanceCaller; callerRole: string | null }> => {
+    if (!callerThreadId) return { caller: "manual", callerRole: null };
+    const refuseUnverified = (error: unknown): never => {
+      throw new PluginCliError(
+        `could not verify the calling team thread (${callerThreadId}): ${(error as Error).message}`,
+        { code: "caller_unverified", hint: "Nothing was changed; re-run the command" },
+      );
+    };
+    let mark: ReturnType<typeof readTeamMark> = null;
+    try {
+      mark = readTeamMark(
+        (await bb.sdk.threads.getPluginMetadata({ threadId: callerThreadId })) as Record<string, unknown>,
+      );
+    } catch (error) {
+      refuseUnverified(error);
     }
-    return { task, sentTo, busy, sendError };
+    if (!mark) return { caller: "manual", callerRole: null };
+    if (mark.helper) return { caller: "executor", callerRole: mark.role };
+    if (mark.team !== scope.team) return { caller: "executor", callerRole: null };
+    let threadProjectId: string | undefined;
+    try {
+      threadProjectId = (await bb.sdk.threads.get({ threadId: callerThreadId })).projectId;
+    } catch (error) {
+      refuseUnverified(error);
+    }
+    if (threadProjectId !== scope.projectId) return { caller: "executor", callerRole: null };
+    const { lead } = await teamContext(scope, t);
+    if (lead !== null && mark.role === lead) return { caller: "lead", callerRole: mark.role };
+    return { caller: "executor", callerRole: mark.role };
   };
 
   const updatePackage = async (
-    scope: Scope,
-    id: number,
-    patch: { status?: TaskStatus; title?: string; note?: string | null },
-  ): Promise<{ task: TeamTask; previous: TeamTask; busy: TeamTask[] }> => {
-    try {
-      const result = await mutateTasks(scope, (current) => {
-        const updated = updateTask(current, id, patch, Date.now());
-        return { store: updated.store, value: updated };
+    scope: Scope, id: TaskId,
+    patch: { status?: TaskStatus; title?: string; note?: string | null; review?: unknown; acceptReason?: string | null; returnReason?: string | null; expectedSubmissionId?: string | null },
+    callerThreadId?: string,
+  ): Promise<{ task: TeamTask; previous: TeamTask; busy: TeamTask[] }> =>
+    withScopeLock(scope, async () => {
+      const { t, m } = await loadLang();
+      const store = await readTasks(scope);
+      const previous = store.tasks.find(task => task.id === id);
+      if (!previous) throw new PluginCliError(`Task ${id} not found`, {code: "task_not_found"});
+      await assertRoleAvailable(scope, previous.role);
+      // Deterministic preflight first: every read-only refusal happens
+      // BEFORE the first tracker write, so a rejected request never leaves
+      // review/acceptance data behind (bbt-iwi.2 review fix).
+      if ((patch.status === "in-progress" || patch.status === "review") && previous.status !== patch.status && busyTasks(store,previous.role,id).length) {
+        throw new PluginCliError("Role already has an active package",{code:"role_busy"});
+      }
+      if (patch.status === "in-progress" && previous.status !== "in-progress" && previous.status !== "review") {
+        if (busyTasks(store, previous.role, id).length) throw new PluginCliError("Role already has an active package", {code:"role_busy"});
+        if (!(await tracker.ready(scope)).includes(id)) throw new PluginCliError("Task is not ready in the selected tracker", {code:"task_not_ready"});
+      }
+      if (patch.status === "in-progress" && previous.status === "todo") {
+        const {rows}=await teamContext(scope,t);const target=rows.get(previous.role)?.[0];
+        if (target) {
+          const assigned = await bb.storage.kv.get<TaskId>(sessionTaskKey(scope,target.threadId));
+          const rework = assigned === id && latestDecision(previous.review)?.decision === "changes-requested";
+          if (assigned !== undefined && !rework) throw new PluginCliError("Replace the completed role session before starting another package",{code:"session_consumed"});
+        }
+        if (!target || RUNNING.includes(target.status) || await readPause(scope)) throw new PluginCliError("Role thread must be idle and unpaused to start the package",{code:"role_busy"});
+      }
+      // bbt-iwi.2: verifiable-acceptance gate in the existing update path.
+      // The server stamps the actor and time; a rewritten report never
+      // re-grounds an old accept. Team threads must ground every acceptance
+      // step; the manual path always requires an explicit reason too.
+      const { caller, callerRole } = await classifyCaller(scope, callerThreadId, t);
+      if (caller === "executor" && callerRole !== previous.role && (patch.status !== undefined || patch.review !== undefined)) {
+        const error = m.onlyLeadAccepts(callerRole ?? previous.role);
+        throw new PluginCliError(error.message, {code:"only_lead_accepts",hint:error.hint});
+      }
+      const stamp = {
+        id: `sub_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`,
+        submittedBy: caller === "manual" ? null : callerRole,
+      };
+      const gate = acceptanceGate({
+        caller,
+        callerRole,
+        from: previous.status,
+        to: patch.status,
+        record: previous.review,
+        submission: patch.review,
+        acceptReason: patch.acceptReason,
+        returnReason: patch.returnReason,
+        expectedSubmissionId: patch.expectedSubmissionId,
+        stamp,
+        nowMs: Date.now(),
       });
-      const busy =
-        patch.status === "in-progress" ? busyTasks(result.store, result.task.role, result.task.id) : [];
-      return { task: result.task, previous: result.previous, busy };
-    } catch (error) {
-      return asCliError(error);
-    }
-  };
+      if (!gate.ok) {
+        const err = gate.code === "review_submission_required" ? m.reviewSubmissionRequired()
+          : gate.code === "acceptance_reason_required" ? m.acceptanceReasonRequired()
+          : gate.code === "return_reason_required" ? m.returnReasonRequired()
+          : gate.code === "submission_conflict" ? m.submissionConflict(
+              String(patch.expectedSubmissionId ?? ""),
+              previous.review?.submission?.id ?? "none",
+            )
+          : m.onlyLeadAccepts(callerRole ?? previous.role);
+        throw new PluginCliError(err.message, { code: gate.code, hint: err.hint });
+      }
+      let reworkTarget: TeamThreadRow | undefined;
+      const returning = (previous.status === "review" || previous.status === "in-progress") && (patch.status === "todo" || patch.status === "in-progress") && !!patch.returnReason?.trim();
+      if (returning) {
+        const {rows} = await teamContext(scope,t);
+        const candidates = rows.get(previous.role) ?? [];
+        if (candidates.length > 1) throw new PluginCliError("Resolve the role current session before returning the task",{code:"thread_ambiguous"});
+        reworkTarget = candidates[0];
+        if (!reworkTarget && patch.status === "in-progress") throw new PluginCliError("The employee has no session for rework",{code:"role_not_found"});
+        if (reworkTarget) {
+          const assigned = await bb.storage.kv.get<TaskId>(sessionTaskKey(scope,reworkTarget.threadId));
+          if (assigned != null && assigned !== id) throw new PluginCliError("This employee session belongs to another task; resolve its assignment before requesting rework",{code:"session_consumed"});
+        }
+      }
+      if (gate.submission || gate.decision) {
+        await tracker.review(scope, id, {
+          ...(gate.submission ? { submission: gate.submission } : {}),
+          ...(gate.decision ? { decision: gate.decision } : {}),
+        });
+      }
+      const result = await (async () => {
+        try {
+          return await tracker.update(scope, id, { status: patch.status, title: patch.title, note: patch.note });
+        } catch (error) {
+          // Never show a successful acceptance when the tracker write failed:
+          // report the real partial state (review data recorded, status not).
+          if (gate.submission || gate.decision) {
+            throw new PluginCliError(
+              `review/acceptance data recorded, but the status update failed: ${(error as Error).message}`,
+              { code: "task_update_failed", hint: `Re-run the same status update; the recorded review data is kept (task ${id})` },
+            );
+          }
+          throw error;
+        }
+      })();
+      publishChange(scope.projectId);
+      const {rows, lead} = await teamContext(scope, t);
+      if (patch.status === "review" || previous.status === "in-progress" || previous.status === "review") {
+        const target=rows.get(previous.role)?.[0];
+        if (target && await bb.storage.kv.get(sessionTaskKey(scope,target.threadId)) === undefined) await bb.storage.kv.set(sessionTaskKey(scope,target.threadId),id);
+      }
+      if (patch.status === "in-progress" && previous.status === "todo") {
+        const target = rows.get(result.task.role)?.[0];
+        if (!target || RUNNING.includes(target.status)) throw new PluginCliError("Task activated but role thread is not idle; inspect the task before retry", {code: "role_busy"});
+        const assigned = await bb.storage.kv.get<TaskId>(sessionTaskKey(scope,target.threadId));
+        const decision = latestDecision(result.task.review);
+        if (assigned === id && decision?.decision === "changes-requested") await notifyRework(scope, result.task, target, decision);
+        else await deliverPackage(scope, result.task, target, lead);
+      }
+      if(previous.status==="review"&&(patch.status==="todo"||patch.status==="in-progress")){
+        const decision=gate.decision??latestDecision(result.task.review);
+        if(decision?.decision==="changes-requested")await resources.returned(scope,id,result.task.role,decision);
+      }
+      if (returning && reworkTarget && patch.status === "in-progress") {
+        const decision = gate.decision ?? latestDecision(result.task.review);
+        if (decision?.decision === "changes-requested") await notifyRework(scope, result.task, reworkTarget, decision);
+      }
+      if (patch.status === "review" && previous.status !== "review" && lead && lead !== result.task.role) {
+        const target = rows.get(lead)?.[0];
+        if (target) await bb.sdk.threads.send({originPluginId: bb.pluginId, threadId: target.threadId, mode: "auto", input: [{type:"text", text:`[team] ${result.task.role}: task ${id} ready for acceptance. ${result.task.title}`, mentions:[]}]});
+      }
+      // A repeated close (done→done, dropped→done) is idempotent: no second
+      // wake of the queue, no duplicate auto-continue.
+      const closingOpenTask = (patch.status === "done" || patch.status === "dropped")
+        && (previous.status === "todo" || previous.status === "in-progress" || previous.status === "review");
+      if (closingOpenTask) {
+        await resources.finished(scope,id,caller==="manual"&&!!patch.acceptReason?.trim());
+        await dispatchNextPackage(scope, result.task.role, t);
+        // Acceptance auto-continue (bbt-er6.4): arm the durable request for the
+        // consumed executor session, then wake requests of other roles — a
+        // closed package can make their dependencies ready.
+        await scheduleAutoContinue(scope, result.task.role, result.task.id, t);
+        for (const other of await autoContinueRoles(scope)) {
+          if (other !== result.task.role) await runAutoContinue(scope, other, t);
+        }
+      }
+      return {...result, busy: []};
+    });
 
   /** Executors move packages to review; only the lead (or a human) marks them done. */
   const guardAccept = async (scope: Scope, status: TaskStatus | undefined, callerThreadId: string | undefined, t: Strings, m: Messages) => {
-    if (status !== "done" || !callerThreadId) return;
+    if ((status !== "done" && status !== "dropped") || !callerThreadId) return;
     let mark: ReturnType<typeof readTeamMark> = null;
     try {
       mark = readTeamMark((await bb.sdk.threads.getPluginMetadata({ threadId: callerThreadId })) as Record<string, unknown>);
@@ -912,6 +1322,533 @@ export default async function plugin(bb: BbPluginApi) {
     const err = m.onlyLeadAccepts(mark.role);
     throw new PluginCliError(err.message, { code: "only_lead_accepts", hint: err.hint });
   };
+
+  /* ── Session continuation: shared handler (bbt-er6.4) ── */
+
+  /**
+   * Shared continuation handler for `bb team replace` and the acceptance
+   * auto-continue: validates the agent-saved checkpoint, switches the role to
+   * a fresh session in the same environment through the durable replacement
+   * intent, records execution history, then dispatches the next ready
+   * package. Must be called with the scope lock held. Checkpoints are always
+   * agent-saved before review; this handler never fabricates one from output.
+   */
+  const continueRoleSession = async (
+    scope: Scope,
+    roleName: string,
+    oldThreadId: string,
+    options: { keep?: boolean; pending?: ReplacementIntent | null; execution?: ExecutionFallbackSelection } = {},
+  ): Promise<{ result: ReplacementResult; continuing: boolean; kept: boolean }> => {
+    const { lang, t, m } = await loadLang();
+    const pending = options.pending ?? null;
+    const settingsValues = await settings.get();
+    const { config } = await readTeamConfig(bb, scope, scope.team, t);
+    const { lead, roles } = core.semanticChecks(config, t);
+    const configuredRole = roles.find((r) => r.name === roleName);
+    if (!configuredRole) {
+      const err = m.taskRoleUnknown(roleName);
+      throw new PluginCliError(err.message, { code: "role_not_found", hint: err.hint });
+    }
+    const oldMeta=await bb.sdk.threads.getPluginMetadata({threadId:oldThreadId}) as Record<string,unknown>;
+    const configuredExecution=JSON.stringify([configuredRole.provider,configuredRole.model,configuredRole.reasoningLevel,configuredRole.serviceTier]);
+    const savedSelection=oldMeta.teamExecution as ExecutionFallbackSelection|undefined;
+    const stillApproved=savedSelection&&configuredRole.executionPolicy?.fallbacks.some(c=>JSON.stringify(c)===JSON.stringify(savedSelection));
+    const pendingQuota=(await resources.inspect(scope)).fallbacks.find(f=>f.threadId===oldThreadId&&f.selection&&f.stage!=="complete");
+    const quotaApproved=pendingQuota?.selection&&configuredRole.executionPolicy?.fallbacks.some(c=>JSON.stringify(c)===JSON.stringify(pendingQuota.selection));
+    const execution=options.execution??(quotaApproved?pendingQuota!.selection!:oldMeta.teamConfiguredExecution===configuredExecution&&stillApproved?savedSelection:undefined);
+    const role=core.roleSchema.parse({...configuredRole,...(execution?{provider:execution.provider,model:execution.model,reasoningLevel:execution.reasoningLevel,serviceTier:execution.serviceTier}:{})});
+    const old = await bb.sdk.threads.get({ threadId: oldThreadId });
+    const ref = await bb.storage.kv.get<{taskId:TaskId}>(checkpointRefKey(scope, roleName));
+    if (!ref) throw new PluginCliError(`Role ${roleName} needs a saved task checkpoint: bb team checkpoint <id> --file <json>`, {code: "checkpoint_missing"});
+    const checkpoint = workCheckpointSchema.parse(await tracker.readCheckpoint(scope, ref.taskId));
+    if (checkpoint.threadId !== old.id || checkpoint.role !== roleName || checkpoint.taskId !== ref.taskId) throw new PluginCliError("Checkpoint belongs to a different task session", {code: "checkpoint_stale"});
+    const store = await readTasks(scope);
+    const busy = busyTasks(store, roleName);
+    if (busy.some(task => task.id !== checkpoint.taskId)) throw new PluginCliError("Checkpoint must describe the role current package", {code: "checkpoint_stale"});
+    if (!pending && RUNNING.includes(old.status)) throw new PluginCliError("Finish the active operation before replacing the session", {code: "role_busy"});
+    await verifyCheckpoint(bb, checkpoint);
+    if(execution){
+      const catalog=await bb.sdk.providers.models({environmentId:checkpoint.environmentId,providerId:execution.provider});
+      const model=catalog.models.find(m=>m.model===execution.model||m.id===execution.model);
+      if(catalog.modelLoadError||!catalog.providers.some(p=>p.id===execution.provider&&p.available)||!model||
+        execution.reasoningLevel&&!model.supportedReasoningEfforts.some(r=>r.reasoningEffort===execution.reasoningLevel)||
+        execution.serviceTier&&!model.supportedServiceTiers?.some(tier=>tier.id===execution.serviceTier))throw new PluginCliError("The approved backup selection is no longer available; no default substitution was made",{code:"backup_unavailable"});
+    }
+
+    await validateProviders(bb, [role], t);
+    const scan = await scanTeamThreads(bb, scope.projectId);
+    const rows = roleThreadsOf(scan, scope.team);
+    const isLead = role.name === lead.name;
+    const roleThreads = new Map<string,string>();
+    for (const [name,list] of rows) if (list[0]) roleThreads.set(name,list[0].threadId);
+    const leadThreadId = isLead ? null : roleThreads.get(lead.name) ?? null;
+    const priorTask = store.tasks.find(task=>task.id===checkpoint.taskId);
+    if (!priorTask) throw new PluginCliError("Checkpoint task is missing",{code:"task_not_found"});
+    // An externally reassigned package must not continue under the old role
+    // with the old checkpoint/session binding — refuse before any spawn.
+    if (priorTask.role !== roleName) throw new PluginCliError(`Checkpoint task ${checkpoint.taskId} is assigned to role ${priorTask.role}, not ${roleName}; the package cannot continue in this session`,{code:"task_reassigned"});
+    const continuing = priorTask.status === "in-progress" || priorTask.status === "review" || priorTask.status === "todo";
+    const rawPrompt = withExecutionProfile(await loadRolePrompt(bb, scope, role, isLead, lang, t),isLead ? config.roles : [role],lang);
+    const taskLines = listTasks(store, {role:roleName}).map(task=>`- #${task.id} ${task.title} [${task.status}]`).join("\n");
+    const prompt = core.applyPlaceholders(rawPrompt, {workspace:scope,leadThreadId,roleThreads,teamVars:config.vars,teamName:scope.team}, t)
+      + (execution?`\nActual execution uses the explicitly approved backup: ${JSON.stringify(execution)}. Configured primary remains unchanged.`:"")
+      + m.replaceHandoff(`@thread:${old.id}`,JSON.stringify(checkpoint,null,2),taskLines)
+      + (continuing ? `\nThis is a task handoff, not initial setup. Resume checkpoint nextAction for task ${checkpoint.taskId} now. If it is in review, wait for lead acceptance. Do not pick another package; other packages remain queued.` : "\nThe checkpoint task is already accepted or cancelled. Do not execute it again. Confirm readiness and wait for the next queued assignment.")
+      + `\nRoute messages by role: bb team tell <role> --message-file -. The lead role is ${lead.name}. Earlier direct thread addresses are superseded.`;
+    const defaults = config.defaults ?? {};
+    const sectionId = settingsValues.teamSection ? await ensureSection(bb,teamSectionName(t,scope.team),[strings("en"),strings("ru")].map(x=>teamSectionName(x,scope.team))) : null;
+    const result = await replaceSession(bb, {
+      projectId:scope.projectId, team:scope.team, role:roleName,
+      oldThreadId:old.id, environmentId:checkpoint.environmentId,
+      keep: pending?.keep ?? options.keep ?? false,
+      prompt,
+      spawnArgs: {
+        projectId:scope.projectId, title:await threadTitle(scope,role.title ?? role.name,scan),
+        providerId:role.provider,model:role.model,reasoningLevel:role.reasoningLevel,serviceTier:role.serviceTier,
+        permissionMode:role.permissionMode ?? defaults.permissionMode,
+        environment:{type:"reuse",environmentId:checkpoint.environmentId},sectionId,
+        parentThreadId:leadThreadId ?? undefined,
+        parentNotifications:leadThreadId ? role.parentNotifications ?? defaults.parentNotifications : undefined,
+        pluginMetadata:{...teamMetadata(role,scope.team),...(execution?{teamExecution:execution,teamConfiguredExecution:configuredExecution}:{})}, prompt,
+      },
+      beforeSwitch: async () => {
+        const saved = workCheckpointSchema.parse(await tracker.readCheckpoint(scope,ref.taskId));
+        if (JSON.stringify(saved) !== JSON.stringify(checkpoint)) throw new PluginCliError("Checkpoint changed during replacement",{code:"checkpoint_stale"});
+        await verifyCheckpoint(bb,checkpoint);
+      },
+      afterSwitch: async (newThreadId) => {
+        const key = executionKey(scope,checkpoint.taskId);
+        const prior = await bb.storage.kv.get<Record<string,unknown>>(key);
+        const base = {taskId:checkpoint.taskId,role:roleName,environmentId:checkpoint.environmentId,path:checkpoint.path,branch:checkpoint.branch,commit:checkpoint.commit,checkpointAtMs:checkpoint.atMs};
+        const historyKey = `session:${scope.projectId}:${scope.team}:${checkpoint.taskId}:${old.id}`;
+        if (!(await bb.storage.kv.get(historyKey))) await bb.storage.kv.set(historyKey,{...base,threadId:old.id,nextThreadId:newThreadId,atMs:Date.now()});
+        if (continuing) {
+          await bb.storage.kv.set(key,{...prior,...base,threadId:newThreadId,delivery:"continuation"});
+          await bb.storage.kv.set(sessionTaskKey(scope,newThreadId),checkpoint.taskId);
+        }
+        await resources.bindSwitch(scope,old.id,newThreadId);
+        const pauseState = await readPause(scope);
+        if (pauseState?.threadIds.includes(old.id)) {
+          const threadIds = pauseState.threadIds.map(id=>id===old.id?newThreadId:id);
+          await bb.storage.kv.set(pauseKey(scope),{...pauseState,threadIds});
+          pausedThreads.delete(old.id);pausedThreads.add(newThreadId);
+        }
+      },
+    });
+    publishChange(scope.projectId);
+    await resources.recovered(scope,result.oldThreadId,result.newThreadId);
+    if (!continuing) await dispatchNextPackage(scope,roleName,t);
+    if (isLead) {
+      for (const [name,list] of rows) {
+        if (name===roleName) continue;
+        for (const executor of list) {
+          try {await bb.sdk.threads.send({originPluginId:bb.pluginId,threadId:executor.threadId,mode:"queue-if-active",input:[{type:"text",text:`Team routing changed: the lead is now ${result.newThreadId}. Disregard earlier direct lead thread addresses; report through bb team tell ${lead.name} --message-file -. Task results and decisions belong in the selected tracker.`,mentions:[]}]});}
+          catch(error){bb.log.warn(`Lead replaced; routing notice to ${name} failed: ${(error as Error).message}`);}
+        }
+      }
+    }
+    if (!isLead && leadThreadId) {
+      try { await bb.sdk.threads.send({originPluginId:bb.pluginId,threadId:leadThreadId,mode:"queue-if-active",input:[{type:"text",text:m.replaceLeadNotice(roleName,`@thread:${result.oldThreadId}`,`@thread:${result.newThreadId}`),mentions:[]}]}); }
+      catch(error) {bb.log.warn(`Session replaced; lead notice failed: ${(error as Error).message}`);}
+    }
+    return { result, continuing, kept: Boolean(pending?.keep ?? options.keep) };
+  };
+
+  /* ── Acceptance auto-continue (bbt-er6.4) ── */
+
+  // Only genuinely transient busy states retry on the next trigger; every
+  // other error (missing host/environment, lifecycle ownership, provider,
+  // tracker failures, unclear spawn/prompt-release, unknown codes) becomes
+  // an explicit role error a human must resolve.
+  const TRANSIENT_BUSY_CODES = new Set([
+    "role_busy",
+    "old_not_idle_or_error",
+    "old_became_active",
+    "old_active_before_archive",
+    "old_has_background_agents",
+    "old_has_background_activity",
+    "old_has_queued_messages",
+    "old_has_pending_interaction",
+  ]);
+  // Errors an agent can fix by saving a fresh checkpoint: explicit wait.
+  const CHECKPOINT_WAIT_CODES = new Set(["checkpoint_missing", "checkpoint_stale", "checkpoint_invalid"]);
+
+  /**
+   * Durable, technical auto-continue request (KV): ids and stages only.
+   * reason "context" marks an explicit or automatic context-rotation request
+   * (the same open package continues in a fresh session); absence or
+   * "accepted" keeps the acceptance policy (bbt-er6.4).
+   */
+  interface AutoContinueRecord {
+    /** The package that consumed the session (accepted) or continues in it (context). */
+    taskId: TaskId;
+    reason?: "accepted" | "context";
+    /** The session the request was armed for: stale records clear after a manual switch, even when the taskId continues (context). */
+    originThreadId?: string | null;
+    stage: AutoContinueStage;
+    errorCode: string | null;
+    /** Short technical failure message; checkpoint content is never copied. */
+    error: string | null;
+    /** Stage the executor was last notified about (notification dedup). */
+    notifiedStage: AutoContinueStage | null;
+    requestedAtMs: number;
+    updatedAtMs: number;
+  }
+  const autoContinueKey = (scope: Scope, role: string) => `auto-continue:${scope.projectId}:${scope.team}:${role}`;
+  const readAutoContinue = async (scope: Scope, role: string): Promise<AutoContinueRecord | null> =>
+    (await bb.storage.kv.get<AutoContinueRecord>(autoContinueKey(scope, role))) ?? null;
+  const writeAutoContinue = async (scope: Scope, role: string, record: AutoContinueRecord): Promise<void> => {
+    await bb.storage.kv.set(autoContinueKey(scope, role), record);
+  };
+  const autoContinueRoles = async (scope: Scope): Promise<string[]> => {
+    const prefix = `auto-continue:${scope.projectId}:${scope.team}:`;
+    const roles: string[] = [];
+    for (const key of await bb.storage.kv.list(prefix)) roles.push(key.slice(prefix.length));
+    return roles;
+  };
+
+  /**
+   * After a done/dropped package consumed an executor session: arm the
+   * durable auto-continue and advance it once. Lead sessions are never
+   * replaced automatically. Not armed on review transitions or plain idle.
+   */
+  const scheduleAutoContinue = async (scope: Scope, role: string, taskId: TaskId, t: Strings): Promise<void> => {
+    const { rows, lead } = await teamContext(scope, t);
+    if (role === lead) return;
+    const list = rows.get(role);
+    if (!list || list.length !== 1) return; // missing or ambiguous: a human decides
+    const thread = list[0]!;
+    if ((await bb.storage.kv.get<TaskId>(sessionTaskKey(scope, thread.threadId))) !== taskId) return; // session not consumed by this package
+    const existing = await readAutoContinue(scope, role);
+    if (existing?.stage === "failed" && existing.taskId === taskId) return; // no automatic restart after an unclear failure
+    const now = Date.now();
+    if (!existing || existing.taskId !== taskId) {
+      await writeAutoContinue(scope, role, {
+        taskId, reason: "accepted", originThreadId: thread.threadId, stage: "awaiting-safe-boundary",
+        errorCode: null, error: null, notifiedStage: null,
+        requestedAtMs: now, updatedAtMs: now,
+      });
+    }
+    await runAutoContinue(scope, role, t);
+  };
+
+  const notifyAutoContinueCheckpoint = async (role: string, threadId: string, taskId: TaskId): Promise<void> => {
+    try {
+      await bb.sdk.threads.send({
+        originPluginId: bb.pluginId, threadId, mode: "queue-if-active",
+        input: [{type: "text", text: (await loadLang()).lang === "ru" ? `[team] Запрошена передача сессии. Сохрани содержательный checkpoint задачи ${taskId}: bb team checkpoint ${taskId} --file <абсолютный-json-путь>. JSON: goal, criteria[], progress, decisions[{what,why}], checks[{what,result}], blockers[], nextAction, files[]. Укажи только фактически сделанное и проверенное. Не начинай другую задачу. Заверши текущую операцию; Team дождётся безопасной границы, сохранит окружение и передаст состояние новой сессии.` : `[team] Session handoff requested. Save a fresh checkpoint now: bb team checkpoint ${taskId} --file <absolute-json-path>. JSON: goal, criteria[], progress, decisions[{what,why}], checks[{what,result}], blockers[], nextAction, files[]. Record only actual work and checks. Do not start another package. Finish the current operation; Team will wait for a safe boundary and preserve your environment for the next session.`, mentions: []}],
+      });
+    } catch (error) {
+      bb.log.warn(`auto-continue: checkpoint request to ${role} failed: ${(error as Error).message}`);
+      throw error;
+    }
+  };
+
+  const notifyAutoContinueFailed = async (role: string, leadThreadId: string | null, taskId: TaskId, code: string, message: string): Promise<void> => {
+    if (!leadThreadId) return; // the snapshot/doctor error state still surfaces it
+    try {
+      await bb.sdk.threads.send({
+        originPluginId: bb.pluginId, threadId: leadThreadId, mode: "queue-if-active",
+        input: [{type: "text", text: `[team] Auto-continue of role ${role} stopped after package #${taskId}: [${code}] ${message}. The completed session is kept. Inspect bb team doctor, then bb team replace ${role} --dry-run before retrying; nothing is respawned automatically.`, mentions: []}],
+      });
+    } catch (error) {
+      bb.log.warn(`auto-continue: failure notice to the lead failed: ${(error as Error).message}`);
+    }
+  };
+
+  /**
+   * Advance one durable auto-continue request. Idempotent: recomputes the
+   * state from tasks, the agent-saved checkpoint and live thread activity;
+   * the KV record keeps only technical fields and notification dedup.
+   * Retries are event-driven (idle, checkpoint saved, package added or
+   * accepted, resume, plugin restart) — there is no second scheduler.
+   */
+  const runAutoContinue = async (scope: Scope, role: string, t: Strings): Promise<void> => {
+    const record = await readAutoContinue(scope, role);
+    if (!record) return;
+    let current = record;
+    const save = async (patch: Partial<AutoContinueRecord>) => {
+      current = {...current, ...patch, updatedAtMs: Date.now()};
+      await writeAutoContinue(scope, role, current);
+      return current;
+    };
+    const notifyCheckpointWait = async (threadId?: string) => {
+      const target = threadId ?? await bb.storage.kv.get<string>(activeSessionKey(scope.projectId, scope.team, role));
+      if (target) await notifyAutoContinueCheckpoint(role, target, record.taskId);
+    };
+    const fail = async (code: string, message: string) => {
+      await save({stage: "failed", errorCode: code, error: message});
+      try {
+        const { rows, lead } = await teamContext(scope, t);
+        await notifyAutoContinueFailed(role, lead && lead !== role ? rows.get(lead)?.[0]?.threadId ?? null : null, record.taskId, code, message);
+      } catch {
+        // the failed KV record still surfaces in snapshot and doctor
+      }
+    };
+    try {
+      const { rows, lead } = await teamContext(scope, t);
+      if (role === lead && record.reason !== "context") {
+        // never replace the lead automatically on package acceptance
+        await bb.storage.kv.delete(autoContinueKey(scope, role));
+        return;
+      }
+      const list = rows.get(role);
+      if (!list || list.length !== 1) return; // ambiguous or gone: wait for a human
+      const thread = list[0]!;
+      const intent = await readReplacementIntent(bb, scope.projectId, scope.team, role);
+      if (
+        (await bb.storage.kv.get<TaskId>(sessionTaskKey(scope, thread.threadId))) !== record.taskId ||
+        (typeof record.originThreadId === "string" && record.originThreadId !== thread.threadId)
+      ) {
+        if (intent && intent.stage !== "complete") {
+          if (record.stage !== "failed") await fail("replacement_unfinished", `Role binding changed before replacement finished (stage ${intent.stage}); resume bb team replace ${role} to finish the existing intent`);
+          return;
+        }
+        // The session was already replaced or freed by hand — also clears a
+        // failed record after manual recovery, even when a context rotation
+        // continues the same taskId in the new session.
+        await bb.storage.kv.delete(autoContinueKey(scope, role));
+        return;
+      }
+      if (record.stage === "failed") return; // keep the explicit error; no auto-retry
+      if (intent && intent.stage !== "complete") {
+        // A previous switch attempt died mid-flight (only a crash leaves a
+        // non-complete intent behind: runs are serialized by the scope lock).
+        // Never respawn automatically: surface the durable-intent recovery.
+        await fail(
+          intent.stage === "spawn_uncertain" ? "spawn_uncertain" : "replacement_unfinished",
+          `session replacement is unfinished (stage ${intent.stage}); retry bb team replace ${role} to resume the durable intent, or --abort before the switch`,
+        );
+        return;
+      }
+      const store = await readTasks(scope);
+      // Context rotation continues the role's current open package in a new
+      // session; acceptance policy waits instead. A package other than the
+      // record's own still means the role is busy: wait.
+      const recordTask = store.tasks.find(task => task.id === record.taskId);
+      const contextFlow =
+        record.reason === "context" &&
+        !!recordTask &&
+        (recordTask.status === "in-progress" || recordTask.status === "review");
+      if (busyTasks(store, role).some(task => task.id !== record.taskId)) return; // another open package; wait
+      // Replace the consumed session only when the next package is already
+      // ready: idle sessions are not wasted on fresh threads. A context
+      // rotation does not wait — it passes the current package along. If the
+      // package was accepted meanwhile, the acceptance policy applies.
+      if (!contextFlow) {
+        const ready = new Set(await tracker.ready(scope));
+        if (!listTasks(store, {role}).some(task => task.status === "todo" && ready.has(task.id))) {
+          await save({stage: "awaiting-package"});
+          return;
+        }
+      }
+      if (await readPause(scope)) return; // resume() retries
+      // A substantive checkpoint must come from the agent. Missing or stale →
+      // explicit wait plus a notification; never a fabricated checkpoint.
+      const ref = await bb.storage.kv.get<{taskId: TaskId}>(checkpointRefKey(scope, role));
+      let checkpointFresh = false;
+      if (ref && ref.taskId === record.taskId) {
+        try {
+          const checkpoint = workCheckpointSchema.parse(await tracker.readCheckpoint(scope, ref.taskId));
+          if (checkpoint.taskId === record.taskId && checkpoint.threadId === thread.threadId && checkpoint.role === role) {
+            await verifyCheckpoint(bb, checkpoint);
+            checkpointFresh = true;
+          }
+        } catch (error) {
+          const code = (error as {code?: unknown}).code;
+          // Environment-level failures are role errors, not a re-save fix.
+          if (code === "environment_missing" || code === "environment_unavailable") throw error;
+          // Unexpected (tracker/database) errors are role errors too; only
+          // checkpoint-shaped problems (missing/stale/invalid) keep waiting.
+          if (typeof code !== "string" && (error as Error).name !== "ZodError") throw error;
+        }
+      }
+      if (!checkpointFresh) {
+        await save({stage: "awaiting-checkpoint"});
+        if (current.notifiedStage !== "awaiting-checkpoint") {
+          await notifyCheckpointWait(thread.threadId);
+          await save({notifiedStage: "awaiting-checkpoint"});
+        }
+        return;
+      }
+      // Safe boundary: never interrupt running work, queued messages,
+      // pending interactions or background operations; thread.idle retries.
+      const live = await bb.sdk.threads.get({threadId: thread.threadId});
+      if (RUNNING.includes(live.status) || live.queuedMessageCount > 0 || live.activeBackgroundAgentCount > 0) {
+        await save({stage: "awaiting-safe-boundary", notifiedStage: null});
+        return;
+      }
+      await continueRoleSession(scope, role, thread.threadId, {keep: false});
+      await bb.storage.kv.delete(autoContinueKey(scope, role));
+      publishChange(scope.projectId);
+    } catch (error) {
+      // Everything the machine could not classify — including tracker, host,
+      // environment, config and provider failures — becomes an explicit role
+      // error, never a silent event-log line.
+      const rawCode = (error as {code?: unknown}).code;
+      const code = typeof rawCode === "string" ? rawCode : (error as Error).name === "ZodError" ? "checkpoint_invalid" : "auto_continue_failed";
+      const message = (error as Error).message;
+      if (TRANSIENT_BUSY_CODES.has(code)) {
+        // busy, active, queued or interacting: retry on the next trigger
+        await save({stage: "awaiting-safe-boundary", notifiedStage: null});
+        return;
+      }
+      if (CHECKPOINT_WAIT_CODES.has(code)) {
+        await save({stage: "awaiting-checkpoint"});
+        if (current.notifiedStage !== "awaiting-checkpoint") {
+          await notifyCheckpointWait();
+          await save({notifiedStage: "awaiting-checkpoint"});
+        }
+        return;
+      }
+      // NO_AUTO_RETRY_CODES and every other failure stop automatically;
+      // a human gets the concrete reason and a safe action.
+      await fail(code, message);
+    }
+  };
+
+  /* ── Context rotation (bbt-er6.8) ── */
+
+  // Fill ratio at or above which an idle session asks for rotation.
+  const CONTEXT_ROTATION_THRESHOLD = 0.8;
+
+  /**
+   * Arm an explicit context-rotation request (bb team checkpoint --rotate):
+   * the current open package continues in a fresh session once the thread
+   * reaches a safe boundary. Works for executors and for the lead. The
+   * caller's own active turn is never stopped — the machine only replaces
+   * idle sessions, so an agent gets "requested" back and a human on an idle
+   * role gets "replaced".
+   */
+  const armContextRotation = async (scope: Scope, role: string, taskId: TaskId, originThreadId: string, t: Strings): Promise<"requested" | "replaced"> => {
+    const intent = await readReplacementIntent(bb, scope.projectId, scope.team, role);
+    if (intent && intent.stage !== "complete") {
+      throw new PluginCliError("A session replacement is already in progress; the checkpoint is saved — retry --rotate after it completes", { code: "replacement_pending" });
+    }
+    const existing = await readAutoContinue(scope, role);
+    if (existing?.stage === "failed") {
+      throw new PluginCliError(`Auto-continue of role ${role} failed earlier (${existing.errorCode}); recover with bb team replace ${role} --dry-run before requesting rotation`, { code: "auto_continue_failed" });
+    }
+    const now = Date.now();
+    await writeAutoContinue(scope, role, {
+      taskId, reason: "context", originThreadId, stage: "awaiting-safe-boundary",
+      errorCode: null, error: null, notifiedStage: null,
+      requestedAtMs: now, updatedAtMs: now,
+    });
+    await runAutoContinue(scope, role, t);
+    return (await readAutoContinue(scope, role)) ? "requested" : "replaced";
+  };
+
+  // The selected role card reads this on demand. Reading never advances the machine.
+  const readSessionView = async (scope: Scope, role: string, t: Strings): Promise<SessionView> => {
+    const { rows } = await teamContext(scope, t);
+    const list = rows.get(role) ?? [];
+    const view: SessionView = { threadId: null, taskId: null, context: contextView(null), checkpoint: "missing", phase: "idle", reason: null, blockedReason: null, errorCode: null };
+    if (list.length !== 1) return { ...view, blockedReason: list.length ? "multiple_sessions" : "no_session" };
+    const thread = list[0]!;
+    view.threadId = thread.threadId;
+    const canonical = await bb.storage.kv.get<string>(activeSessionKey(scope.projectId, scope.team, role));
+    if (canonical && canonical !== thread.threadId) return { ...view, blockedReason: "session_changed" };
+    try { view.context = contextView((await bb.sdk.threads.context({ threadId: thread.threadId })).usage); } catch { /* Unsupported provider is not a role failure. */ }
+    const request = await readAutoContinue(scope, role);
+    const intent = await readReplacementIntent(bb, scope.projectId, scope.team, role);
+    if (request) {
+      view.phase = request.stage === "failed" ? "error" : request.stage;
+      view.reason = request.reason ?? "accepted";
+      view.errorCode = request.errorCode;
+    }
+    if (intent && intent.stage !== "complete") {
+      view.phase = intent.stage === "spawn_uncertain" ? "error" : "replacing";
+      view.blockedReason = "replacement_pending";
+    }
+    if (request?.stage === "failed") view.blockedReason = "failed";
+    const linked = await bb.storage.kv.get<TaskId>(sessionTaskKey(scope, thread.threadId));
+    view.taskId = linked ?? null;
+    if (linked == null) { view.blockedReason ??= "no_task"; return view; }
+    let task: TeamTask | undefined;
+    try { task = (await readTasks(scope)).tasks.find(task => task.id === linked); }
+    catch { view.checkpoint = "unavailable"; view.blockedReason ??= "tracker_unavailable"; return view; }
+    if (!task) { view.blockedReason ??= "no_task"; return view; }
+    if (task.role !== role) { view.blockedReason ??= "task_reassigned"; return view; }
+    if ((task.status === "done" || task.status === "dropped") && view.reason === "context") view.reason = "accepted";
+    const ref = await bb.storage.kv.get<{ taskId: TaskId }>(checkpointRefKey(scope, role));
+    if (ref) {
+      view.checkpoint = "stale";
+      if (ref.taskId === linked) {
+        try {
+          const checkpoint = workCheckpointSchema.parse(await tracker.readCheckpoint(scope, linked));
+          if (checkpoint.threadId === thread.threadId && checkpoint.role === role && checkpoint.taskId === linked) {
+            await verifyCheckpoint(bb, checkpoint);
+            view.checkpoint = "ready";
+          }
+        } catch (error) {
+          const code = (error as {code?: string}).code;
+          if (code !== "checkpoint_stale" && code !== "checkpoint_invalid" && (error as Error).name !== "ZodError") view.checkpoint = "unavailable";
+        }
+      }
+    }
+    if (await readPause(scope)) view.blockedReason ??= "paused";
+    return view;
+  };
+
+  /**
+   * One context-usage measurement per thread.idle for a canonical non-helper
+   * team role. threads.context reads counters only — it never calls the
+   * model. Automation trusts only exact finite numbers (estimated===false,
+   * limit>0, used>=0) and a consistent snapshot; an estimated value, a null
+   * or unsupported API, or a contradiction is a silent no-op: no role error,
+   * no spam — the explicit --rotate request remains available.
+   */
+  const maybeArmContextRotation = async (scope: Scope, role: string, meta: Record<string, unknown>, threadId: string, t: Strings): Promise<boolean> => {
+    if (meta.teamRetired === true || meta.teamReplacement === true) return false;
+    const linked = await bb.storage.kv.get<TaskId>(sessionTaskKey(scope, threadId));
+    if (linked === undefined || linked === null) return false; // no linked package: never invent one
+    const store = await readTasks(scope);
+    const task = store.tasks.find(item => item.id === linked);
+    if (!task || task.role !== role) return false; // reassigned or missing: never arm for the old role
+    if (task.status !== "in-progress" && task.status !== "review") return false;
+    const { rows } = await teamContext(scope, t);
+    const list = rows.get(role);
+    if (!list || list.length !== 1 || list[0]!.threadId !== threadId) return false; // not the canonical session
+    let usage: { estimated: boolean; modelContextWindow: number; usedTokens: number; snapshot?: { estimated: boolean; contextWindowTokens: number; usedTokens: number } } | null = null;
+    try {
+      usage = (await bb.sdk.threads.context({ threadId })).usage;
+    } catch {
+      return false; // unsupported API: no automation, no error surfaced
+    }
+    if (!usage || usage.estimated !== false) return false;
+    const limit = usage.modelContextWindow, used = usage.usedTokens;
+    if (!Number.isFinite(limit) || !(limit > 0) || !Number.isFinite(used) || !(used >= 0)) return false;
+    const snap = usage.snapshot;
+    if (snap && (snap.estimated === true || snap.contextWindowTokens !== limit || snap.usedTokens !== used || !Number.isFinite(snap.contextWindowTokens) || !Number.isFinite(snap.usedTokens))) return false; // contradiction: do not trust the top-level numbers
+    if (used / limit < CONTEXT_ROTATION_THRESHOLD) return false;
+    const now = Date.now();
+    await writeAutoContinue(scope, role, {
+      taskId: linked, reason: "context", originThreadId: threadId, stage: "awaiting-safe-boundary",
+      errorCode: null, error: null, notifiedStage: null,
+      requestedAtMs: now, updatedAtMs: now,
+    });
+    return true;
+  };
+
+  // Restart safety: advance durable auto-continue requests that survived a
+  // plugin restart; their event triggers may have fired while it was down.
+  try {
+    const { t } = await loadLang();
+    for (const key of await bb.storage.kv.list("auto-continue:")) {
+      const parts = key.split(":");
+      const projectId = parts[1]!, team = parts[2]!, role = parts.slice(3).join(":");
+      if (!projectId || !team || !role) continue;
+      try {
+        const scope = await scopeFor(projectId, team, t);
+        await withScopeLock(scope, async () => { await runAutoContinue(scope, role, t); });
+      } catch (error) {
+        bb.log.warn(`auto-continue restore for ${key} failed: ${(error as Error).message}`);
+      }
+    }
+  } catch (error) {
+    bb.log.warn(`auto-continue restore failed: ${(error as Error).message}`);
+  }
 
   const taskOutput = (
     result: { task: TeamTask; previous: TeamTask; busy: TeamTask[] },
@@ -995,6 +1932,9 @@ export default async function plugin(bb: BbPluginApi) {
     const loaded = await readTeamConfig(bb, scope, scope.team, t);
     const { config, source } = loaded;
     const { lead, roles } = core.semanticChecks(config, t);
+    // The tracker database must exist before the team starts working: prepare
+    // is idempotent and dry-run paths never reach here.
+    await tracker.prepare(scope);
     const defaults = config.defaults ?? {};
     const wanted = (role: Role) => !options.only || options.only.includes(role.name) || role.name === lead.name;
     await validateProviders(bb, roles.filter((r) => !r.threadId && wanted(r)), t);
@@ -1010,7 +1950,10 @@ export default async function plugin(bb: BbPluginApi) {
       prompt: string;
     }
     const plan: PlanEntry[] = [];
-    for (const role of roles) {
+    for (const configuredRole of roles) {
+      const role = {...configuredRole};
+      const canonical = await bb.storage.kv.get<string>(`active-session:${scope.projectId}:${scope.team}:${role.name}`);
+      if (canonical && existing.get(role.name)?.includes(canonical)) delete role.threadId;
       if (!wanted(role)) continue;
       const already = existing.get(role.name);
       if (role.threadId || (already && already.length > 0)) {
@@ -1020,7 +1963,7 @@ export default async function plugin(bb: BbPluginApi) {
       plan.push({
         role,
         environment: await resolveEnvironment(bb, scope, roleEnvironmentSpec(role, config), t),
-        prompt: await loadRolePrompt(bb, scope, role, role.name === lead.name, lang, t),
+        prompt: withExecutionProfile(await loadRolePrompt(bb, scope, role, role.name === lead.name, lang, t),role.name===lead.name ? config.roles : [role],lang),
       });
     }
 
@@ -1175,6 +2118,8 @@ export default async function plugin(bb: BbPluginApi) {
     if (input.provider) entry.provider = input.provider;
     if (input.model) entry.model = input.model;
     if (input.reasoningLevel) entry.reasoningLevel = input.reasoningLevel;
+    if (input.serviceTier) entry.serviceTier = input.serviceTier;
+    if (input.executionPolicy) entry.executionPolicy = input.executionPolicy;
     if (input.environment) entry.environment = input.environment;
     if (input.notifyOn?.length) entry.notifyOn = input.notifyOn;
     if (input.threadId) {
@@ -1240,6 +2185,9 @@ export default async function plugin(bb: BbPluginApi) {
         throw new PluginCliError(err.message, { code: "team_exists", hint: err.hint });
       }
       await validateProviders(bb, template.roles.filter((r) => r.enabled !== false), t);
+      // Prepare the tracker storage before any files are written or threads
+      // spawned, so a fresh team never starts against a missing database.
+      await tracker.prepare(scope);
       // Without a checkout environment the roles start in the project default one.
       const checkouts = await bb.sdk.environments
         .list({ projectId: scope.projectId, environmentProviderId: "project-checkout" })
@@ -1259,7 +2207,17 @@ export default async function plugin(bb: BbPluginApi) {
 
   const buildSnapshot = async (scope: Scope, t: Strings): Promise<TeamSnapshot> => {
     const { loaded, configError, lead, scan, rows, helpers } = await teamContext(scope, t);
-    const store = await readTasks(scope);
+    // A missing tracker database is a state, not a crash: the panel still
+    // renders (empty packages) and offers the tracker's prepare action.
+    let trackerError: TeamSnapshot["trackerError"] = null;
+    let store: TaskStore;
+    try {
+      store = await readTasks(scope);
+    } catch (error) {
+      if (!isTrackerAbsentError(error)) throw error;
+      store = { nextId: 1, tasks: [] };
+      trackerError = { code: "beads_absent", message: (error as Error).message };
+    }
     const paused = (await readPause(scope)) !== null;
     const version = loaded ? await versionState(scope, loaded.legacy) : null;
     const toThreads = (list: TeamThreadRow[] | undefined): SnapshotThread[] =>
@@ -1307,11 +2265,32 @@ export default async function plugin(bb: BbPluginApi) {
       });
     }
     roles.sort((a, b) => Number(b.lead) - Number(a.lead));
+    const resourceSummary=withResourceResults(await resources.inspect(scope),store.tasks);
+    const withExecutionState: SnapshotRole[] = [];
+    for (const role of roles) {
+      const intent = await readReplacementIntent(bb, scope.projectId, scope.team, role.name);
+      const autoRaw = await bb.storage.kv.get<{taskId?: TaskId; stage?: AutoContinueStage; errorCode?: string | null; error?: string | null; reason?: string; updatedAtMs?: number}>(autoContinueKey(scope, role.name));
+      let executionState = deriveExecutionState({
+        role: role.name,
+        tasks: role.tasks,
+        replacement: intent ? {stage: intent.stage, delivery: intent.delivery, startedAtMs: intent.startedAt} : null,
+        autoContinue: autoRaw?.stage && autoRaw.taskId !== undefined
+          ? {taskId: autoRaw.taskId, stage: autoRaw.stage, errorCode: autoRaw.errorCode ?? null, error: typeof autoRaw.error === "string" ? autoRaw.error : null, reason: autoRaw.reason === "context" ? "context" : "accepted", updatedAtMs: typeof autoRaw.updatedAtMs === "number" ? autoRaw.updatedAtMs : 0}
+          : null,
+        threadStatus: role.threads[0]?.status ?? null,
+      });
+      const active=role.threads.some(thread=>thread.status==="active"||thread.status==="starting");
+      const task=role.tasks.find(task=>task.status==="in-progress"||task.status==="review");
+      const resourceReason=resourceSummary.blocked??resourceSummary.holds[task?`task:${task.id}`:`role:${role.name}`];
+      if(!active&&resourceReason&&executionState?.kind!=="error")executionState={kind:"error",taskId:task?.id??null,errorCode:"resource_hold",errorMessage:resourceReason,safeAction:"Inspect Team resources and record a concrete decision; replacing the session cannot reset the budget",atMs:Date.now()};
+      withExecutionState.push(executionState ? {...role, executionState} : role);
+    }
     return {
       projectId: scope.projectId,
       projectName: scope.projectName,
       team: scope.team,
       teamTitle: loaded?.config.title ?? null,
+      resources:resourceSummary,
       teams: await allTeams(scope, scan),
       versioned: version ? version.versioned : null,
       versioningBlocked: version ? version.blocked : false,
@@ -1319,8 +2298,10 @@ export default async function plugin(bb: BbPluginApi) {
       configError,
       leadRole: lead,
       paused,
-      roles,
+      roles: withExecutionState,
       generatedAtMs: Date.now(),
+      tracker: (await tracker.getConfig(scope)).kind,
+      trackerError,
     };
   };
 
@@ -1392,6 +2373,11 @@ export default async function plugin(bb: BbPluginApi) {
         if (promptFailures === 0) add(m.check.prompts, "ok", m.doctorOk);
         if (varWarnings === 0 && config.vars) add(m.check.vars, "ok", Object.keys(config.vars).join(", "));
         for (const role of roles.filter((r) => r.threadId)) {
+          const canonical=await bb.storage.kv.get<string>(`active-session:${scope.projectId}:${scope.team}:${role.name}`);
+          if (canonical && rows.get(role.name)?.some(row=>row.threadId===canonical)) {
+            add(m.check.adopted,"ok",`${role.name}: ${canonical} (current session overrides initial threadId)`);
+            continue;
+          }
           try {
             const thread = await bb.sdk.threads.get({ threadId: role.threadId! });
             if (thread.projectId !== scope.projectId) {
@@ -1435,6 +2421,18 @@ export default async function plugin(bb: BbPluginApi) {
         if (threadWarnings === 0) add(m.check.threads, "ok", m.doctorOk);
       }
     }
+    for (const key of await bb.storage.kv.list(`review-feedback:${scope.projectId}:${scope.team}:`)) {
+      const delivery = await bb.storage.kv.get<{taskId:TaskId,threadId:string,delivery:string}>(key);
+      if (delivery && delivery.delivery !== "sent") add("review feedback", "fail", `#${delivery.taskId}: remark delivery is uncertain; inspect ${delivery.threadId} before resending`);
+    }
+    for (const key of await bb.storage.kv.list(`replacement:${scope.projectId}:${scope.team}:`)) {
+      const pending=await bb.storage.kv.get<{stage?:string;oldThreadId?:string;newThreadId?:string;delivery?:string}>(key);
+      if (pending && (pending.stage!=="complete" || pending.delivery==="uncertain")) add("session replacement","fail",`${key.split(":").at(-1)}: ${JSON.stringify(pending)}; inspect replace --dry-run --json; retry after a partial switch, or --abort before switching`);
+    }
+    for (const role of await autoContinueRoles(scope)) {
+      const record = await readAutoContinue(scope, role);
+      if (record?.stage === "failed") add("auto-continue","fail",`${role}: package #${record.taskId} [${record.errorCode}] ${record.error ?? ""}; the completed session is kept; inspect, then bb team replace ${role} --dry-run`);
+    }
     if ((await readPause(scope)) !== null) add(m.check.threads, "warn", m.doctorPaused);
     return checks;
   };
@@ -1454,10 +2452,35 @@ export default async function plugin(bb: BbPluginApi) {
     }
     const mark = readTeamMark(meta);
     if (!mark) return;
+    if (kind === "idle" && !mark.helper) {
+      const {t} = await loadLang();
+      const scope = await scopeFor(thread.projectId, mark.team, t);
+      await withScopeLock(scope, async () => {
+        // Idle is a trigger for the durable auto-continue request, never its
+        // source: records are armed by package acceptance or a rotation
+        // request. Without a record, one cheap context measurement can arm
+        // a context rotation (never calls the model).
+        if (await readAutoContinue(scope, mark.role)) {
+          await runAutoContinue(scope, mark.role, t);
+          return;
+        }
+        if (await maybeArmContextRotation(scope, mark.role, meta, thread.id, t)) {
+          await runAutoContinue(scope, mark.role, t);
+          return;
+        }
+        const intent = await readReplacementIntent(bb, scope.projectId, scope.team, mark.role);
+        if (!intent || intent.stage === "complete") await dispatchNextPackage(scope, mark.role, t);
+      });
+    }
     publishChange(thread.projectId);
-    if (kind === "other" || mark.helper || !thread.parentThreadId) return;
+    if (kind === "other" || mark.helper) return;
     const notifyOn = Array.isArray(meta.teamNotifyOn) ? meta.teamNotifyOn : [];
-    if (!notifyOn.includes(kind)) return;
+    if (kind === "idle" && !notifyOn.includes(kind)) return;
+    const {t}=await loadLang();
+    const scope=await scopeFor(thread.projectId,mark.team,t);
+    const {rows,lead}=await teamContext(scope,t);
+    const target=lead && lead!==mark.role ? rows.get(lead)?.[0] : null;
+    if (!target) return;
     const m = messages(currentLang);
     const text =
       kind === "idle"
@@ -1465,8 +2488,8 @@ export default async function plugin(bb: BbPluginApi) {
         : m.notifyError(mark.role, thread.id, excerpt(detail, 300));
     await bb.sdk.threads.send({
       originPluginId: bb.pluginId,
-      threadId: thread.parentThreadId,
-      mode: "queue-if-active",
+      threadId: target.threadId,
+      mode: kind === "error" ? "auto" : "queue-if-active",
       input: [{ type: "text", text, mentions: [] }],
     });
   };
@@ -1489,6 +2512,8 @@ export default async function plugin(bb: BbPluginApi) {
       (await bb.sdk.threads.getPluginMetadata({ threadId: thread.id })) as Record<string, unknown>,
     );
     if (own) return; // spawned by bb team itself
+    const ownMeta = await bb.sdk.threads.getPluginMetadata({threadId:thread.id}) as Record<string,unknown>;
+    if (ownMeta.teamReplacement === true) return;
     await bb.sdk.threads.updatePluginMetadata({
       threadId: thread.id,
       set: { teamName: mark.team, teamHelperOf: mark.role },
@@ -1504,6 +2529,93 @@ export default async function plugin(bb: BbPluginApi) {
     publishChange(thread.projectId);
   };
 
+  /**
+   * Background command/goal/workflow completion does not always fire a new
+   * thread.idle. The debounced experimental_thread.events is an additional
+   * cheap trigger to re-check the safe boundary of an EXISTING durable
+   * request: no context metrics, no LLM, and nothing at all without a
+   * request. Helpers, retired and non-team threads never rotate.
+   */
+  const onThreadActivityEvent = async (thread: { id: string; projectId: string; status: string }): Promise<void> => {
+    if (RUNNING.includes(thread.status)) return; // only idle candidates
+    let meta: Record<string, unknown>;
+    try {
+      meta = (await bb.sdk.threads.getPluginMetadata({ threadId: thread.id })) as Record<string, unknown>;
+    } catch {
+      return;
+    }
+    const mark = readTeamMark(meta);
+    if (!mark || mark.helper || meta.teamRetired === true || meta.teamReplacement === true) return;
+    const { t } = await loadLang();
+    const scope = await scopeFor(thread.projectId, mark.team, t);
+    if (!(await readAutoContinue(scope, mark.role))) return; // no request: never wake anything
+    await withScopeLock(scope, async () => {
+      if (await readAutoContinue(scope, mark.role)) await runAutoContinue(scope, mark.role, t);
+    });
+  };
+
+  bb.events.on("turn.failed",async failure=>{
+    const owner=await resourceOwner(failure.threadId);if(!owner)return;
+    const {t}=await loadLang();const scope=await scopeFor(owner.projectId,owner.team,t);
+    const {config}=await readTeamConfig(bb,scope,scope.team,t);
+    const role=config.roles.find(r=>r.name===owner.role);
+    // Helpers count against their task but never replace the owner's session.
+    const configuredCandidates=owner.ownerThreadId===failure.threadId?role?.executionPolicy?.fallbacks??[]:[];
+    const candidates:ExecutionFallbackSelection[]=[];
+    if(confirmedQuota(failure)&&configuredCandidates.length){
+      const old=await bb.sdk.threads.get({threadId:failure.threadId});
+      const catalogs=new Map<string,Awaited<ReturnType<typeof bb.sdk.providers.models>>|null>();
+      if(old.environmentId)for(const candidate of configuredCandidates){
+        if(candidate.provider===old.providerId)continue; // Exhausted provider/account scope.
+        if(!catalogs.has(candidate.provider)){
+          try{catalogs.set(candidate.provider,await bb.sdk.providers.models({environmentId:old.environmentId,providerId:candidate.provider}));}catch{catalogs.set(candidate.provider,null);}
+        }
+        const catalog=catalogs.get(candidate.provider);const model=catalog?.models.find(m=>m.model===candidate.model||m.id===candidate.model);
+        if(!catalog||catalog.modelLoadError||!catalog.providers.some(p=>p.id===candidate.provider&&p.available)||!model)continue;
+        if(candidate.reasoningLevel&&!model.supportedReasoningEfforts.some(r=>r.reasoningEffort===candidate.reasoningLevel))continue;
+        if(candidate.serviceTier&&!model.supportedServiceTiers?.some(t=>t.id===candidate.serviceTier))continue;
+        candidates.push(candidate);
+      }
+    }
+    const plan=await resources.failed(failure,candidates);if(!plan)return;
+    if(plan.stage!=="selected"||!plan.selection){await notifyResource(scope,owner.role,plan.reason);return;}
+    await withScopeLock(scope,async()=>{
+      try{
+        const store=await readTasks(scope);const task=store.tasks.find(t=>t.id===plan.taskId);
+        if(!task||task.role!==owner.role||!["todo","in-progress"].includes(task.status))throw new PluginCliError("Quota handoff needs the same unfinished assigned task",{code:"task_reassigned"});
+        const unfinished=await readReplacementIntent(bb,scope.projectId,scope.team,owner.role);
+        if(unfinished&&unfinished.stage!=="complete")throw new PluginCliError("Existing replacement is unfinished; inspect/resume it manually",{code:"replacement_pending"});
+        const chosen=plan.selection!;
+        const ref=await bb.storage.kv.get<{taskId:TaskId}>(checkpointRefKey(scope,owner.role));
+        if(!ref)throw new PluginCliError("A saved task checkpoint is required for automatic quota handoff",{code:"checkpoint_missing"});
+        const parsed=workCheckpointSchema.safeParse(await tracker.readCheckpoint(scope,ref.taskId));
+        if(!parsed.success)throw new PluginCliError("The saved checkpoint is invalid",{code:"checkpoint_invalid"});
+        if(parsed.data.threadId!==failure.threadId||parsed.data.taskId!==plan.taskId)throw new PluginCliError("Checkpoint belongs to another task/session",{code:"checkpoint_stale"});
+        await verifyQuotaBoundary(bb,failure,parsed.data);
+        // No call to the exhausted model: the existing handler verifies its
+        // saved checkpoint and Git fingerprint, or refuses without spawning.
+        await resources.authorizeFallback(scope,failure.requestId);
+        const result=await continueRoleSession(scope,owner.role,failure.threadId,{execution:chosen});
+        await resources.fallbackStage(scope,failure.requestId,"complete",undefined,result.result.newThreadId);
+      }catch(error){
+        const reason=`${(error as PluginCliError).code??"fallback_failed"}: ${(error as Error).message}`;
+        await resources.fallbackStage(scope,failure.requestId,"error",reason);await notifyResource(scope,owner.role,reason);
+      }
+    });
+  });
+  bb.events.on("message.cancelled",({entry})=>resources.cancelled(entry.threadId,entry.id));
+  bb.events.on("thread.active",({thread})=>resources.watch(thread.id));
+  bb.events.on("message.queued",async({entry})=>{
+    await resources.queued(entry.threadId,entry.id,entry.payload?.kind==="retry");
+    if(entry.waitingOn?.kind==="plugin"&&entry.waitingOn.pluginId===bb.pluginId&&entry.waitingOn.reason.startsWith("Team resources:")){
+      const owner=await resourceOwner(entry.threadId);if(owner){const {t}=await loadLang();const scope=await scopeFor(owner.projectId,owner.team,t);await notifyResource(scope,owner.role,entry.waitingOn.reason);}
+    }
+  });
+  bb.events.on("thread.idle",({thread})=>resources.settle(thread.id,"completed"));
+  bb.events.on("thread.failed",({thread})=>resources.settle(thread.id,"failed"));
+  bb.events.on("experimental_thread.events",async({thread})=>{
+    const owner=await resourceOwner(thread.id);if(owner)await resources.inspect(owner);
+  });
   bb.events.on("thread.created", ({ thread }) => onThreadCreated(thread));
   bb.events.on("thread.idle", ({ thread, lastAssistantText }) =>
     onTeamThreadEvent(thread, "idle", lastAssistantText),
@@ -1511,6 +2623,7 @@ export default async function plugin(bb: BbPluginApi) {
   bb.events.on("thread.failed", ({ thread, error }) => onTeamThreadEvent(thread, "error", error));
   bb.events.on("thread.active", ({ thread }) => onTeamThreadEvent(thread, "other", null));
   bb.events.on("thread.archived", ({ thread }) => onTeamThreadEvent(thread, "other", null));
+  bb.events.on("experimental_thread.events", ({ thread }) => onThreadActivityEvent(thread));
 
   /* ── RPC ── */
 
@@ -1518,6 +2631,21 @@ export default async function plugin(bb: BbPluginApi) {
     ROLE_KINDS.map((kind) => ({ kind, title: kindTitle(lang, kind) }));
 
   bb.rpc.register(rpcContract, {
+    async trackerConfig({projectId}) {
+      const {t} = await loadLang();
+      return tracker.getConfig(await resolveWorkspace(bb, projectId, undefined, t, {}));
+    },
+    async trackerSet({projectId, kind}) {
+      const {t} = await loadLang();
+      await setProjectTracker(await resolveWorkspace(bb, projectId, undefined, t, {}), kind);
+      return {ok: true};
+    },
+    async trackerPrepare({projectId, team}) {
+      const {t} = await loadLang();
+      const result = await tracker.prepare({...await resolveWorkspace(bb, projectId, undefined, t, {}), team});
+      publishChange(projectId);
+      return result;
+    },
     async projects() {
       const projects = await bb.sdk.projects.list({ includePersonal: true });
       return { projects: projects.map((p) => ({ id: p.id, name: p.name })) };
@@ -1591,6 +2719,24 @@ export default async function plugin(bb: BbPluginApi) {
       const scope = await scopeFor(projectId, team, t);
       return { spawned: (await spawnTeam(scope, lang, t, m)).spawned.length };
     },
+    async sessionView({ projectId, team, role }) {
+      const { t } = await loadLang();
+      return readSessionView(await scopeFor(projectId, team, t), role, t);
+    },
+    async sessionRotate({ projectId, team, role, expectedThreadId }) {
+      const { t, lang } = await loadLang();
+      const scope = await scopeFor(projectId, team, t);
+      return withScopeLock(scope, async () => {
+        const view = await readSessionView(scope, role, t);
+        if (view.threadId !== expectedThreadId) throw new experimental_PluginRpcRefusal({ code: "conflict", message: lang === "ru" ? "Сессия уже изменилась. Обновите карточку сотрудника." : "The session changed. Refresh the employee card." });
+        // Repeated clicks observe the same durable request; never resend or respawn.
+        if (view.reason && view.phase !== "error" && view.blockedReason !== "replacement_pending") return view;
+        if (view.blockedReason || view.taskId == null) throw new experimental_PluginRpcRefusal({ code: "conflict", message: lang === "ru" ? "Передача недоступна. Обновите карточку и проверьте причину ожидания." : "Handoff is unavailable. Refresh the card and inspect the reason." });
+        await armContextRotation(scope, role, view.taskId, expectedThreadId, t);
+        publishChange(projectId);
+        return readSessionView(scope, role, t);
+      });
+    },
     async stop({ projectId, team, role }) {
       const { t } = await loadLang();
       const scope = await scopeFor(projectId, team, t);
@@ -1620,7 +2766,62 @@ export default async function plugin(bb: BbPluginApi) {
     },
     async templates() {
       const { lang } = await loadLang();
-      return { templates: await allTemplates(lang), kinds: kindsList(lang), language: lang };
+      const settingsValues = await settings.get();
+      return { templates: await allTemplates(lang), kinds: kindsList(lang), language: lang, defaultTemplate: settingsValues.defaultTemplate };
+    },
+    async editorSettings() {
+      const { lang } = await loadLang();
+      const settingsValues = await settings.get();
+      const templates = await allTemplates(lang);
+      return {
+        language: lang,
+        defaultTemplate: settingsValues.defaultTemplate,
+        defaultTemplateExists: templates.some((tpl) => tpl.id === settingsValues.defaultTemplate),
+        generatorSelection: await readGeneratorSelection(),
+        reloadHint: settingsMessages(lang).reloadHint,
+      };
+    },
+    async editorSettingsSet(input) {
+      const { lang } = await loadLang();
+      const sm = settingsMessages(lang);
+      if (input.defaultTemplate !== undefined) {
+        const templates = await allTemplates(lang);
+        if (!templates.some((tpl) => tpl.id === input.defaultTemplate)) {
+          const err = sm.defaultTemplateMissing(input.defaultTemplate);
+          // Structured RPC refusal; codes are limited to
+          // forbidden/not_found/conflict/invalid. Nothing is written.
+          throw new experimental_PluginRpcRefusal({
+            code: "not_found",
+            message: `${err.message}. ${err.hint}`,
+          });
+        }
+      }
+      if (input.generatorSelection !== undefined) {
+        await writeGeneratorSelection(input.generatorSelection);
+      }
+      if (input.language !== undefined || input.defaultTemplate !== undefined) {
+        try {
+          await settings.experimental_set({
+            ...(input.language !== undefined ? { language: input.language } : {}),
+            ...(input.defaultTemplate !== undefined ? { defaultTemplate: input.defaultTemplate } : {}),
+          });
+        } catch (error) {
+          throw new experimental_PluginRpcRefusal({
+            code: "invalid",
+            message: error instanceof Error ? error.message : String(error),
+          });
+        }
+      }
+      const { lang: nextLang } = await loadLang();
+      const settingsValues = await settings.get();
+      const templates = await allTemplates(nextLang);
+      return {
+        language: nextLang,
+        defaultTemplate: settingsValues.defaultTemplate,
+        defaultTemplateExists: templates.some((tpl) => tpl.id === settingsValues.defaultTemplate),
+        generatorSelection: await readGeneratorSelection(),
+        reloadHint: settingsMessages(nextLang).reloadHint,
+      };
     },
     async templateSave({ template }) {
       const { m } = await loadLang();
@@ -1628,8 +2829,21 @@ export default async function plugin(bb: BbPluginApi) {
       return { ok: true };
     },
     async templateDelete({ id }) {
-      const { m } = await loadLang();
-      await deleteUserTemplate(id, m);
+      const { lang, m } = await loadLang();
+      try {
+        await deleteUserTemplate(id, m);
+      } catch (error) {
+        // A structured refusal for the UI: deleting the current default is
+        // a conflict the user must resolve by choosing another default.
+        if ((error as PluginCliError).code === "template_is_default") {
+          const err = settingsMessages(lang).templateIsDefault(id);
+          throw new experimental_PluginRpcRefusal({
+            code: "conflict",
+            message: `${err.message}. ${err.hint}`,
+          });
+        }
+        throw error;
+      }
       return { ok: true };
     },
     async templateNew({ id, title, kinds }) {
@@ -1669,6 +2883,42 @@ export default async function plugin(bb: BbPluginApi) {
       const result = await addRole(scope, { ...role, threadId }, lang, t, m, true);
       return { role: result.role, threadId: result.threadId };
     },
+    async rolePolicy({projectId,team,role:roleName,primary,policy,expectedRevision}) {
+      const {t}=await loadLang(); const scope=await scopeFor(projectId,team,t);
+      return withScopeLock(scope,async()=>{
+        const loaded=await readTeamConfig(bb,scope,team,t);
+        const raw=await readFileOrNull(bb,scope,loaded.source);
+        if(raw===null) throw new PluginCliError("Team config is unavailable",{code:"not_found"});
+        const revision=createHash("sha256").update(raw).digest("hex");
+        const role=loaded.config.roles.find(r=>r.name===roleName);
+        if(!role) throw new PluginCliError("Role is not in the team config",{code:"not_found"});
+        if(policy===undefined && primary===undefined) return {role,source:loaded.source,revision};
+        if(expectedRevision!==revision) throw new PluginCliError("Team config changed; reopen the profile before saving",{code:"conflict"});
+        const parsed=(loaded.source.endsWith(".json")?JSON.parse(raw):loadYaml(raw)) as {roles:Array<Record<string,unknown>>};
+        const entry=parsed.roles.find(r=>r.name===roleName)!;
+        if(primary!==undefined) for(const key of ["provider","model","reasoningLevel","serviceTier"] as const) {
+          delete entry[key]; if(primary[key]!==undefined) entry[key]=primary[key];
+        }
+        if(policy===null) delete entry.executionPolicy; else if(policy!==undefined) entry.executionPolicy=policy;
+        const next=loaded.source.endsWith(".json")?`${JSON.stringify(parsed,null,2)}\n`:dumpYaml(parsed,{lineWidth:120,noRefs:true});
+        core.parseTeamConfig(next,loaded.source,t);
+        await writeWorkspaceFile(bb,scope,loaded.source,next);publishChange(projectId);
+        const updated=core.parseTeamConfig(next,loaded.source,t).roles.find(r=>r.name===roleName)!;
+        return {role:updated,source:loaded.source,revision:createHash("sha256").update(next).digest("hex")};
+      });
+    },
+    async resources({projectId,team,reason,role,policy,taskId}) {
+      const {t}=await loadLang();const scope=await scopeFor(projectId,team,t);
+      if(!reason){if(policy||taskId!==undefined||role)throw new experimental_PluginRpcRefusal({code:"invalid",message:"State the concrete resource decision"});return withResourceResults(await resources.inspect(scope),(await readTasks(scope)).tasks);}
+      if(taskId!==undefined){
+        const task=(await readTasks(scope)).tasks.find(t=>t.id===taskId);if(!task)throw new experimental_PluginRpcRefusal({code:"not_found",message:"Task missing"});
+        const intent=await readReplacementIntent(bb,scope.projectId,scope.team,task.role);
+        if(intent&&intent.stage!=="complete")throw new experimental_PluginRpcRefusal({code:"conflict",message:"Resolve the unfinished replacement before releasing attempts"});
+        await tracker.review(scope,taskId,{decision:{decision:"changes-requested",reason,decidedBy:"manual",basis:"manual",atMs:Date.now()}});
+      }
+      const result=await resources.decide(scope,reason,policy,taskId,role);publishChange(projectId);
+      await bb.experimental_hooks.recheck("message.dispatch");return withResourceResults(result,(await readTasks(scope)).tasks);
+    },
     async setVersioned({ projectId, team, versioned }) {
       const { t } = await loadLang();
       const scope = await scopeFor(projectId, team, t);
@@ -1692,10 +2942,11 @@ export default async function plugin(bb: BbPluginApi) {
       const result = await addPackage(scope, { role, title, note: note ?? null, send }, t, m);
       return { task: result.task, sentTo: result.sentTo, sendError: result.sendError };
     },
-    async taskUpdate({ projectId, team, id, status }) {
+    async taskUpdate({ projectId, team, id, status, review, acceptReason, returnReason, expectedSubmissionId }) {
       const { t } = await loadLang();
       const scope = await scopeFor(projectId, team, t);
-      return { task: (await updatePackage(scope, id, { status })).task };
+      // RPC comes from the user's panel (no team thread): the manual path.
+      return { task: (await updatePackage(scope, id, { status, review, acceptReason, returnReason, expectedSubmissionId })).task };
     },
     async pause({ projectId, team, paused }) {
       const { t } = await loadLang();
@@ -1760,7 +3011,7 @@ export default async function plugin(bb: BbPluginApi) {
             team: { ...TEAM_OPTION, description: `Team name (default: ${DEFAULT_TEAM})` },
             template: {
               type: "string",
-              description: "Template id: dev (default), qa, docs, product, or your own (bb team template list)",
+              description: "Template id (default: the Default team template setting, initially dev); see bb team template list",
               placeholder: "<id>",
             },
             from: {
@@ -1811,8 +3062,21 @@ export default async function plugin(bb: BbPluginApi) {
               vars = loaded.config.vars;
               defaults = loaded.config.defaults;
             } else {
-              templateId = input.options.template ?? "dev";
-              template = await getTemplate(templateId, lang, m);
+              const settingsValues = await settings.get();
+              templateId = input.options.template ?? settingsValues.defaultTemplate;
+              try {
+                template = await getTemplate(templateId, lang, m);
+              } catch (error) {
+                // An explicitly requested template keeps its plain error; a
+                // missing saved default must not silently fall back.
+                if (!input.options.template && (error as PluginCliError).code === "template_not_found") {
+                  throw new PluginCliError(
+                    `Default team template "${templateId}" does not exist; save it first or change the Team "Default team template" setting`,
+                    { code: "template_not_found", hint: "bb team template list" },
+                  );
+                }
+                throw error;
+              }
             }
             const written = await withScopeLock(scope, async () => {
               const teams = await listConfiguredTeams(bb, workspace);
@@ -1820,8 +3084,12 @@ export default async function plugin(bb: BbPluginApi) {
                 const err = m.teamExists(team);
                 throw new PluginCliError(err.message, { code: "team_exists", hint: err.hint });
               }
+              const checkouts = input.options.from ? [] : await bb.sdk.environments.list({
+                projectId: scope.projectId, environmentProviderId: "project-checkout",
+              });
               const files = teamFilesFromTemplate(lang, template, team, {
                 vars,
+                ...(!input.options.from ? { environment: checkouts.length ? "checkout" : "default" } : {}),
                 ...(defaults ? { defaults: defaults as Record<string, unknown> } : {}),
               });
               const written = await writeTeamFiles(scope, files, Boolean(input.options.force), t);
@@ -2117,6 +3385,81 @@ export default async function plugin(bb: BbPluginApi) {
           },
         }),
 
+        tracker: cliCommand({
+          summary: "Select one task tracker for every team of the project",
+          positionals: [{name: "kind", description: "beads | builtin | default (clear override)"}],
+          options: {project: PROJECT_OPTION, json: JSON_OPTION},
+          async run(input, ctx) {
+            const {t} = await loadLang();
+            const workspace = await resolveWorkspace(bb, input.options.project, ctx.projectId, t, ctx);
+            const kind = input.positionals.kind;
+            if (kind !== undefined) {
+              if (!["beads", "builtin", "default"].includes(kind)) throw new PluginCliError("Tracker must be beads, builtin or default", {code: "invalid_value"});
+              await setProjectTracker(workspace, kind === "default" ? null : kind as "beads" | "builtin");
+            }
+            const config = await tracker.getConfig(workspace);
+            return {exitCode: 0, stdout: input.options.json ? JSON.stringify({projectId: workspace.projectId, ...config}) : `${workspace.projectName}: ${config.kind} (${config.override ? "project override" : "plugin default"})`};
+          },
+        }),
+        checkpoint: cliCommand({
+          summary: "Save a complete task handoff and verify the current environment",
+          positionals: [{name: "id", required: true, description: "Task ID"}],
+          options: {project: PROJECT_OPTION, team: TEAM_OPTION, file: {type: "string", required: true, description: "Checkpoint JSON file, absolute or relative to the caller environment"}, rotate: {type: "boolean", description: "Queue a session rotation: this task continues in a fresh session with this checkpoint once the current operations end (idle)"}, json: JSON_OPTION},
+          async run(input, ctx) {
+            const {t} = await loadLang();
+            const scope = await resolveScope(input.options, ctx, t);
+            return withScopeLock(scope, async () => {
+              const id = parseTaskId(input.positionals.id!);
+              const task = (await readTasks(scope)).tasks.find(task => task.id === id);
+              if (!task) throw new PluginCliError(`Task ${id} not found`, {code: "task_not_found"});
+              const replacement = await readReplacementIntent(bb,scope.projectId,scope.team,task.role);
+              if (replacement && replacement.stage!=="complete") {
+                const canonical=await bb.storage.kv.get<string>(`active-session:${scope.projectId}:${scope.team}:${task.role}`);
+                if ((replacement.stage!=="spawning" && replacement.stage!=="spawn_uncertain") || (canonical && canonical!==replacement.oldThreadId)) throw new PluginCliError("Finish or abort the pending replacement before saving another checkpoint",{code:"replacement_pending"});
+              }
+              const {rows} = await teamContext(scope, t);
+              const list = rows.get(task.role) ?? [];
+              if (list.length !== 1) throw new PluginCliError("Checkpoint requires exactly one current thread for the task role", {code: "thread_ambiguous"});
+              const target = list[0]!;
+              const assigned=await bb.storage.kv.get<TaskId>(sessionTaskKey(scope,target.threadId));
+              if (assigned !== undefined && assigned !== id) throw new PluginCliError("Checkpoint must describe this session existing package",{code:"session_consumed"});
+              const other=busyTasks(await readTasks(scope),task.role,id);
+              if (other.length) throw new PluginCliError("Checkpoint must describe the role active package",{code:"role_busy"});
+              if (task.status === "todo" && !(await tracker.ready(scope)).includes(id)) throw new PluginCliError("Checkpoint task is not ready in the selected tracker",{code:"task_not_ready"});
+              if (ctx.threadId && ctx.threadId !== target.threadId) {
+                const mark = readTeamMark(await bb.sdk.threads.getPluginMetadata({threadId: ctx.threadId}) as Record<string,unknown>);
+                if (mark) throw new PluginCliError("An agent can checkpoint only its own role", {code: "task_forbidden"});
+              }
+              const thread = await bb.sdk.threads.get({threadId: ctx.threadId ?? target.threadId});
+              const environment = thread.environmentId ? await bb.sdk.environments.get({environmentId: thread.environmentId}) : null;
+              const path = joinPath(environment?.path ?? scope.path, input.options.file!);
+              const file = await bb.sdk.files.read({hostId: environment?.hostId ?? scope.hostId, path});
+              let content: unknown;
+              try { content = JSON.parse(file.content); } catch { throw new PluginCliError("Checkpoint file must contain JSON", {code: "checkpoint_invalid"}); }
+              const checkpoint = await captureCheckpoint(bb, id, task.role, target.threadId, content);
+              if (task.status === "todo") await tracker.update(scope,id,{status:"in-progress"});
+              await tracker.writeCheckpoint(scope, id, checkpoint);
+              const verified = workCheckpointSchema.parse(await tracker.readCheckpoint(scope, id));
+              if (JSON.stringify(checkpoint) !== JSON.stringify(verified)) throw new PluginCliError("Checkpoint read-back failed", {code: "checkpoint_invalid"});
+              await bb.storage.kv.set(checkpointRefKey(scope, task.role), {taskId: id});
+              await bb.storage.kv.set(sessionTaskKey(scope,target.threadId),id);
+              // --rotate queues an explicit deferred context rotation; it
+              // never stops the caller's own active turn (the machine only
+              // replaces idle sessions). Otherwise a fresh agent-saved
+              // checkpoint can release a pending auto-continue.
+              let rotation: "requested" | "replaced" | null = null;
+              if (input.options.rotate) rotation = await armContextRotation(scope, task.role, id, target.threadId, t);
+              else await runAutoContinue(scope, task.role, t);
+              const note = rotation === "replaced"
+                ? `; session replaced: task ${id} continues in a fresh session`
+                : rotation === "requested"
+                  ? "; session rotation queued: it runs when this session reaches a safe boundary"
+                  : "";
+              return {exitCode: 0, stdout: input.options.json ? JSON.stringify({ok:true, taskId:id, role:task.role, environmentId:checkpoint.environmentId, ...(rotation ? {rotate: rotation} : {})}) : `Checkpoint saved in task ${id}; environment ${checkpoint.environmentId}${note}`};
+            });
+          },
+        }),
+
         /* ── bb team task … ── */
         "task add": cliCommand({
           summary: "Add a work package for a role (--send hands it to the role's thread)",
@@ -2166,6 +3509,7 @@ export default async function plugin(bb: BbPluginApi) {
             const out = [m.taskAdded(result.task.id, result.task.role, result.task.title)];
             out.push(`  ${m.taskStatusLine(result.task.status)}`);
             if (result.sentTo) out.push(`  ${m.taskSent(result.task.role, result.sentTo)}`);
+            if (input.options.send && !result.sentTo && !result.sendError) out.push("  queued: the role must finish its current package; replace a completed session to start another package");
             if (result.sendError) out.push(`  ${m.taskSendFailed(result.task.id, result.sendError)}`);
             if (result.busy.length > 0) {
               out.push(`  ${m.taskBusy(result.task.role, result.busy.map((task) => `#${task.id}`).join(", "))}`);
@@ -2209,7 +3553,7 @@ export default async function plugin(bb: BbPluginApi) {
         }),
 
         "task update": cliCommand({
-          summary: "Change a work package: status, title or note",
+          summary: "Change a work package: status, title, note, review report or acceptance grounds",
           positionals: [{ name: "id", required: true, description: "Package number" }],
           options: {
             project: PROJECT_OPTION,
@@ -2217,9 +3561,22 @@ export default async function plugin(bb: BbPluginApi) {
             status: { type: "string", description: `New status: ${TASK_STATUSES.join(" | ")}`, placeholder: "<status>" },
             title: { type: "string", description: "New title" },
             note: { type: "string", description: "New note (empty string clears it)", stdin: true },
+            review: {
+              type: "string",
+              description:
+                'Review report JSON for --status review: {"result":…,"artifacts":[…],"checks":[{"what":…,"result":…}|{"what":…,"notApplicable":…}],"problems":[…]}',
+              stdin: true,
+            },
+            "accept-reason": { type: "string", description: "Grounds for accepting (--status done): what was verified and why it is enough", stdin: true },
+            "return-reason": { type: "string", description: "Concrete remark when returning from review (--status todo)", stdin: true },
+            "expected-submission": {
+              type: "string",
+              description: "Id of the reviewed submission (bb team task list --json): a mismatch with the stored report is a conflict, nothing is written",
+              placeholder: "<sub_…>",
+            },
             json: JSON_OPTION,
           },
-          constraints: [{ kind: "at-least-one", options: ["status", "title", "note"] }],
+          constraints: [{ kind: "at-least-one", options: ["status", "title", "note", "review", "accept-reason", "return-reason"] }],
           async run(input, ctx) {
             const { t, m } = await loadLang();
             const scope = await resolveScope(input.options, ctx, t);
@@ -2234,7 +3591,11 @@ export default async function plugin(bb: BbPluginApi) {
               status,
               title: input.options.title,
               note: input.options.note,
-            });
+              review: input.options.review,
+              acceptReason: input.options["accept-reason"],
+              returnReason: input.options["return-reason"],
+              expectedSubmissionId: input.options["expected-submission"],
+            }, ctx.threadId);
             return taskOutput(result, input.options.json, scope, m);
           },
         }),
@@ -2242,12 +3603,30 @@ export default async function plugin(bb: BbPluginApi) {
         "task done": cliCommand({
           summary: "Accept a work package (status done)",
           positionals: [{ name: "id", required: true, description: "Package number" }],
-          options: { project: PROJECT_OPTION, team: TEAM_OPTION, json: JSON_OPTION },
+          options: {
+            project: PROJECT_OPTION,
+            team: TEAM_OPTION,
+            reason: {
+              type: "string",
+              description: "Grounds for acceptance: what was verified and why it is enough (required for the lead role)",
+              stdin: true,
+            },
+            "expected-submission": {
+              type: "string",
+              description: "Id of the reviewed submission (bb team task list --json): a mismatch with the stored report is a conflict, nothing is written",
+              placeholder: "<sub_…>",
+            },
+            json: JSON_OPTION,
+          },
           async run(input, ctx) {
             const { t, m } = await loadLang();
             const scope = await resolveScope(input.options, ctx, t);
             await guardAccept(scope, "done", ctx.threadId, t, m);
-            const result = await updatePackage(scope, parseTaskId(input.positionals.id!), { status: "done" });
+            const result = await updatePackage(scope, parseTaskId(input.positionals.id!), {
+              status: "done",
+              acceptReason: input.options.reason,
+              expectedSubmissionId: input.options["expected-submission"],
+            }, ctx.threadId);
             return taskOutput(result, input.options.json, scope, m);
           },
         }),
@@ -2261,9 +3640,10 @@ export default async function plugin(bb: BbPluginApi) {
             const scope = await resolveScope(input.options, ctx, t);
             const id = parseTaskId(input.positionals.id!);
             try {
-              await mutateTasks(scope, (current) => {
-                const result = removeTask(current, id);
-                return { store: result.store, value: undefined };
+              await withScopeLock(scope, async () => {
+                const task = (await readTasks(scope)).tasks.find(task => task.id === id);
+                if (task && (task.status === "in-progress" || task.status === "review")) throw new PluginCliError("Drop or accept the active package before removing it", {code: "role_busy"});
+                await tracker.remove(scope, id);
               });
             } catch (error) {
               return asCliError(error);
@@ -2370,165 +3750,70 @@ export default async function plugin(bb: BbPluginApi) {
 
         /* ── bb team replace ── */
         replace: cliCommand({
-          summary: "Move a role onto a fresh thread: handoff of its last report and open packages",
+          summary: "Continue a role in its existing environment using a saved task checkpoint",
           positionals: [{ name: "role", required: true, description: "Role name" }],
           options: {
             project: PROJECT_OPTION,
             team: TEAM_OPTION,
             thread: { type: "string", description: "The thread to replace when the role has several", placeholder: "<thr_…>" },
             keep: { type: "boolean", description: "Keep the old thread (unbound from the role) instead of archiving it" },
+            abort: {type:"boolean",description:"Cancel an unfinished replacement before the canonical role switches; keep the original session"},
             "dry-run": { type: "boolean", description: "Show the plan without changing anything" },
             json: JSON_OPTION,
           },
           async run(input, ctx) {
-            const { lang, t, m } = await loadLang();
-            const settingsValues = await settings.get();
+            const { t, m } = await loadLang();
             const scope = await resolveScope(input.options, ctx, t);
             const roleName = input.positionals.role!;
-            const { config } = await readTeamConfig(bb, scope, scope.team, t);
-            const { lead, roles } = core.semanticChecks(config, t);
+            const { roles } = core.semanticChecks((await readTeamConfig(bb, scope, scope.team, t)).config, t);
             const role = roles.find((r) => r.name === roleName);
             if (!role) {
               const err = m.taskRoleUnknown(roleName);
               throw new PluginCliError(err.message, { code: "role_not_found", hint: err.hint });
             }
-            const scan = await scanTeamThreads(bb, scope.projectId);
-            const rows = roleThreadsOf(scan, scope.team);
-            const list = rows.get(roleName) ?? [];
-            let old: TeamThreadRow | undefined;
-            if (input.options.thread) {
-              old = list.find((row) => row.threadId === input.options.thread);
-              if (!old) {
-                throw new PluginCliError(m.replaceThreadMismatch(roleName, input.options.thread), {
-                  code: "thread_not_found",
-                });
+            return withScopeLock(scope, async () => {
+              const scan = await scanTeamThreads(bb, scope.projectId);
+              const rows = roleThreadsOf(scan, scope.team);
+              const intent = await readReplacementIntent(bb, scope.projectId, scope.team, roleName);
+              const pending = intent && intent.stage !== "complete" ? intent : null;
+              if (input.options.abort && !input.options["dry-run"]) {
+                if (!pending) throw new PluginCliError("No unfinished replacement to abort",{code:"replacement_missing"});
+                const canonical=await bb.storage.kv.get<string>(`active-session:${scope.projectId}:${scope.team}:${roleName}`);
+                if (canonical && canonical!==pending.oldThreadId) throw new PluginCliError("The role already switched; repeat replace to finish recovery",{code:"replacement_switched"});
+                const candidates=await core.listProjectThreads(bb,scope.projectId);
+                for (const candidate of candidates) {
+                  const meta=await bb.sdk.threads.getPluginMetadata({threadId:candidate.id}) as Record<string,unknown>;
+                  if (candidate.id!==pending.newThreadId && !(meta.teamReplacement===true && meta.teamReplacementRole===roleName && meta.teamReplacementTeam===scope.team)) continue;
+                  if (!(await isPreparedReplacement(bb,await bb.sdk.threads.get({threadId:candidate.id}))) || candidate.environmentId!==pending.environmentId) throw new PluginCliError("A replacement candidate is active or changed environment; inspect it before aborting",{code:"replacement_candidate_invalid"});
+                  const descendants=await bb.sdk.threads.experimental_listDescendants({threadIds:[candidate.id]});
+                  for (const id of descendants.threads.find(x=>x.threadId===candidate.id)?.descendantIds ?? []) {
+                    const child=await bb.sdk.threads.get({threadId:id});
+                    if (child.parentThreadId===candidate.id) await bb.sdk.threads.update({threadId:id,parentThreadId:pending.oldThreadId});
+                  }
+                  await bb.sdk.threads.updatePluginMetadata({threadId:candidate.id,set:{teamRetired:true},remove:["teamRole","teamName","teamNotifyOn"]});
+                  await bb.sdk.threads.archive({threadId:candidate.id});
+                }
+                await bb.storage.kv.delete(`replacement:${scope.projectId}:${scope.team}:${roleName}`);
+                publishChange(scope.projectId);
+                return {exitCode:0,stdout:input.options.json?JSON.stringify({ok:true,aborted:true,oldThreadId:pending.oldThreadId}):`Replacement aborted; original session ${pending.oldThreadId} remains current`};
               }
-            } else if (list.length === 0) {
-              const err = m.replaceNoThread(roleName);
-              throw new PluginCliError(err.message, { code: "thread_not_found", hint: err.hint });
-            } else if (list.length > 1) {
-              const err = m.replaceAmbiguous(roleName, list.map((row) => row.threadId).join(", "));
-              throw new PluginCliError(err.message, { code: "thread_ambiguous", hint: err.hint });
-            } else {
-              old = list[0]!;
-            }
-            const isLead = role.name === lead.name;
-            if (input.options["dry-run"]) {
-              if (input.options.json) {
-                return {
-                  exitCode: 0,
-                  stdout: JSON.stringify({ ok: true, dryRun: true, role: roleName, oldThreadId: old.threadId }),
-                };
+              if (pending?.stage === "spawn_uncertain" && input.options.thread && !input.options["dry-run"]) {
+                const candidate = await bb.sdk.threads.get({threadId:input.options.thread});
+                const meta = await bb.sdk.threads.getPluginMetadata({threadId:candidate.id}) as Record<string,unknown>;
+                if (candidate.projectId!==scope.projectId || candidate.environmentId!==pending.environmentId || !(await isPreparedReplacement(bb,candidate)) || candidate.archivedAt!==null || meta.teamReplacement!==true || meta.teamReplacementRole!==roleName || meta.teamReplacementTeam!==scope.team) throw new PluginCliError("Candidate is not an idle replacement for this role and environment",{code:"replacement_candidate_invalid"});
+                pending.newThreadId=candidate.id;pending.stage="spawning";
+                await bb.storage.kv.set(`replacement:${scope.projectId}:${scope.team}:${roleName}`,pending);
               }
-              return { exitCode: 0, stdout: m.replacePlan(roleName, old.threadId) };
-            }
-            await validateProviders(bb, [role], t);
-            const environment = await resolveEnvironment(bb, scope, roleEnvironmentSpec(role, config), t);
-            let output: string | null = null;
-            try {
-              output = excerpt((await bb.sdk.threads.output({ threadId: old.threadId })).output, 4000);
-            } catch {
-              output = null;
-            }
-            const taskLines = listTasks(await readTasks(scope), { role: roleName })
-              .map((task) => `- #${task.id} ${task.title} [${task.status}]`)
-              .join("\n");
-            const roleThreads = new Map<string, string>();
-            for (const [name, threads] of rows) if (threads[0]) roleThreads.set(name, threads[0].threadId);
-            const leadThreadId = isLead ? null : roleThreads.get(lead.name) ?? null;
-            const rawPrompt = await loadRolePrompt(bb, scope, role, isLead, lang, t);
-            const prompt =
-              core.applyPlaceholders(
-                rawPrompt,
-                { workspace: scope, leadThreadId, roleThreads, teamVars: config.vars, teamName: scope.team },
-                t,
-              ) + m.replaceHandoff(`@thread:${old.threadId}`, output, taskLines);
-            const sectionId = settingsValues.teamSection
-              ? await ensureSection(bb, teamSectionName(t, scope.team), [strings("en"), strings("ru")].map((x) => teamSectionName(x, scope.team)))
-              : null;
-            const defaults = config.defaults ?? {};
-            const spawnArgs = {
-              projectId: scope.projectId,
-              title: await threadTitle(scope, role.title ?? role.name, scan),
-              providerId: role.provider,
-              model: role.model,
-              reasoningLevel: role.reasoningLevel,
-              serviceTier: role.serviceTier,
-              permissionMode: role.permissionMode ?? defaults.permissionMode,
-              environment,
-              sectionId,
-              parentThreadId: leadThreadId ?? undefined,
-              parentNotifications: leadThreadId ? role.parentNotifications ?? defaults.parentNotifications : undefined,
-              pluginMetadata: teamMetadata(role, scope.team),
-              prompt,
-            };
-            let fresh: Awaited<ReturnType<typeof bb.sdk.threads.spawn>>;
-            try {
-              fresh = await bb.sdk.threads.spawn(spawnArgs);
-            } catch {
-              await new Promise((resolve) => setTimeout(resolve, 1500));
-              try {
-                fresh = await bb.sdk.threads.spawn(spawnArgs);
-              } catch (error) {
-                const err = t.spawnFailed(roleName, (error as Error).message);
-                throw new PluginCliError(err.message, { code: "spawn_failed", hint: err.hint });
-              }
-            }
-            await bb.sdk.threads.updatePluginMetadata({
-              threadId: old.threadId,
-              remove: ["teamRole", "teamName", "teamNotifyOn"],
+              const list = rows.get(roleName) ?? [];
+              const selected = pending?.oldThreadId ?? input.options.thread ?? (list.length === 1 ? list[0]!.threadId : null);
+              if (!selected) throw new PluginCliError(list.length ? m.replaceAmbiguous(roleName, list.map(x=>x.threadId).join(", ")).message : m.replaceNoThread(roleName).message, {code: list.length ? "thread_ambiguous" : "thread_not_found"});
+              if (!pending && !list.some(x => x.threadId === selected)) throw new PluginCliError(m.replaceThreadMismatch(roleName, selected), {code: "thread_not_found"});
+              const old = await bb.sdk.threads.get({threadId: selected});
+              if (input.options["dry-run"]) return {exitCode: 0, stdout: input.options.json ? JSON.stringify({ok:true,dryRun:true,role:roleName,oldThreadId:old.id,environmentId:old.environmentId,replacement:pending}) : m.replacePlan(roleName, old.id)};
+              const outcome = await continueRoleSession(scope, roleName, old.id, {keep: input.options.keep, pending});
+              if (input.options.json) return {exitCode:0,stdout:JSON.stringify({ok:true,team:scope.team,role:roleName,...outcome.result,continuing:outcome.continuing,archived:!outcome.kept})};
+              return {exitCode:0,stdout:[m.replaceDone(roleName,outcome.result.oldThreadId,outcome.result.newThreadId),m.replaceReparented(outcome.result.reparented)].join("\n")};
             });
-            let reparented = 0;
-            if (isLead) {
-              for (const row of scan.rows) {
-                if (row.parentThreadId !== old.threadId || row.threadId === old.threadId) continue;
-                await bb.sdk.threads.update({ threadId: row.threadId, parentThreadId: fresh.id });
-                reparented += 1;
-              }
-            }
-            if (!input.options.keep) await bb.sdk.threads.archive({ threadId: old.threadId });
-            const pauseState = await readPause(scope);
-            if (pauseState?.threadIds.includes(old.threadId)) {
-              const threadIds = pauseState.threadIds.map((id) => (id === old!.threadId ? fresh.id : id));
-              await bb.storage.kv.set(pauseKey(scope), { ...pauseState, threadIds });
-              pausedThreads.delete(old.threadId);
-              pausedThreads.add(fresh.id);
-            }
-            if (!isLead && leadThreadId) {
-              await bb.sdk.threads.send({
-                originPluginId: bb.pluginId,
-                threadId: leadThreadId,
-                mode: "queue-if-active",
-                input: [
-                  {
-                    type: "text",
-                    text: m.replaceLeadNotice(roleName, `@thread:${old.threadId}`, `@thread:${fresh.id}`),
-                    mentions: [],
-                  },
-                ],
-              });
-            }
-            publishChange(scope.projectId);
-            if (input.options.json) {
-              return {
-                exitCode: 0,
-                stdout: JSON.stringify({
-                  ok: true,
-                  team: scope.team,
-                  role: roleName,
-                  oldThreadId: old.threadId,
-                  newThreadId: fresh.id,
-                  archived: !input.options.keep,
-                  reparented,
-                  configBindsOld: role.threadId === old.threadId,
-                }),
-              };
-            }
-            const out = [m.replaceDone(roleName, old.threadId, fresh.id)];
-            out.push(input.options.keep ? m.replaceKept(old.threadId) : m.replaceArchived(old.threadId));
-            if (reparented > 0) out.push(m.replaceReparented(reparented));
-            if (role.threadId === old.threadId) out.push(m.replaceConfigNote(roleName, old.threadId));
-            return { exitCode: 0, stdout: out.join("\n") };
           },
         }),
 
@@ -2687,6 +3972,7 @@ export default async function plugin(bb: BbPluginApi) {
                 versioned: snapshot.versioned,
                 config: configReport(snapshot),
                 configError: snapshot.configError,
+                trackerError: snapshot.trackerError ?? null,
                 paused: snapshot.paused,
                 threads: Object.fromEntries(
                   snapshot.roles.filter((r) => r.threads.length > 0).map((r) => [r.name, r.threads]),
@@ -2722,6 +4008,7 @@ export default async function plugin(bb: BbPluginApi) {
                 out.push(`  ${t.statusNoConfig(snapshot.team)}`);
               }
               if (snapshot.configError) out.push(`  ! ${snapshot.configError}`);
+              if (snapshot.trackerError) out.push(`  ! ${snapshot.trackerError.message}`);
               if (snapshot.paused) out.push(`  ${m.doctorPaused}`);
               if (snapshot.roles.every((role) => role.threads.length === 0)) {
                 out.push(`  ${t.statusThreadsEmpty}`);

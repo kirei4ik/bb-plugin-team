@@ -316,7 +316,7 @@ function makeHost(
   const written: Array<{ path: string; content: string }> = [];
   const { bb, harness } = createFakePluginHost({
     pluginId: "team",
-    settings: opts.settings ?? {},
+    settings: {defaultTracker: "builtin", ...opts.settings},
     sdk: {
       projects: {
         list: async () => [
@@ -647,5 +647,212 @@ describe("bb team CLI (поведение)", () => {
     const data = JSON.parse(result.stdout) as { ok: boolean; config: { lead: string } };
     expect(data.ok).toBe(true);
     expect(data.config.lead).toBe("lead");
+  });
+
+  it("init: defaultTemplate задаёт шаблон по умолчанию (fallback на настройку)", async () => {
+    const { bb, harness, written } = makeHost({ configYaml: null, settings: { defaultTemplate: "qa" } });
+    await plugin(bb);
+    const result = await harness.behavior.runCli(["init", "--project", "demo", "--json"]);
+    expect(result.exitCode).toBe(0);
+    expect((JSON.parse(result.stdout) as { template: string }).template).toBe("qa");
+    // qa-шаблон: lead + tester
+    const yaml = written.find((w) => w.path.endsWith("main.yaml"))!.content;
+    expect(yaml).toContain("tester");
+    expect(yaml).not.toContain("junior");
+    expect(teamConfigSchema.parse(loadYaml(yaml)).defaults?.environment).toBe("checkout");
+  });
+
+  it("init нового проекта без checkout-окружения сохраняет рабочий project-default", async () => {
+    const { bb, harness, written } = makeHost({ configYaml: null });
+    harness.sdk.stub("environments.list", async () => []);
+    await plugin(bb);
+    const result = await harness.behavior.runCli(["init", "--project", "demo", "--json"]);
+    expect(result.exitCode).toBe(0);
+    const yaml = written.find(w => w.path.endsWith("main.yaml"))!.content;
+    expect(teamConfigSchema.parse(loadYaml(yaml)).defaults?.environment).toBe("default");
+  });
+
+  it("init: отсутствующий defaultTemplate — явная ошибка, не молчаливый fallback на dev", async () => {
+    const { bb, harness, written } = makeHost({ configYaml: null, settings: { defaultTemplate: "ghost" } });
+    await plugin(bb);
+    const result = await harness.behavior.runCli(["init", "--project", "demo"]);
+    expect(result.exitCode).not.toBe(0);
+    expect(result.stderr).toContain("Default team template");
+    expect(result.stderr).toContain("ghost");
+    expect(written).toHaveLength(0);
+  });
+
+  it("init: явный --template перекрывает defaultTemplate", async () => {
+    const { bb, harness } = makeHost({ configYaml: null, settings: { defaultTemplate: "ghost" } });
+    await plugin(bb);
+    const result = await harness.behavior.runCli(["init", "--project", "demo", "--template", "qa", "--json"]);
+    expect(result.exitCode).toBe(0);
+    expect((JSON.parse(result.stdout) as { template: string }).template).toBe("qa");
+  });
+
+  it("templates RPC отдаёт defaultTemplate; по умолчанию dev", async () => {
+    const { bb, harness } = makeHost();
+    await plugin(bb);
+    const data = (await harness.behavior.callRpc("templates", null)) as { defaultTemplate: string; templates: Array<{ id: string }> };
+    expect(data.defaultTemplate).toBe("dev");
+    expect(data.templates.some((tpl) => tpl.id === "dev")).toBe(true);
+  });
+});
+
+describe("общие настройки: локализация и defaultTemplate (editorSettings RPC)", () => {
+  const EDITOR_SETTINGS_FIELDS = ["language", "defaultTemplate", "defaultTemplateExists", "generatorSelection", "reloadHint"] as const;
+
+  const rpcErrorCode = async (promise: Promise<unknown>): Promise<{ code?: string; message: string }> => {
+    try {
+      await promise;
+      throw new Error("ожидался отказ RPC");
+    } catch (error) {
+      const e = error as { code?: string; message?: string };
+      return { code: e.code, message: String(e.message) };
+    }
+  };
+
+  it("native descriptors при сохранённом ru — русские подписи без EN-склейки", async () => {
+    const { bb, harness } = makeHost({ settings: { language: "ru" } });
+    await plugin(bb);
+    const descriptors = harness.inspection.registrations.settingsDescriptors as Record<string, { label: string; description?: string; experimental_optionLabels?: Record<string, string> }>;
+    // Переключатель языка находим на обоих языках; остальные поля — RU-only.
+    expect(descriptors.language.label).toBe("Language / Язык");
+    expect(descriptors.defaultTemplate.label).toBe("Шаблон команды по умолчанию");
+    expect(descriptors.defaultTemplate.description).toContain("bb team init");
+    expect(descriptors.defaultTracker.label).toBe("Трекер задач по умолчанию");
+    expect(descriptors.defaultTracker.experimental_optionLabels).toEqual({
+      beads: "Beads (внешний трекер задач)",
+      builtin: "Встроенные задачи",
+    });
+    expect(descriptors.teamSection.label).toBe("Разделы команд в боковой панели");
+    expect(descriptors.titleFormat.label).toBe("Формат заголовка треда");
+    // Ключи и дефолты сохранены.
+    expect(Object.keys(descriptors).sort()).toEqual(
+      ["defaultTracker", "defaultTemplate", "language", "roster", "teamSection", "titleFormat"].sort(),
+    );
+    expect(descriptors.defaultTemplate.default).toBe("dev");
+    expect(descriptors.language.options).toEqual(["en", "ru"]);
+  });
+
+  it("native descriptors по умолчанию (en) — английские подписи", async () => {
+    const { bb, harness } = makeHost();
+    await plugin(bb);
+    const descriptors = harness.inspection.registrations.settingsDescriptors as Record<string, { label: string }>;
+    expect(descriptors.defaultTemplate.label).toBe("Default team template");
+    expect(descriptors.defaultTracker.label).toBe("Default task tracker");
+    expect(descriptors.teamSection.label).toBe("Team sidebar sections");
+  });
+
+  it("editorSettings: дефолты, существование defaultTemplate, hint о reload", async () => {
+    const { bb, harness } = makeHost();
+    await plugin(bb);
+    const data = (await harness.behavior.callRpc("editorSettings", null)) as Record<string, unknown>;
+    expect(Object.keys(data).sort()).toEqual([...EDITOR_SETTINGS_FIELDS].sort());
+    expect(data.language).toBe("en");
+    expect(data.defaultTemplate).toBe("dev");
+    expect(data.defaultTemplateExists).toBe(true);
+    expect(data.generatorSelection).toBeNull();
+    expect(String(data.reloadHint)).toContain("reload");
+  });
+
+  it("editorSettingsSet: language и defaultTemplate пишутся в существующий settings handle", async () => {
+    const { bb, harness } = makeHost({ settings: { language: "ru" } });
+    await plugin(bb);
+    const data = (await harness.behavior.callRpc("editorSettingsSet", { defaultTemplate: "qa" })) as {
+      language: string;
+      defaultTemplate: string;
+    };
+    expect(data.language).toBe("ru");
+    expect(data.defaultTemplate).toBe("qa");
+    // Тот же источник: templates RPC и CLI видят изменение.
+    const templates = (await harness.behavior.callRpc("templates", null)) as { defaultTemplate: string };
+    expect(templates.defaultTemplate).toBe("qa");
+    const cli = await harness.behavior.runCli(["template", "list"]);
+    expect(cli.stdout).toContain("Шаблоны команд:");
+  });
+
+  it("editorSettingsSet: смена языка на ru видна CLI без второго источника", async () => {
+    const { bb, harness } = makeHost();
+    await plugin(bb);
+    const data = (await harness.behavior.callRpc("editorSettingsSet", { language: "ru" })) as { language: string; reloadHint: string };
+    expect(data.language).toBe("ru");
+    // Подсказка локализована уже в новом языке.
+    expect(data.reloadHint).toContain("перезагрузк");
+    const cli = await harness.behavior.runCli(["template", "list"]);
+    expect(cli.stdout).toContain("Шаблоны команд:");
+  });
+
+  it("editorSettingsSet: несуществующий defaultTemplate — отказ, настройки не меняются", async () => {
+    const { bb, harness } = makeHost();
+    await plugin(bb);
+    const failure = await rpcErrorCode(harness.behavior.callRpc("editorSettingsSet", { defaultTemplate: "ghost" }));
+    // Структурный отказ RPC: код из множества forbidden/not_found/conflict/invalid.
+    expect(failure.code).toBe("not_found");
+    expect(failure.message).toContain("ghost");
+    const data = (await harness.behavior.callRpc("editorSettings", null)) as { defaultTemplate: string };
+    expect(data.defaultTemplate).toBe("dev");
+  });
+
+  it("editorSettings: сохранённый ru отдаёт русские значения", async () => {
+    const { bb, harness } = makeHost({ settings: { language: "ru", defaultTemplate: "ghost" } });
+    await plugin(bb);
+    const data = (await harness.behavior.callRpc("editorSettings", null)) as { language: string; defaultTemplate: string; defaultTemplateExists: boolean };
+    expect(data.language).toBe("ru");
+    expect(data.defaultTemplate).toBe("ghost");
+    expect(data.defaultTemplateExists).toBe(false);
+  });
+
+  it("editorSettingsSet: generatorSelection сохраняется и очищается (один kv-ключ)", async () => {
+    const { bb, harness } = makeHost();
+    await plugin(bb);
+    const selection = { providerId: "pi", model: "qwen3-coder", reasoningLevel: "high" as const };
+    const saved = (await harness.behavior.callRpc("editorSettingsSet", { generatorSelection: selection })) as { generatorSelection: typeof selection | null };
+    expect(saved.generatorSelection).toEqual(selection);
+    const read = (await harness.behavior.callRpc("editorSettings", null)) as { generatorSelection: typeof selection | null };
+    expect(read.generatorSelection).toEqual(selection);
+    // Перезагрузка плагина с тем же kv-хранилищем — значение сохранено.
+    const reloaded = await harness.behavior.reload((nextBb) => plugin(nextBb));
+    const reread = (await reloaded.harness.behavior.callRpc("editorSettings", null)) as { generatorSelection: typeof selection | null };
+    expect(reread.generatorSelection).toEqual(selection);
+    // null очищает.
+    const cleared = (await reloaded.harness.behavior.callRpc("editorSettingsSet", { generatorSelection: null })) as { generatorSelection: unknown };
+    expect(cleared.generatorSelection).toBeNull();
+  });
+
+  it("editorSettingsSet: невалидная generatorSelection — ошибка валидации, ничего не пишется", async () => {
+    const { bb, harness } = makeHost();
+    await plugin(bb);
+    const failure = await rpcErrorCode(harness.behavior.callRpc("editorSettingsSet", {
+      generatorSelection: { providerId: "pi", model: "" },
+    }));
+    // Отказ на валидации входа RPC-схемой.
+    expect(failure.code).toBe("invalid_input");
+    const data = (await harness.behavior.callRpc("editorSettings", null)) as { generatorSelection: unknown };
+    expect(data.generatorSelection).toBeNull();
+  });
+
+  it("удаление текущего default-шаблона запрещено; после смены default — удаляется", async () => {
+    const { bb, harness } = makeHost();
+    await plugin(bb);
+    await harness.behavior.callRpc("templateNew", { id: "custom", title: "Custom", kinds: ["lead", "developer"] });
+    await harness.behavior.callRpc("editorSettingsSet", { defaultTemplate: "custom" });
+
+    // RPC отказывает структурно: конфликт, требующий сначала сменить default.
+    const rpcFailure = await rpcErrorCode(harness.behavior.callRpc("templateDelete", { id: "custom" }));
+    expect(rpcFailure.code).toBe("conflict");
+    expect(rpcFailure.message).toContain("custom");
+
+    // CLI отказывает без удаления.
+    const cli = await harness.behavior.runCli(["template", "delete", "custom"]);
+    expect(cli.exitCode).not.toBe(0);
+    expect(cli.stderr).toContain("custom");
+    const after = (await harness.behavior.callRpc("templates", null)) as { templates: Array<{ id: string }> };
+    expect(after.templates.some((tpl) => tpl.id === "custom")).toBe(true);
+
+    // Смена default разблокирует удаление — без скрытого fallback.
+    await harness.behavior.callRpc("editorSettingsSet", { defaultTemplate: "dev" });
+    const ok = await harness.behavior.runCli(["template", "delete", "custom"]);
+    expect(ok.exitCode).toBe(0);
   });
 });
