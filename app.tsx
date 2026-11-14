@@ -16,6 +16,7 @@ import {
 } from "@get-bb/plugin-sdk/app";
 import type { rpcContract } from "./server";
 import { RoleSessionCard } from "./role-session-card";
+import {RoleContinuationControls} from "./continuation-controls";
 import { ResourcePanel } from "./resource-panel";
 import { ReviewForm } from "./review-form";
 import {
@@ -1684,6 +1685,7 @@ function RoleDetails({
       </div>
       {role.inConfig && <Button onClick={()=>setEditingPolicy(value=>!value)}>{labels.executionPolicy}</Button>}
       {editingPolicy && <ExistingRolePolicy key={`${projectId}:${team}:${role.name}`} projectId={projectId} team={team} role={role.name} labels={labels} onAction={onAction}/>}
+      {role.inConfig&&<RoleContinuationControls projectId={projectId} team={team} role={role.name} threadId={role.threads[0]?.threadId??null} language={language} onChanged={()=>onAction(async()=>language==="ru"?"Состояние сотрудника обновлено.":"Employee state updated.")}/>}
       <RoleSessionCard
         key={`${projectId}:${team}:${role.name}:${role.threads.map(thread => thread.threadId).join(",")}`}
         projectId={projectId} team={team} role={role.name}

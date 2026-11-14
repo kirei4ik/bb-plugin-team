@@ -137,3 +137,21 @@ it("unavailable request history explicitly stops automatic quota recovery",async
  const {bb}=createFakePluginHost({pluginId:"history-test",sdk:{threads:{events:{list:async()=>{throw new Error("Unavailable");}}}}});
  const f=fixture();await expect(verifyQuotaBoundary(bb,f.fail(),{atMs:1000} as WorkCheckpoint)).rejects.toMatchObject({code:"checkpoint_history_unavailable"});
 });
+
+it("separates approved lead coordination budget from execution without resetting counts",async()=>{
+ const f=fixture();f.owners.set("lead",{...f.scope,role:"manager",taskId:"coordination",isLead:true});
+ await f.control.decide(f.scope,"Separate finite lead allowance",{...DEFAULT_RESOURCE_POLICY,taskAttempts:1,coordinationAttempts:3});
+ for(let i=0;i<3;i++){expect((await f.control.admit(f.ctx("lead",`coord-${i}`))).action).toBe("proceed");await f.control.settle("lead","completed");f.tick();}
+ expect((await f.control.admit(f.ctx("lead","over"))).action).toBe("wait");
+ const s=await f.control.inspect(f.scope);expect(s.starts).toBe(3);expect(s.blocked).toContain("3/3");
+});
+it("deduplicates resource notices across changed count text",async()=>{
+ const f=fixture();expect(await f.control.notice(f.scope,"dev:Task attempt limit reached (task:x: 8/8)")).toBe(true);
+ expect(await f.control.notice(f.scope,"dev:Task attempt limit reached (task:x: 12/8)")).toBe(false);
+});
+it("distinguishes Ollama and OpenRouter upstream accounts inside Pi while blocking all Ollama models",async()=>{
+ const f=fixture();const ctx=f.ctx();ctx.requestedExecution.model="ollama-cloud/one";
+ await f.control.admit(ctx);
+ const result=await f.control.failed(f.fail(),[{provider:"pi",model:"ollama-cloud/two"},{provider:"pi",model:"openrouter/approved-free"}]);
+ expect(result?.selection?.model).toBe("openrouter/approved-free");
+});

@@ -29,6 +29,9 @@ const content = {
 };
 
 interface Fixture {
+  control: (input: Record<string,unknown>) => Promise<{paused:boolean;threadId:string|null;fallbacks:ExecutionFallbackSelection[]}>;
+  doctor: () => Promise<{exitCode:number;stdout:string;stderr:string}>;
+  rpc: (method:string,input:unknown)=>Promise<unknown>;
   session: (role?: string) => Promise<SessionView>;
   rotate: (expectedThreadId?: string, role?: string) => Promise<SessionView>;
   cli: (args: string[]) => Promise<Record<string, unknown>>;
@@ -141,7 +144,7 @@ async function setup(opts: { spawnFailures?: number; fallbacks?:ExecutionFallbac
       pluginId: "team",
       experimental_hostEntry: true,
       settings: { defaultTracker: "builtin", teamSection: false, roster: false },
-      experimental_callHostRpc: (call) => host.experimental_call(call.method as never, call.input as never, { signal: call.signal }),
+      experimental_callHostRpc: (call) => call.method==="ollamaUsage"?Promise.resolve({status:"unavailable",checkedAtMs:Date.now(),windows:[],reason:"host_unavailable"}):host.experimental_call(call.method as never, call.input as never, { signal: call.signal }),
       sdk: {
         system: { config: async () => ({ primaryHostId: "host_local" }) },
         providers:{list:async()=>[{id:"pi",enabled:true},{id:"opencode2",enabled:true}] as never,models:async()=>({providers:[{id:"pi",available:true},{id:"opencode2",available:true}],models:[{id:"approved/free",model:"approved/free",defaultReasoningEffort:"low",supportedReasoningEfforts:[{reasoningEffort:"low"}]}],modelLoadError:null}) as never},
@@ -250,6 +253,9 @@ async function setup(opts: { spawnFailures?: number; fallbacks?:ExecutionFallbac
     };
     const rawCli = (args: string[]) => harness!.behavior.runCli([...args, "--project", "flow"]);
     return {
+      rpc:(method,input)=>harness!.behavior.callRpc(method,input),
+      control:input=>harness!.behavior.callRpc("roleControl",{projectId:"proj_flow",team:"main",role:"dev",...input}) as never,
+      doctor:()=>harness!.behavior.runCli(["doctor","--project","flow","--json"]),
       spawnSelections,
       resources:()=>harness!.behavior.callRpc("resources",{projectId:"proj_flow",team:"main"}) as Promise<ResourceSummary>,
       quota:async(requestId="quota-1",inputAccepted=false,uncovered=false)=>{
@@ -1027,4 +1033,56 @@ describe("resource quota continuation and grounded acceptance (bbt-iwi.6)",()=>{
    if(scenario==="stale")expect(state.fallbacks[0]?.reason).toContain("checkpoint_stale");
   }finally{await fx.dispose();}
  });
+});
+
+
+it("role pause holds future turns and resume releases the same session",async()=>{
+ const f=await setup();try {
+  await f.control({action:"pause",expectedThreadId:"thr_dev"});
+  expect((await f.startAttempt("thr_dev","held")) as object).toMatchObject({action:"wait"});
+  expect(f.spawnCount()).toBe(0);
+  expect(await f.control({action:"resume",expectedThreadId:"thr_dev"})).toMatchObject({paused:false,threadId:"thr_dev"});
+ }finally{await f.dispose();}
+});
+it("handoff rejects a changed session and unapproved backup before spawn",async()=>{
+ const f=await setup();try {
+  await expect(f.control({action:"pause",expectedThreadId:"stale"})).rejects.toThrow(/Session changed/);
+  await expect(f.control({action:"switch",expectedThreadId:"thr_dev",selection:{provider:"paid",model:"arbitrary"}})).rejects.toThrow(/approved/);
+  expect(f.spawnCount()).toBe(0);
+ }finally{await f.dispose();}
+});
+it("approved handoff reuses the checkpoint task/environment and keeps new session paused",async()=>{
+ const selection={provider:"opencode2",model:"approved/free",reasoningLevel:"low"};
+ const f=await setup({fallbacks:[selection]});try {
+  await f.cli(["task","add","dev","Profile","--send"]);
+  await f.cli(["checkpoint","1","--file","checkpoint.json"]);
+  const result=await f.control({action:"switch",expectedThreadId:"thr_dev",selection});
+  expect(result.paused).toBe(true);expect(result.threadId).not.toBe("thr_dev");expect(f.spawnCount()).toBe(1);
+  expect(f.spawnSelections[0]).toMatchObject({providerId:"opencode2",model:"approved/free",environment:{type:"reuse",environmentId:"env_task"}});
+  expect((await f.startAttempt(result.threadId!,"new-held")) as object).toMatchObject({action:"wait"});
+ }finally{await f.dispose();}
+});
+
+it("an exhausted cached Ollama pool survives a failed refresh without a model call",async()=>{
+ const f=await setup();try {
+  await f.setKv("ollama-usage:host_local",{status:"ready",checkedAtMs:0,windows:[{name:"weekly",remainingPercent:0,resetsAtMs:null}],reason:null});
+  const value=await f.rpc("ollamaUsage",{projectId:"proj_flow",team:"main",refresh:true});
+  expect(value).toMatchObject({status:"unavailable",observedAtMs:0,windows:[{name:"weekly",remainingPercent:0}]});
+  expect(f.spawnCount()).toBe(0);
+ }finally{await f.dispose();}
+});
+it("busy handoff refuses spawning and holds the role until explicit resume",async()=>{
+ const selection={provider:"opencode2",model:"approved/free",reasoningLevel:"low"};
+ const f=await setup({fallbacks:[selection]});try {
+  await f.cli(["task","add","dev","Profile","--send"]);await f.cli(["checkpoint","1","--file","checkpoint.json"]);f.setStatus("thr_dev","active");
+  await expect(f.control({action:"switch",expectedThreadId:"thr_dev",selection})).rejects.toThrow(/active operation/);
+  expect(f.spawnCount()).toBe(0);expect(await f.control({action:"status"})).toMatchObject({paused:true});
+ }finally{await f.dispose();}
+});
+it("doctor exposes a resource stop instead of claiming all is good",async()=>{
+ const f=await setup();try {
+  await f.rpc("resources",{projectId:"proj_flow",team:"main",reason:"One finite start",policy:{taskAttempts:1,teamStarts:100,tokens:null,minutes:null}});
+  await f.cli(["task","add","dev","Profile","--send"]);await f.startAttempt("thr_dev","only-start");
+  const result=await f.doctor();const data=JSON.parse(result.stdout);expect(data.fail).toBeGreaterThan(0);expect(data.checks.some((c:{check:string;level:string})=>c.check==="resources"&&c.level==="fail")).toBe(true);
+ }finally{await f.dispose();}
 });

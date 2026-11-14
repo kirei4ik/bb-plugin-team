@@ -1,7 +1,7 @@
 // The Team plugin's singular `bb.host` entry (manifest: bb.host).
 //
 // Runs on the daemon of the host that holds a project's canonical checkout
-// and exposes exactly three operations (see host-contract.ts):
+// and exposes constrained operations (see host-contract.ts):
 //
 // - bd: a restricted `bd --sandbox --json` CLI runner. The subcommand comes
 //   from an allowlist, the executable is fixed, no shell is involved, the
@@ -15,11 +15,14 @@
 //   marked blocks to .git/info/exclude); the entry refuses a linked git
 //   worktree (execution worktree) so no second database can be created
 //   outside the canonical checkout.
+// - ollamaUsage: fixed read-only Ollama balance query using host-local Pi
+//   credentials; only normalized quota windows leave the host.
 // - gitState: read-only git commands plus file reads under the same project
 //   directory, summarized as a content fingerprint.
 //
-// The entry runs nothing outside the requested project directory, keeps no
-// state, and performs no writes on its own (bdInit's write is bd's own,
+// bd/git stay within the requested project directory. The usage reader only
+// reads host-local authentication and calls the fixed HTTPS balance endpoint.
+// The entry performs no writes of its own (bdInit's write is bd's own,
 // fixed init argv in the requested directory).
 
 import { execFile } from "node:child_process";
@@ -31,6 +34,7 @@ import {
   experimental_sanitizeInheritedChildProcessEnv,
 } from "@get-bb/plugin-sdk/host";
 import { hostContract } from "./host-contract";
+import { readOllamaUsage } from "./ollama-usage-host";
 
 const BD_TIMEOUT_MS = 60_000;
 /** Dolt bootstrap on first init can be slower than a plain query. */
@@ -118,6 +122,7 @@ const assertAbsolute = (cwd: string): void => {
 };
 
 const handlers = {
+  async ollamaUsage(_input: Record<string, never>, context: {signal: AbortSignal}) { return readOllamaUsage(context.signal); },
   /** Restricted bd runner; see host-contract.ts for the argv policy. */
   async bd(
     input: { cwd: string; args: string[] },

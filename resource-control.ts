@@ -2,17 +2,19 @@ import { createHash, randomUUID } from "node:crypto";
 import { z } from "zod";
 import type { BbPluginApi, MessageDispatchHookContext, MessageDispatchHookDecision, PluginTurnFailedEvent } from "@get-bb/plugin-sdk";
 import type { TaskId, TeamTask } from "./snapshot";
+import type { OllamaUsage } from "./ollama-usage";
 import type { ExecutionFallbackSelection } from "./execution-policy";
 
 export const resourcePolicySchema = z.object({
+  coordinationAttempts: z.number().int().min(1).max(1000).optional(),
   taskAttempts: z.number().int().min(1).max(1000),
   teamStarts: z.number().int().min(1).max(10000),
   tokens: z.number().int().positive().max(Number.MAX_SAFE_INTEGER).nullable(),
   minutes: z.number().int().positive().max(525600).nullable(),
 }).strict();
 export type ResourcePolicy = z.infer<typeof resourcePolicySchema>;
-export const DEFAULT_RESOURCE_POLICY: ResourcePolicy = {taskAttempts:8,teamStarts:100,tokens:null,minutes:null};
-export interface ResourceOwner {projectId:string;team:string;role:string;taskId:TaskId|null;ownerThreadId:string;hostId:string|null}
+export const DEFAULT_RESOURCE_POLICY: ResourcePolicy = {coordinationAttempts:40,taskAttempts:8,teamStarts:100,tokens:null,minutes:null};
+export interface ResourceOwner {projectId:string;team:string;role:string;taskId:TaskId|null;ownerThreadId:string;hostId:string|null;isLead?:boolean}
 export interface ResourceAttempt {
   id:string;key:string;threadId:string;taskId:TaskId|null;role:string;provider:string;model:string|null;
   initiator:string;requestId:string|null;atMs:number;endedAtMs:number|null;
@@ -20,7 +22,7 @@ export interface ResourceAttempt {
   reason:string|null; tokens:number|null; queuedIds:string[];
 }
 interface TrackedThread {owner:ResourceOwner;cursor:number;lastUsage:number|null;reported:number;usageKnown:boolean;usagePartial:boolean;activeId:string|null;requestId:string|null;eventsAvailable:boolean}
-interface Quota {provider:string;hostId:string|null;pool:string|null;until:number|null;requestId:string}
+interface Quota {accountScope?:string;provider:string;hostId:string|null;pool:string|null;until:number|null;requestId:string}
 export interface ResourceFallback {requestId:string;threadId:string;role:string;taskId:TaskId|null;stage:"blocked"|"selected"|"switching"|"complete"|"error";selection:ExecutionFallbackSelection|null;newThreadId:string|null;reason:string;atMs:number;manualReleased?:boolean}
 interface ResourceState {
   version:1;sinceMs:number;policy:ResourcePolicy;attempts:ResourceAttempt[];threads:Record<string,TrackedThread>;
@@ -30,6 +32,7 @@ interface ResourceState {
   blocked:string|null;blockedAtMs:number|null;
 }
 export interface ResourceSummary {
+  ollamaUsage?:OllamaUsage;
   sinceMs:number;policy:ResourcePolicy;starts:number;remainingStarts:number;reportedTokens:number|null;
   usageCoverage:"unavailable"|"partial";blocked:string|null;holds:Record<string,string>;
   attempts:ResourceAttempt[];fallbacks:ResourceFallback[];quotaBlocks:Array<{provider:string;hostId:string|null;resetAtMs:number|null}>;
@@ -43,6 +46,12 @@ const terminal=(attempt:ResourceAttempt)=>attempt.outcome!=="reserved"&&attempt.
 const safeText=(text:string)=>text.split("\n")[0]!.slice(0,700);
 const TYPES=["client/turn/requested","turn/started","turn/completed","thread/tokenUsage/updated","provider/modelFallback","provider/rateLimits/updated"] as const;
 
+const piAccountScope=(provider:string,model?:string|null)=>provider==="pi"&&(model?.startsWith("ollama-cloud/")||model?.startsWith("openrouter/"))?model.split("/")[0]:undefined;
+export function independentQuotaSelection(provider:string,model:string|null|undefined,candidate:ExecutionFallbackSelection):boolean {
+ if(candidate.provider!==provider)return true;
+ const from=piAccountScope(provider,model),to=piAccountScope(candidate.provider,candidate.model);
+ return !!from&&!!to&&from!==to;
+}
 export function confirmedQuota(f:PluginTurnFailedEvent):boolean {
  return f.errorInfo?.category==="budget-exceeded"||(f.errorInfo?.category==="rate-limit"&&f.rateLimits?.status==="blocked"&&f.rateLimits.kind!=="unknown");
 }
@@ -81,23 +90,26 @@ export class ResourceControl {
     active.outcome=outcome;active.endedAtMs=atMs;active.reason=reason;
     if(outcome==="failed"||outcome==="interrupted")state.holds[taskKey(active.taskId,active.role)]=reason??outcome;
   }
-  private pools(state:ResourceState,owner:ResourceOwner,rate:unknown):string[]{
+  private pools(state:ResourceState,owner:ResourceOwner,rate:unknown,model?:string|null):string[]{
     if(!rate||typeof rate!=="object")return [];
     const raw=rate as {providerId?:unknown;status?:unknown;windows?:Array<{providerKey?:unknown;status?:unknown}>};
     if(typeof raw.providerId!=="string"||!Array.isArray(raw.windows))return [];
+    const accountScope=piAccountScope(raw.providerId,model);
     const keys=raw.windows.flatMap(w=>typeof w.providerKey==="string"?[digest(w.providerKey)]:[]);
-    this.db.prepare("INSERT INTO team_resource_provider_pools(provider,pools) VALUES(?,?) ON CONFLICT(provider) DO UPDATE SET pools=excluded.pools").run(JSON.stringify([owner.hostId,raw.providerId]),JSON.stringify(keys));
+    this.db.prepare("INSERT INTO team_resource_provider_pools(provider,pools) VALUES(?,?) ON CONFLICT(provider) DO UPDATE SET pools=excluded.pools").run(JSON.stringify([owner.hostId,raw.providerId,...(accountScope?[accountScope]:[])]),JSON.stringify(keys));
     if(raw.status==="allowed"&&raw.windows.every(w=>w.status!=="blocked")){
       const rows=this.db.prepare("SELECT id,data FROM team_resource_quota").all() as Array<{id:string;data:string}>;
-      for(const row of rows){const q=JSON.parse(row.data) as Quota;if(q.hostId===owner.hostId&&q.provider===raw.providerId&&(q.pool===null||keys.includes(q.pool))){q.until=this.now();this.db.prepare("UPDATE team_resource_quota SET data=? WHERE id=?").run(JSON.stringify(q),row.id);}}
+      for(const row of rows){const q=JSON.parse(row.data) as Quota;if(q.hostId===owner.hostId&&q.provider===raw.providerId&&q.accountScope===accountScope&&(q.pool===null||keys.includes(q.pool))){q.until=this.now();this.db.prepare("UPDATE team_resource_quota SET data=? WHERE id=?").run(JSON.stringify(q),row.id);}}
     }
     return keys;
   }
   private quotas():Quota[]{return (this.db.prepare("SELECT data FROM team_resource_quota").all() as Array<{data:string}>).map(r=>JSON.parse(r.data) as Quota);}
-  private isBlocked(state:ResourceState,provider:string,hostId:string|null):boolean{
-    const entry=this.db.prepare("SELECT pools FROM team_resource_provider_pools WHERE provider=?").get(JSON.stringify([hostId,provider])) as {pools:string}|undefined;
-    const known:string[]=entry?JSON.parse(entry.pools):[];
-    return this.quotas().some(q=>(q.provider===provider&&q.hostId===hostId||q.pool!==null&&known.includes(q.pool))&&(q.until===null||q.until>this.now()));
+  private isBlocked(state:ResourceState,provider:string,hostId:string|null,model?:string|null):boolean{
+    const accountScope=piAccountScope(provider,model);
+    const entry=this.db.prepare("SELECT pools FROM team_resource_provider_pools WHERE provider=?").get(JSON.stringify([hostId,provider,...(accountScope?[accountScope]:[])])) as {pools:string}|undefined;
+    const legacy=accountScope?this.db.prepare("SELECT pools FROM team_resource_provider_pools WHERE provider=?").get(JSON.stringify([hostId,provider])) as {pools:string}|undefined:undefined;
+    const known:string[]=[...(entry?JSON.parse(entry.pools):[]),...(legacy?JSON.parse(legacy.pools):[])];
+    return this.quotas().some(q=>(q.provider===provider&&q.hostId===hostId&&(!q.accountScope||!accountScope||q.accountScope===accountScope)||q.pool!==null&&known.includes(q.pool))&&(q.until===null||q.until>this.now()));
   }
   private async syncThread(state:ResourceState,id:string){
     const thread=state.threads[id];if(!thread)return;
@@ -136,7 +148,7 @@ export class ResourceControl {
                 const active=this.attempt(state,thread);if(active)active.tokens=(active.tokens??0)+delta;
               }else thread.usagePartial=true;
             } else if(row.type==="provider/rateLimits/updated"){
-              this.pools(state,thread.owner,data.rateLimits);
+              this.pools(state,thread.owner,data.rateLimits,this.attempt(state,thread)?.model);
             } else if(row.type==="provider/modelFallback"){
               const active=this.attempt(state,thread);
               if(active){if(typeof data.fallbackModel==="string")active.model=data.fallbackModel;active.reason="Provider reported an internal model fallback; inspect actual model before continuing";state.holds[taskKey(active.taskId,active.role)]=active.reason;}
@@ -164,7 +176,11 @@ export class ResourceControl {
     const counts=new Map<string,number>();
     for(const a of attempts){if(a.taskId===null)continue;const key=taskKey(a.taskId,a.role);counts.set(key,(counts.get(key)??0)+1);}
     for(const returned of state.returns??[]){const key=taskKey(returned.taskId,returned.role);counts.set(key,(counts.get(key)??0)+1);}
-    for(const [key,count]of counts)if(count>=state.policy.taskAttempts&&!state.finished.includes(key))return `Task attempt limit reached (${key}: ${count}/${state.policy.taskAttempts}); a new card or session cannot reset it`;
+    for(const [key,count]of counts) {
+      const lead = attempts.some(a=>taskKey(a.taskId,a.role)===key && state.threads[a.threadId]?.owner.isLead);
+      const ceiling = lead ? state.policy.coordinationAttempts ?? state.policy.taskAttempts : state.policy.taskAttempts;
+      if(count>=ceiling&&!state.finished.includes(key))return `Task attempt limit reached (${key}: ${count}/${ceiling}); a new card or session cannot reset it`;
+    }
     return null;
   }
   private block(state:ResourceState,reason:string){if(state.blocked!==reason){state.blocked=reason;state.blockedAtMs=this.now();}}
@@ -195,7 +211,7 @@ export class ResourceControl {
       const pending=Object.values(state.fallbacks).find(f=>f.taskId!==null&&f.taskId===owner.taskId&&f.stage!=="complete"&&!f.manualReleased&&f.newThreadId!==ctx.thread.id);
       if(pending)return {action:"wait",reason:`Team is preserving task ${owner.taskId} during quota recovery: ${pending.reason}`};
       const limit=this.limit(state,reentry?active!.id:undefined);
-      const quota=this.isBlocked(state,ctx.requestedExecution.providerId,owner.hostId);
+      const quota=this.isBlocked(state,ctx.requestedExecution.providerId,owner.hostId,ctx.requestedExecution.model);
       const reason=limit??state.blocked??state.holds[taskKey(owner.taskId,owner.role)]??(quota?"Provider quota is blocked for this host/account scope; wait for reset or choose an approved independent provider":null);
       if(reason){const changed=limit&&state.blocked!==limit;if(limit)this.block(state,limit);this.save(owner,state);if(changed)this.changed(owner.projectId);return {action:"wait",reason:`Team resources: ${reason}. Review the resource panel; active work is not interrupted.`};}
       if(reentry){this.save(owner,state);return {action:"proceed"};}
@@ -234,7 +250,7 @@ export class ResourceControl {
     if(manualClosure||!s.blocked)s.blocked=this.limit(s);this.save(owner,s);
   });}
   private quota(f:PluginTurnFailedEvent):boolean {return confirmedQuota(f);}
-  async failed(f:PluginTurnFailedEvent,candidates:ExecutionFallbackSelection[]):Promise<ResourceFallback|null>{
+  async failed(f:PluginTurnFailedEvent,candidates:ExecutionFallbackSelection[],observedModel?:string):Promise<ResourceFallback|null>{
     const owner=await this.resolve(f.threadId);if(!owner)return null;
     return this.serial(async()=>{
       const s=this.load(owner);this.track(s,f.threadId,owner);await this.syncThread(s,f.threadId);
@@ -242,19 +258,20 @@ export class ResourceControl {
       const thread=s.threads[f.threadId]!;
       let a=s.attempts.find(a=>a.requestId===f.requestId)??this.attempt(s,thread);
       if(!a){const dto=await this.bb.sdk.threads.get({threadId:f.threadId});a=this.append(s,owner,f.threadId,`failed:${f.requestId}`,dto.providerId,null,"observed failure");}
+      a.model??=observedModel??null;
       a.requestId=f.requestId;a.outcome="failed";a.endedAtMs=this.now();a.reason=safeText(f.errorInfo?.category??"unknown");
       s.holds[taskKey(owner.taskId,owner.role)]=a.reason;
       if(!this.quota(f)){this.save(owner,s);this.changed(owner.projectId);return null;}
-      this.pools(s,owner,f.rateLimits);
+      this.pools(s,owner,f.rateLimits,a.model);
       const windows=f.rateLimits?.windows.filter(w=>w.status==="blocked")??[];
       const exhausted=windows.length?windows:[{providerKey:null,resetsAtMs:null}];
       for(const w of exhausted){
-        const quota:Quota={provider:a.provider,hostId:owner.hostId,pool:w.providerKey?digest(w.providerKey):null,until:finite(w.resetsAtMs)&&w.resetsAtMs>this.now()?w.resetsAtMs:null,requestId:f.requestId};
+        const quota:Quota={accountScope:piAccountScope(a.provider,a.model),provider:a.provider,hostId:owner.hostId,pool:w.providerKey?digest(w.providerKey):null,until:finite(w.resetsAtMs)&&w.resetsAtMs>this.now()?w.resetsAtMs:null,requestId:f.requestId};
         s.quotas.push(quota);this.db.prepare("INSERT OR IGNORE INTO team_resource_quota(id,data) VALUES(?,?)").run(digest([f.threadId,f.requestId,quota.pool]),JSON.stringify(quota));
       }
       // Unknown account scopes are conservatively pooled by host+BB provider.
       // Known providerKey hashes also exclude shared pools across providers.
-      const selection=candidates.find(c=>!this.isBlocked(s,c.provider,owner.hostId));
+      const selection=candidates.find(c=>!this.isBlocked(s,c.provider,owner.hostId,c.model));
       const reason=this.limit(s)??s.blocked??(owner.taskId===null?"No task is bound to this session":!selection?"No independent approved backup provider remains (shared quota, empty pool or unavailable catalog)":null);
       const result:ResourceFallback={requestId:f.requestId,threadId:f.threadId,role:owner.role,taskId:owner.taskId,stage:reason?"blocked":"selected",selection:selection??null,newThreadId:null,reason:reason??`Quota exhausted on ${a.provider}; use explicitly approved ${selection!.provider}/${selection!.model}`,atMs:this.now()};
       s.fallbacks[f.requestId]=result;this.save(owner,s);this.changed(owner.projectId);return result;
@@ -267,7 +284,7 @@ export class ResourceControl {
       this.save(owner,s);this.changed(owner.projectId);
     });
   }
-  async notice(owner:Pick<ResourceOwner,"projectId"|"team">,reason:string):Promise<boolean>{return this.serial(async()=>{const s=this.load(owner);s.notices??=[];const key=digest(reason);if(s.notices.includes(key))return false;s.notices.push(key);this.save(owner,s);return true;});}
+  async notice(owner:Pick<ResourceOwner,"projectId"|"team">,reason:string):Promise<boolean>{return this.serial(async()=>{const s=this.load(owner);s.notices??=[];const key=digest(reason.replace(/:\s*\d+\/\d+/g,":limit"));if(s.notices.includes(key))return false;s.notices.push(key);this.save(owner,s);return true;});}
   async bindSwitch(owner:Pick<ResourceOwner,"projectId"|"team">,oldThreadId:string,newThreadId:string){
     await this.serial(async()=>{const s=this.load(owner);for(const f of Object.values(s.fallbacks))if(f.threadId===oldThreadId&&f.stage!=="complete"){f.stage="switching";f.newThreadId=newThreadId;delete s.holds[taskKey(f.taskId,f.role)];}this.save(owner,s);});
   }

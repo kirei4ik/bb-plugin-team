@@ -213,6 +213,7 @@ async function mount(
   };
   let snapshots = options.snapshots ?? [SNAPSHOT];
   let requested = false;
+  const pausedRoles=new Set<string>();
   const session = (role: string): SessionView => ({threadId: role === "developer" ? "thr_d" : "thr_l", taskId: role === "developer" ? 7 : null, context: {kind: "unavailable", usedTokens: null, limitTokens: null}, checkpoint: "missing", phase: requested ? "awaiting-checkpoint" : "idle", reason: requested ? "context" : null, blockedReason: role === "developer" ? null : "no_task", errorCode: null, ...options.session});
   const slot = renderSlot(
     app.navPanels[0]!,
@@ -259,6 +260,10 @@ async function mount(
         resources: (input:{policy?:ResourceSummary["policy"]})=>{
           log("resources")(input);const current=snapshots[0]!.resources!;const result={...current,...(input.policy?{policy:input.policy}:{}),blocked:null};
           snapshots=snapshots.map(snapshot=>({...snapshot,resources:result}));return result;
+        },
+        roleControl: (input:{role:string;action:string;expectedThreadId?:string;selection?:unknown})=>{
+          log("roleControl")(input);if(input.action==="pause")pausedRoles.add(input.role);if(input.action==="resume")pausedRoles.delete(input.role);
+          return {paused:pausedRoles.has(input.role),threadId:input.role==="developer"?"thr_d":"thr_l",fallbacks:[]};
         },
         rolePolicy: (input: {policy?: unknown}) => {
           log("rolePolicy")(input);
@@ -720,11 +725,14 @@ describe("настройки: uniform picker/starter", () => {
     // Role starts unset → click the first Select model (role picker; generator is below).
     fireEvent.click(slot.getAllByText("Select model")[0]!);
     await slot.findByLabelText("Provider ID");
+    // The SDK test picker synchronizes its draft from props in an effect.
+    await act(async () => {});
     fireEvent.change(slot.getByLabelText("Provider ID"), { target: { value: "pi" } });
     fireEvent.change(slot.getByLabelText("Model"), { target: { value: "qwen3" } });
     fireEvent.change(slot.getByLabelText("Reasoning level"), { target: { value: "high" } });
     fireEvent.change(slot.getByLabelText("Service tier"), { target: { value: "fast" } });
     fireEvent.click(slot.getByText("Apply execution selection"));
+    await waitFor(() => expect((slot.getByLabelText("Provider ID") as HTMLInputElement).value).toBe("pi"));
     fireEvent.click(slot.getByText("Save"));
     await slot.findByText('Template "cloud" saved.');
     const saved = (calls.find((c) => c.method === "templateSave")!.input as { template: { roles: Array<Record<string, unknown>> } }).template.roles[0]!;
@@ -921,7 +929,7 @@ it("resource status is read-only and a retry/limit decision needs explicit groun
  const {slot,calls}=await mount({snapshots:[{...SNAPSHOT,resources}]});
  const panel=within(await slot.findByRole("region",{name:"Team resource control"}));
  expect(panel.getByText(/Reported cumulative tokens.*unavailable/)).toBeTruthy();
- expect(panel.getByText(/Profile delivered/)).toBeTruthy();expect(panel.getByText(/Compared with criteria/)).toBeTruthy();
+ expect(panel.getByText(/Profile delivered/).closest("details")?.open).toBe(false);expect(panel.getByText(/Compared with criteria/)).toBeTruthy();
  expect(calls.filter(c=>c.method==="resources")).toHaveLength(0);
  fireEvent.click(panel.getByText("Save limits with grounds"));await panel.findByText("State the concrete decision or changed approach");
  expect(calls.filter(c=>c.method==="resources")).toHaveLength(0);
@@ -929,5 +937,15 @@ it("resource status is read-only and a retry/limit decision needs explicit groun
  fireEvent.click(panel.getByText("Allow next start with this decision"));
  await slot.findByText("Resource decision saved.");
  expect(calls.filter(c=>c.method==="resources").at(-1)?.input).toMatchObject({taskId:7,role:"developer",reason:"Reduce the input and inspect the actual error"});
+ expect(calls.some(c=>c.method==="sessionRotate")).toBe(false);slot.lifecycle.unmount();
+});
+
+it("employee pause/resume is separate from team pause and does not request rotation",async()=>{
+ const {slot,calls}=await mount();
+ fireEvent.click(await slot.findByText("Developer"));
+ const region=within(await slot.findByRole("region",{name:"Continue work"}));
+ fireEvent.click(region.getByText("Pause employee"));await region.findByText("Employee paused");
+ expect(calls.filter(c=>c.method==="roleControl").at(-1)?.input).toMatchObject({action:"pause",expectedThreadId:"thr_d"});
+ fireEvent.click(region.getByText("Resume employee"));await region.findByText("New turns enabled");
  expect(calls.some(c=>c.method==="sessionRotate")).toBe(false);slot.lifecycle.unmount();
 });

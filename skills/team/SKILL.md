@@ -244,3 +244,52 @@ Unsupported/incomplete history is an explicit stop. Human recovery must inspect
 that state before using the existing manual replace. Compaction/edited re-send
 are additional core operations outside message.dispatch; no hard universal
 LLM spending limit is claimed.
+
+
+### Quota planning and employee pause
+
+The resource panel keeps prior reports collapsed. A blocked state gives a short
+reason and a separate technical detail. `bb team doctor` includes resource
+holds and known Ollama quota exhaustion.
+
+New teams have 8 task attempt units, 40 lead coordination turns and 100 total
+team starts. Existing saved policies retain their previous effective lead
+limit until an explicit grounded policy edit. Counts never reset on upgrade.
+The lead uses the configured lead flag (including custom role names/helpers).
+A global resource hold is shown without waking the already blocked lead.
+
+For Pi `ollama-cloud/*`, Team reads the same fixed account-balance endpoint as
+Pi's `/ollama-cloud-usage` command. The host resolves a static API key from Pi's
+auth.json or OLLAMA_API_KEY; credentials never cross host RPC or appear in
+reports. Executable credential sources/custom registries are unsupported and
+shown as unavailable; no shell credential command is evaluated. Opening a
+quota view makes no model call. Reads are cached for three minutes per host
+and refreshed on demand or before a later model start; there is no polling.
+A failed refresh does not release the last known exhausted quota. A positive
+remainder is a snapshot, not a reservation or a guarantee for the next task.
+Purchased credits never authorize paid overage automatically.
+
+Check `bb team report` before assigning a large package: it includes returned
+Ollama quota windows, reset times and when they were checked. Ollama models
+share their account's quota. Known Pi Ollama/OpenRouter services are distinct
+upstream pools; ambiguous services/account data remain conservatively pooled.
+
+In the employee card, Pause holds future turns (human messages included) for
+that role and its helpers; it does not interrupt active operations. BB Send-now
+remains a core override. Resume releases existing queued work and checks ready
+packages. Team pause remains separate.
+
+Choose an explicitly approved backup to prepare a handoff using the existing
+checkpoint/replace protocol: same task, role and Git environment/dirty files.
+The new session stays paused until explicitly resumed. Live work, queued inputs,
+missing/stale checkpoint, unknown/exhausted Ollama backup quota and unfinished
+replacements produce explicit errors rather than blind respawn/resend. Failure
+keeps the role paused for inspection. A changed employee session or removed
+approval rejects a stale action. Arbitrary paid/default substitution is absent.
+This action changes the executing session/model for the same employee; it does
+not silently assign an in-flight task to another permanent role.
+
+The team-wide quota display is scoped to the canonical project host. Execution
+admission and backup validation use the employee's actual environment host.
+A different remote execution host is not represented by that one project-host
+balance; multi-host quota aggregation remains outside this iteration.

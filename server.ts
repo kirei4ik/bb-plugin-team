@@ -1,5 +1,7 @@
+import { hostContract } from "./host-contract";
+import { ollamaUsageSchema, isOllamaCloud, exhaustedOllama, type OllamaUsage } from "./ollama-usage";
 import { verifyQuotaBoundary } from "./checkpoint";
-import { ResourceControl, resourcePolicySchema, withResourceResults, confirmedQuota, type ResourceOwner, type ResourceSummary } from "./resource-control";
+import { ResourceControl, resourcePolicySchema, withResourceResults, confirmedQuota, independentQuotaSelection, type ResourceOwner, type ResourceSummary } from "./resource-control";
 import { executionPolicySchema, withExecutionProfile, type ExecutionFallbackSelection } from "./execution-policy";
 // bb-plugin-team — role-based agent teams for a project.
 //
@@ -432,6 +434,13 @@ export const rpcContract = defineRpcContract({
   rolePolicy: {
     input:z.object({projectId:projectIdSchema,team:teamSchema,role:z.string(),primary:templateRoleSchema.pick({provider:true,model:true,reasoningLevel:true,serviceTier:true}).strict().optional(),policy:executionPolicySchema.nullable().optional(),expectedRevision:z.string().optional()}).strict(),
     output:z.object({role:templateRoleSchema,source:z.string(),revision:z.string()}),
+  },
+  ollamaUsage: {
+    input:z.object({projectId:projectIdSchema,team:teamSchema,refresh:z.boolean().optional()}).strict(),output:ollamaUsageSchema,
+  },
+  roleControl: {
+    input:z.object({projectId:projectIdSchema,team:teamSchema,role:z.string(),action:z.enum(["status","pause","resume","switch"]),expectedThreadId:z.string().optional(),selection:executionPolicySchema.shape.fallbacks.element.optional()}).strict(),
+    output:z.object({paused:z.boolean(),threadId:z.string().nullable(),fallbacks:z.array(executionPolicySchema.shape.fallbacks.element),actual:executionPolicySchema.shape.fallbacks.element.nullable().optional()}),
   },
   resources: {
     input:z.object({projectId:projectIdSchema,team:teamSchema,reason:z.string().trim().min(1).max(4000).optional(),role:z.string().optional(),policy:resourcePolicySchema.optional(),taskId:z.union([z.number().int().positive(),z.string().min(1).max(200)]).optional()}).strict(),
@@ -883,9 +892,32 @@ export default async function plugin(bb: BbPluginApi) {
     if(!mark||!first)return null;
     let hostId:string|null=null;
     if(first.environmentId)hostId=(await bb.sdk.environments.get({environmentId:first.environmentId})).hostId;
-    return {projectId:first.projectId,team:mark.team,role:mark.role,taskId:bound??null,ownerThreadId,hostId};
+    const {t}=await loadLang();
+    const scope=await scopeFor(first.projectId,mark.team,t);
+    const loaded=await readTeamConfig(bb,scope,scope.team,t);
+    const isLead=core.semanticChecks(loaded.config,t).lead.name===mark.role;
+    return {projectId:first.projectId,team:mark.team,role:mark.role,taskId:bound??null,ownerThreadId,hostId,isLead};
   };
   const resources=new ResourceControl(bb,resourceOwner,publishChange);
+  const quotaHost=bb.hosts.experimental_client({contract:hostContract});
+  const quotaPending=new Map<string,Promise<OllamaUsage>>();
+  const cloudUsage=async(hostId:string,refresh=false):Promise<OllamaUsage>=>{
+    const key=`ollama-usage:${hostId}`;
+    const prior=ollamaUsageSchema.safeParse(await bb.storage.kv.get(key));
+    if(!refresh&&prior.success&&Date.now()-prior.data.checkedAtMs<180_000)return prior.data;
+    if(quotaPending.has(hostId))return quotaPending.get(hostId)!;
+    const pending=(async()=>{
+      let data:OllamaUsage;
+      try {data=await quotaHost.call("ollamaUsage",{},{hostId,timeoutMs:12_000});}
+      catch {data={status:"unavailable",checkedAtMs:Date.now(),windows:[],reason:"host_unavailable"};}
+      // A failed refresh cannot silently release a previously exhausted account.
+      if(data.status!=="ready"&&prior.success&&exhaustedOllama(prior.data))data={...prior.data,status:"unavailable",reason:data.reason,checkedAtMs:data.checkedAtMs,observedAtMs:prior.data.observedAtMs??prior.data.checkedAtMs};
+      await bb.storage.kv.set(key,data);return data;
+    })();quotaPending.set(hostId,pending);
+    try{return await pending;}finally{quotaPending.delete(hostId);}
+  };
+  const rolePauseKey=(scope:Pick<Scope,"projectId"|"team">,role:string)=>`role-paused:${scope.projectId}:${scope.team}:${role}`;
+  const isRolePaused=async(scope:Pick<Scope,"projectId"|"team">,role:string)=>await bb.storage.kv.get<boolean>(rolePauseKey(scope,role))===true;
 
   bb.experimental_hooks.on("message.dispatch", async (ctx) => {
     const meta = await bb.sdk.threads.getPluginMetadata({threadId:ctx.thread.id}) as Record<string,unknown>;
@@ -899,6 +931,11 @@ export default async function plugin(bb: BbPluginApi) {
     if (meta.teamRetired === true || (canonical && canonical!==ctx.thread.id)) return {action:"wait" as const,reason:"This session was replaced. Address the current role using bb team tell <role>."};
     const paused=pauseDecision(ctx.thread.id,{initiator:ctx.initiator,originPluginId:ctx.originPluginId},bb.pluginId,pausedThreads,messages(currentLang).pauseWaitReason);
     if(paused.action!=="proceed")return paused;
+    if(mark && await isRolePaused({projectId:ctx.thread.projectId,team:mark.team},mark.role))return {action:"wait" as const,reason:currentLang==="ru"?"Сотрудник на паузе: новые ходы удерживаются. Продолжите его в Team.":"Employee is paused; resume the role in Team."};
+    if(isOllamaCloud(ctx.requestedExecution?.providerId,ctx.requestedExecution?.model)){
+      const owner=await resourceOwner(ctx.thread.id);
+      if(owner?.hostId){const usage=await cloudUsage(owner.hostId);if(exhaustedOllama(usage))return {action:"wait" as const,reason:currentLang==="ru"?"Ollama Cloud: квота аккаунта исчерпана. Проверьте сброс или выберите утверждённую резервную модель в Team; смена модели Ollama не обновляет квоту.":"Ollama Cloud account quota exhausted; inspect reset or select an approved independent backup in Team."};}
+    }
     return resources.admit(ctx);
   });
 
@@ -923,6 +960,8 @@ export default async function plugin(bb: BbPluginApi) {
   };
 
   const notifyResource = async (scope:Scope,role:string,reason:string) => {
+    // A global hold also holds the lead: do not wake a model to explain its own hold.
+    if((await resources.inspect(scope)).blocked)return;
     if(!await resources.notice(scope,`${role}:${reason}`))return;
     const {t}=await loadLang();const {rows,lead}=await teamContext(scope,t);
     const target=lead&&lead!==role?rows.get(lead)?.[0]:null;if(!target)return;
@@ -1067,7 +1106,7 @@ export default async function plugin(bb: BbPluginApi) {
 
   // Called with the project lock held. Task readiness belongs to the tracker.
   const dispatchNextPackage = async (scope: Scope, role: string, t: Strings): Promise<void> => {
-    if (await readPause(scope)) return;
+    if (await readPause(scope) || await isRolePaused(scope,role)) return;
     await assertRoleAvailable(scope, role);
     const store = await readTasks(scope);
     if (busyTasks(store, role).length) return;
@@ -1642,7 +1681,7 @@ export default async function plugin(bb: BbPluginApi) {
           return;
         }
       }
-      if (await readPause(scope)) return; // resume() retries
+      if (await readPause(scope) || await isRolePaused(scope,role)) return; // resume() retries
       // A substantive checkpoint must come from the agent. Missing or stale →
       // explicit wait plus a notification; never a fabricated checkpoint.
       const ref = await bb.storage.kv.get<{taskId: TaskId}>(checkpointRefKey(scope, role));
@@ -2266,6 +2305,7 @@ export default async function plugin(bb: BbPluginApi) {
     }
     roles.sort((a, b) => Number(b.lead) - Number(a.lead));
     const resourceSummary=withResourceResults(await resources.inspect(scope),store.tasks);
+    if(roles.some(r=>isOllamaCloud(r.provider??"",r.model)))resourceSummary.ollamaUsage=await cloudUsage(scope.hostId);
     const withExecutionState: SnapshotRole[] = [];
     for (const role of roles) {
       const intent = await readReplacementIntent(bb, scope.projectId, scope.team, role.name);
@@ -2281,7 +2321,11 @@ export default async function plugin(bb: BbPluginApi) {
       });
       const active=role.threads.some(thread=>thread.status==="active"||thread.status==="starting");
       const task=role.tasks.find(task=>task.status==="in-progress"||task.status==="review");
-      const resourceReason=resourceSummary.blocked??resourceSummary.holds[task?`task:${task.id}`:`role:${role.name}`];
+      const actualMeta=role.threads[0]?await bb.sdk.threads.getPluginMetadata({threadId:role.threads[0].threadId}) as {teamExecution?:ExecutionFallbackSelection}:{};
+      const actualParsed=executionPolicySchema.shape.fallbacks.element.safeParse(actualMeta.teamExecution);
+      const actual=actualParsed.success?actualParsed.data:undefined;
+      const quotaOwner=isOllamaCloud(actual?.provider??role.provider??"",actual?.model??role.model)&&role.threads[0]?await resourceOwner(role.threads[0].threadId):null;
+      const resourceReason=resourceSummary.blocked??resourceSummary.holds[task?`task:${task.id}`:`role:${role.name}`]??(quotaOwner?.hostId===scope.hostId&&exhaustedOllama(resourceSummary.ollamaUsage)?"Ollama Cloud account quota exhausted; refresh quota after reset or choose an approved independent model":null);
       if(!active&&resourceReason&&executionState?.kind!=="error")executionState={kind:"error",taskId:task?.id??null,errorCode:"resource_hold",errorMessage:resourceReason,safeAction:"Inspect Team resources and record a concrete decision; replacing the session cannot reset the budget",atMs:Date.now()};
       withExecutionState.push(executionState ? {...role, executionState} : role);
     }
@@ -2433,6 +2477,16 @@ export default async function plugin(bb: BbPluginApi) {
       const record = await readAutoContinue(scope, role);
       if (record?.stage === "failed") add("auto-continue","fail",`${role}: package #${record.taskId} [${record.errorCode}] ${record.error ?? ""}; the completed session is kept; inspect, then bb team replace ${role} --dry-run`);
     }
+    const doctorConfig=await readTeamConfig(bb,scope,scope.team,t).catch(()=>null);
+    if(doctorConfig?.config.roles.some(r=>isOllamaCloud(r.provider??"",r.model))){
+      const usage=await cloudUsage(scope.hostId);
+      if(exhaustedOllama(usage))add("Ollama Cloud","fail",currentLang==="ru"?"Квота аккаунта исчерпана; проверьте сброс или утверждённую резервную модель":"Account quota exhausted; inspect reset or approved backups");
+      else if(usage.status!=="ready")add("Ollama Cloud","warn",currentLang==="ru"?"Остаток квоты неизвестен":"Quota remaining is unknown");
+    }
+    const budget=await resources.inspect(scope);
+    if(budget.blocked)add(currentLang==="ru"?"ресурсы":"resources","fail",budget.blocked);
+    for(const [key,reason]of Object.entries(budget.holds))add("resources","warn",`${key}: ${reason}`);
+    for(const key of await bb.storage.kv.list(`role-paused:${scope.projectId}:${scope.team}:`))if(await bb.storage.kv.get(key)===true)add("pause","warn",key.split(":").at(-1)!);
     if ((await readPause(scope)) !== null) add(m.check.threads, "warn", m.doctorPaused);
     return checks;
   };
@@ -2561,12 +2615,14 @@ export default async function plugin(bb: BbPluginApi) {
     const role=config.roles.find(r=>r.name===owner.role);
     // Helpers count against their task but never replace the owner's session.
     const configuredCandidates=owner.ownerThreadId===failure.threadId?role?.executionPolicy?.fallbacks??[]:[];
+    const failureMeta=await bb.sdk.threads.getPluginMetadata({threadId:failure.threadId}) as {teamExecution?:ExecutionFallbackSelection};
+    const failedModel=failureMeta.teamExecution?.model??role?.model;
     const candidates:ExecutionFallbackSelection[]=[];
     if(confirmedQuota(failure)&&configuredCandidates.length){
       const old=await bb.sdk.threads.get({threadId:failure.threadId});
       const catalogs=new Map<string,Awaited<ReturnType<typeof bb.sdk.providers.models>>|null>();
       if(old.environmentId)for(const candidate of configuredCandidates){
-        if(candidate.provider===old.providerId)continue; // Exhausted provider/account scope.
+        if(!independentQuotaSelection(old.providerId,failedModel,candidate))continue; // Same upstream account cannot restore quota.
         if(!catalogs.has(candidate.provider)){
           try{catalogs.set(candidate.provider,await bb.sdk.providers.models({environmentId:old.environmentId,providerId:candidate.provider}));}catch{catalogs.set(candidate.provider,null);}
         }
@@ -2577,7 +2633,7 @@ export default async function plugin(bb: BbPluginApi) {
         candidates.push(candidate);
       }
     }
-    const plan=await resources.failed(failure,candidates);if(!plan)return;
+    const plan=await resources.failed(failure,candidates,failedModel);if(!plan)return;
     if(plan.stage!=="selected"||!plan.selection){await notifyResource(scope,owner.role,plan.reason);return;}
     await withScopeLock(scope,async()=>{
       try{
@@ -2607,7 +2663,7 @@ export default async function plugin(bb: BbPluginApi) {
   bb.events.on("thread.active",({thread})=>resources.watch(thread.id));
   bb.events.on("message.queued",async({entry})=>{
     await resources.queued(entry.threadId,entry.id,entry.payload?.kind==="retry");
-    if(entry.waitingOn?.kind==="plugin"&&entry.waitingOn.pluginId===bb.pluginId&&entry.waitingOn.reason.startsWith("Team resources:")){
+    if(entry.waitingOn?.kind==="plugin"&&entry.waitingOn.pluginId===bb.pluginId&&(entry.waitingOn.reason.startsWith("Team resources:")||entry.waitingOn.reason.startsWith("Ollama Cloud"))){
       const owner=await resourceOwner(entry.threadId);if(owner){const {t}=await loadLang();const scope=await scopeFor(owner.projectId,owner.team,t);await notifyResource(scope,owner.role,entry.waitingOn.reason);}
     }
   });
@@ -2905,6 +2961,47 @@ export default async function plugin(bb: BbPluginApi) {
         await writeWorkspaceFile(bb,scope,loaded.source,next);publishChange(projectId);
         const updated=core.parseTeamConfig(next,loaded.source,t).roles.find(r=>r.name===roleName)!;
         return {role:updated,source:loaded.source,revision:createHash("sha256").update(next).digest("hex")};
+      });
+    },
+    async ollamaUsage({projectId,team,refresh}) {
+      const {t}=await loadLang();const scope=await scopeFor(projectId,team,t);
+      return cloudUsage(scope.hostId,refresh);
+    },
+    async roleControl({projectId,team,role:roleName,action,expectedThreadId,selection:requestedSelection}) {
+      const {t}=await loadLang();const scope=await scopeFor(projectId,team,t);
+      return withScopeLock(scope,async()=>{
+        const {loaded,rows}=await teamContext(scope,t);
+        const configured=loaded?.config.roles.find(r=>r.name===roleName);
+        if(!configured)throw new experimental_PluginRpcRefusal({code:"not_found",message:"Role not found"});
+        const list=rows.get(roleName)??[];let threadId=list.length===1?list[0]!.threadId:null;
+        if(action!=="status"&&(!threadId||expectedThreadId!==threadId))throw new experimental_PluginRpcRefusal({code:"conflict",message:"Session changed or is ambiguous; refresh the employee card"});
+        const key=rolePauseKey(scope,roleName);
+        if(action==="pause")await bb.storage.kv.set(key,true);
+        if(action==="resume") {
+          await bb.storage.kv.delete(key);await bb.experimental_hooks.recheck("message.dispatch");
+          if(await readAutoContinue(scope,roleName))await runAutoContinue(scope,roleName,t);else await dispatchNextPackage(scope,roleName,t);
+          const current=(await teamContext(scope,t)).rows.get(roleName)??[];threadId=current.length===1?current[0]!.threadId:null;
+        }
+        if(action==="switch") {
+          const selection=configured.executionPolicy?.fallbacks.find(c=>JSON.stringify(c)===JSON.stringify(requestedSelection));
+          if(!configured.executionPolicy?.noAdditionalCost||!selection)throw new experimental_PluginRpcRefusal({code:"invalid",message:"Select an explicitly approved backup model"});
+          const owner=await resourceOwner(threadId!);
+          const usage=isOllamaCloud(selection.provider,selection.model)?owner?.hostId?await cloudUsage(owner.hostId,true):{status:"unavailable" as const,checkedAtMs:Date.now(),windows:[],reason:"host_unavailable" as const}:undefined;
+          if(usage&&(usage.status!=="ready"||exhaustedOllama(usage)))throw new experimental_PluginRpcRefusal({code:"conflict",message:"Backup quota is exhausted or unavailable; choose an independent model or wait"});
+          if(await readPause(scope))throw new experimental_PluginRpcRefusal({code:"conflict",message:"The team is paused; resume it first"});
+          if((await resources.inspect(scope)).blocked)throw new experimental_PluginRpcRefusal({code:"conflict",message:"Resolve the task/team resource limit first; switching cannot reset it"});
+          const pending=await readReplacementIntent(bb,projectId,team,roleName);
+          if(pending&&pending.stage!=="complete")throw new experimental_PluginRpcRefusal({code:"conflict",message:"Resolve the unfinished replacement before starting another switch"});
+          await bb.storage.kv.set(key,true);
+          const result=await continueRoleSession(scope,roleName,threadId!,{execution:selection});
+          threadId=result.result.newThreadId;
+          // Keep the new session paused until the user explicitly resumes it.
+          await bb.storage.kv.set(key,true);
+        }
+        publishChange(projectId);
+        const meta=threadId?await bb.sdk.threads.getPluginMetadata({threadId}) as {teamExecution?:unknown}:{};
+        const actual=executionPolicySchema.shape.fallbacks.element.safeParse(meta.teamExecution??{provider:configured.provider,model:configured.model,...(configured.reasoningLevel?{reasoningLevel:configured.reasoningLevel}:{}),...(configured.serviceTier?{serviceTier:configured.serviceTier}:{})});
+        return {paused:await isRolePaused(scope,roleName),threadId,fallbacks:configured.executionPolicy?.fallbacks??[],actual:actual.success?actual.data:null};
       });
     },
     async resources({projectId,team,reason,role,policy,taskId}) {

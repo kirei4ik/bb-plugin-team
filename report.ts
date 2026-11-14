@@ -202,6 +202,7 @@ function resourceLines(snapshot:TeamSnapshot,lang:Language):string[]{
  return [ru?"Ресурсы команды":"Team resources",`${ru?"Допусков запусков (включая резервы)":"Start admissions (including reservations)"}: ${r.starts}/${r.policy.teamStarts}; ${ru?"осталось":"remaining"} ${r.remainingStarts}`,
  `${ru?"Сообщённые накопленные токены":"Reported cumulative tokens"}: ${r.reportedTokens===null?(ru?"недоступны":"unavailable"):`${r.reportedTokens} (${ru?"неполный учёт":"partial coverage"})`}`,
  ru?"Контекст не равен расходу. Денежный расход неизвестен. Активный вызов не прерывается; Send-now — ручное исключение BB.":"Context is not cumulative spend. Monetary cost is unknown. Active calls are not interrupted; Send-now is a manual BB override.",
+ ...(r.ollamaUsage?[`Ollama Cloud: ${r.ollamaUsage.status} · ${new Date(r.ollamaUsage.checkedAtMs).toISOString()}`,...r.ollamaUsage.windows.map(w=>`${w.name}: ${w.remainingPercent}% ${ru?"осталось":"remaining"}; ${ru?"сброс":"reset"}: ${w.resetsAtMs?new Date(w.resetsAtMs).toISOString():"?"}`)]:[]),
  ...(r.blocked?[`${ru?"Блокировка":"Blocked"}: ${r.blocked}`]:[]),
  ...Object.entries(r.holds).map(([key,why])=>`${key}: ${why}`),
  ...r.fallbacks.map(f=>`#${f.taskId??"—"}: ${f.stage} · ${f.selection?.provider??"—"}/${f.selection?.model??"—"} · ${f.reason}`),

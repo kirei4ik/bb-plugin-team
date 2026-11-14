@@ -17,6 +17,7 @@
 
 import { defineRpcContract } from "@get-bb/plugin-sdk";
 import { z } from "zod";
+import { ollamaUsageSchema } from "./ollama-usage";
 
 /** bd subcommands the entry may run; anything else is refused before exec. */
 export const BD_COMMANDS = [
@@ -240,6 +241,10 @@ export const hostContract = defineRpcContract({
    * unstaged binary diffs and the contents of untracked files. Editing a
    * dirty or untracked file without renaming it changes the fingerprint.
    */
+  ollamaUsage: {
+    input: z.object({}).strict(),
+    output: ollamaUsageSchema,
+  },
   gitState: {
     experimental_description:
       "Read the git branch, HEAD, dirty files, and state fingerprint.",
