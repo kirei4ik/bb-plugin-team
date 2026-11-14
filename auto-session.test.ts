@@ -44,6 +44,7 @@ interface Fixture {
   failNextSend: () => void;
   failNextRelease: () => void;
   setStatus: (id: string, status: "idle" | "active") => void;
+  setQueued:(id:string,value:boolean)=>void;
   archived: (id: string) => boolean;
   emitIdle: (id: string) => Promise<void>;
   /** threads.context counter for a thread (null = unsupported API). */
@@ -256,6 +257,7 @@ async function setup(opts: { spawnFailures?: number; fallbacks?:ExecutionFallbac
       rpc:(method,input)=>harness!.behavior.callRpc(method,input),
       control:input=>harness!.behavior.callRpc("roleControl",{projectId:"proj_flow",team:"main",role:"dev",...input}) as never,
       doctor:()=>harness!.behavior.runCli(["doctor","--project","flow","--json"]),
+      setQueued:(id,value)=>{if(value)queued.set(id,[{type:"text",text:"Original queued work",mentions:[]}]);else queued.delete(id);},
       spawnSelections,
       resources:()=>harness!.behavior.callRpc("resources",{projectId:"proj_flow",team:"main"}) as Promise<ResourceSummary>,
       quota:async(requestId="quota-1",inputAccepted=false,uncovered=false)=>{
@@ -1084,5 +1086,90 @@ it("doctor exposes a resource stop instead of claiming all is good",async()=>{
   await f.rpc("resources",{projectId:"proj_flow",team:"main",reason:"One finite start",policy:{taskAttempts:1,teamStarts:100,tokens:null,minutes:null}});
   await f.cli(["task","add","dev","Profile","--send"]);await f.startAttempt("thr_dev","only-start");
   const result=await f.doctor();const data=JSON.parse(result.stdout);expect(data.fail).toBeGreaterThan(0);expect(data.checks.some((c:{check:string;level:string})=>c.check==="resources"&&c.level==="fail")).toBe(true);
+ }finally{await f.dispose();}
+});
+
+it("manual model recovery needs no preconfigured backup, previews first and preserves scoped approval",async()=>{
+ const f=await setup();const selection={provider:"opencode2",model:"approved/free",reasoningLevel:"low"};try{
+  await f.cli(["task","add","dev","Profile","--send"]);await f.cli(["checkpoint","1","--file","checkpoint.json"]);
+  const view=await f.rpc("roleRecovery",{projectId:"proj_flow",team:"main",role:"dev",selection}) as {revision:string;blockers:string[];environmentId:string};
+  expect(view.blockers).toEqual([]);expect(view.environmentId).toBe("env_task");expect(f.spawnCount()).toBe(0);
+  const result=await f.control({action:"switch",expectedThreadId:"thr_dev",selection,approveSelection:true,expectedRecoveryRevision:view.revision});
+  expect(result.paused).toBe(true);expect(f.spawnSelections[0]).toMatchObject({providerId:"opencode2",model:"approved/free",environment:{type:"reuse",environmentId:"env_task"}});
+  await expect(f.control({action:"switch",expectedThreadId:"thr_dev",selection,approveSelection:true,expectedRecoveryRevision:view.revision})).rejects.toThrow(/changed/);
+  expect(f.spawnCount()).toBe(1);
+  await f.control({action:"resume",expectedThreadId:result.threadId});await f.emitIdle(result.threadId!);
+  await f.cli(["checkpoint","1","--file","checkpoint.json"]);await f.cli(["replace","dev"]);
+  expect(f.spawnSelections[1]).toMatchObject({providerId:"opencode2",model:"approved/free"});
+ }finally{await f.dispose();}
+});
+it("recovery preview explains busy/missing state and stale preview cannot spawn",async()=>{
+ const f=await setup();const selection={provider:"opencode2",model:"approved/free",reasoningLevel:"low"};try{
+  await f.cli(["task","add","dev","Profile","--send"]);
+  let view=await f.rpc("roleRecovery",{projectId:"proj_flow",team:"main",role:"dev",selection}) as {revision:string;blockers:string[]};
+  expect(view.blockers).toContain("checkpoint_missing");expect(f.spawnCount()).toBe(0);
+  await f.cli(["checkpoint","1","--file","checkpoint.json"]);
+  view=await f.rpc("roleRecovery",{projectId:"proj_flow",team:"main",role:"dev",selection}) as typeof view;
+  f.setStatus("thr_dev","active");
+  const busy=await f.rpc("roleRecovery",{projectId:"proj_flow",team:"main",role:"dev",selection}) as typeof view;expect(busy.blockers).toContain("busy");
+  await expect(f.control({action:"switch",expectedThreadId:"thr_dev",selection,approveSelection:true,expectedRecoveryRevision:view.revision})).rejects.toThrow(/changed/);expect(f.spawnCount()).toBe(0);
+ }finally{await f.dispose();}
+});
+it("recovery preview rejects invalid models and exhausted Ollama selection before mutation",async()=>{
+ const f=await setup();try{
+  await f.cli(["task","add","dev","Profile","--send"]);await f.cli(["checkpoint","1","--file","checkpoint.json"]);
+  const view=await f.rpc("roleRecovery",{projectId:"proj_flow",team:"main",role:"dev",selection:{provider:"missing",model:"unavailable"}}) as {blockers:string[]};expect(view.blockers).toContain("model_unavailable");
+  await f.setKv("ollama-usage:host_local",{status:"ready",checkedAtMs:Date.now(),windows:[{name:"weekly",remainingPercent:0,resetsAtMs:null}],reason:null});
+  const quota=await f.rpc("roleRecovery",{projectId:"proj_flow",team:"main",role:"dev",selection:{provider:"pi",model:"ollama-cloud/any"}}) as {blockers:string[]};expect(quota.blockers).toContain("quota_exhausted");expect(f.spawnCount()).toBe(0);
+ }finally{await f.dispose();}
+});
+it("explicit workspace recovery works without the exhausted model's checkpoint and preserves dirty work",async()=>{
+ const f=await setup();const selection={provider:"opencode2",model:"approved/free",reasoningLevel:"low"};try{
+  await f.cli(["task","add","dev","Profile","--send"]);
+  const view=await f.rpc("roleRecovery",{projectId:"proj_flow",team:"main",role:"dev",selection}) as {revision:string;blockers:string[]};expect(view.blockers).toContain("checkpoint_missing");
+  const result=await f.control({action:"switch",expectedThreadId:"thr_dev",selection,approveSelection:true,recoverFromWorkspace:true,expectedRecoveryRevision:view.revision});
+  expect(result.paused).toBe(true);expect(f.spawnCount()).toBe(1);expect(f.spawnSelections[0]?.environment).toEqual({type:"reuse",environmentId:"env_task"});
+  const role=await f.snapshotRole("dev");const task=(role.tasks as Array<{id:number;checkpoint:{content:{progress:string;nextAction:string};dirtyFiles:string[]}}>)[0]!;
+  expect(task.id).toBe(1);expect(task.checkpoint.content.progress).toContain("unconfirmed");expect(task.checkpoint.content.nextAction).toContain("First inventory");expect(task.checkpoint.dirtyFiles).toContain("profile.ts");
+ }finally{await f.dispose();}
+});
+it("workspace recovery preserves an older checkpoint as history instead of asserting its claims",async()=>{
+ const f=await setup();const selection={provider:"opencode2",model:"approved/free",reasoningLevel:"low"};try{
+  await f.cli(["task","add","dev","Profile","--send"]);await f.cli(["checkpoint","1","--file","checkpoint.json"]);await f.writeAfterCheckpoint();
+  const view=await f.rpc("roleRecovery",{projectId:"proj_flow",team:"main",role:"dev",selection}) as {revision:string;blockers:string[]};expect(view.blockers).toContain("checkpoint_stale");
+  await f.control({action:"switch",expectedThreadId:"thr_dev",selection,approveSelection:true,recoverFromWorkspace:true,expectedRecoveryRevision:view.revision});
+  const role=await f.snapshotRole("dev");const task=(role.tasks as Array<{decisions:string;checkpoint:{content:{progress:string}}}>)[0]!;
+  expect(task.decisions).toContain("Previous checkpoint preserved");expect(task.decisions).toContain("Edited profile.ts");expect(task.checkpoint.content.progress).toContain("unconfirmed");
+ }finally{await f.dispose();}
+});
+
+it("workspace recovery never bypasses queued messages",async()=>{
+ const f=await setup();const selection={provider:"opencode2",model:"approved/free",reasoningLevel:"low"};try{
+  await f.cli(["task","add","dev","Profile","--send"]);f.setQueued("thr_dev",true);
+  const view=await f.rpc("roleRecovery",{projectId:"proj_flow",team:"main",role:"dev",selection}) as {revision:string;blockers:string[]};expect(view.blockers).toContain("queue");
+  await expect(f.control({action:"switch",expectedThreadId:"thr_dev",selection,approveSelection:true,recoverFromWorkspace:true,expectedRecoveryRevision:view.revision})).rejects.toThrow(/queue/);expect(f.spawnCount()).toBe(0);
+ }finally{await f.dispose();}
+});
+it("coordination continuation records the reason in the task without changing overall policy",async()=>{
+ const f=await setup();try{
+  await f.cli(["task","add","lead","Coordinate","--send"]);
+  await f.rpc("resources",{projectId:"proj_flow",team:"main",reason:"One coordination turn",policy:{taskAttempts:8,coordinationAttempts:1,teamStarts:100,tokens:null,minutes:null}});
+  await f.startAttempt("thr_lead","coord-one");await f.emitIdle("thr_lead");
+  const before=await f.resources();expect(before.blocked).toContain("task:1");
+  const result=await f.rpc("continueCoordination",{projectId:"proj_flow",team:"main",taskId:1,expectedStarts:before.starts,expectedUsed:1}) as ResourceSummary;
+  expect(result.policy).toEqual(before.policy);expect(result.taskLimits?.["task:1"]).toBe(5);expect(result.starts).toBe(before.starts);
+  const lead=await f.snapshotRole("lead");expect((lead.tasks as Array<{decisions:string}>)[0]?.decisions).toContain("four more coordination turns");
+  await expect(f.rpc("continueCoordination",{projectId:"proj_flow",team:"main",taskId:1,expectedStarts:before.starts,expectedUsed:1})).rejects.toThrow(/changed/);
+ }finally{await f.dispose();}
+});
+
+it("a manual model choice expires after the task instead of becoming a new permanent primary",async()=>{
+ const f=await setup();const selection={provider:"opencode2",model:"approved/free",reasoningLevel:"low"};try{
+  await f.cli(["task","add","dev","First","--send"]);await f.cli(["checkpoint","1","--file","checkpoint.json"]);
+  const view=await f.rpc("roleRecovery",{projectId:"proj_flow",team:"main",role:"dev",selection}) as {revision:string};
+  const switched=await f.control({action:"switch",expectedThreadId:"thr_dev",selection,approveSelection:true,expectedRecoveryRevision:view.revision});
+  await f.control({action:"resume",expectedThreadId:switched.threadId});await f.emitIdle(switched.threadId!);await f.cli(["checkpoint","1","--file","checkpoint.json"]);
+  await f.cli(["task","done","1","--reason","Manually inspected the completed work"]);await f.cli(["task","add","dev","Second","--send"]);
+  expect(f.spawnSelections).toHaveLength(2);expect(f.spawnSelections[1]?.providerId).not.toBe("opencode2");
  }finally{await f.dispose();}
 });

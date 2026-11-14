@@ -68,21 +68,6 @@ const EXECUTION_LABELS: Record<Language, Record<RoleExecutionState["kind"], stri
   },
 };
 
-function recoveryAction(language: Language, role: string, state: RoleExecutionState): string | null {
-  if (language !== "ru") return state.safeAction;
-  if(state.errorCode==="resource_hold")return "Откройте ресурсы команды и укажите конкретное решение. Замена сессии не сбрасывает бюджет.";
-  if (state.errorCode === "release_failed" || state.errorCode === "delivery_uncertain") {
-    return "Выполните bb team resume, чтобы продолжить доставку уже созданного запроса. Не отправляйте его повторно.";
-  }
-  if (state.errorCode === "spawn_uncertain") {
-    return `Проверьте, был ли создан новый тред: bb team replace ${role} --dry-run --json. Подтвердите найденный тред через --thread или отмените незавершённую замену через --abort.`;
-  }
-  if (state.errorCode === "replacement_unfinished") {
-    return `Продолжите сохранённую передачу: bb team replace ${role}. До переключения её можно отменить через --abort.`;
-  }
-  return `Проверьте причину ошибки и bb team doctor. После исправления проверьте план: bb team replace ${role} --dry-run. Автоматический повтор остановлен.`;
-}
-
 /* ──────────────────────── Labels ──────────────────────── */
 
 const EN = {
@@ -217,7 +202,7 @@ const RU: typeof EN = {
   resume: "Снять паузу",
   open: "Открыть",
   message: "Сообщение",
-  package: "Пакет",
+  package: "Назначить задачу",
   send: "Отправить",
   cancel: "Отмена",
   title: "Название",
@@ -228,7 +213,7 @@ const RU: typeof EN = {
   loading: "Загрузка…",
   noProject: "Откройте панель из проекта или выберите проект выше.",
   sent: (n) => `Отправлено тредов: ${n}.`,
-  added: (id) => `Пакет #${id} добавлен.`,
+  added: (id) => `Задача #${id} добавлена.`,
   failed: "Ошибка",
   trackerAbsent: "Базы Beads ещё нет — пакеты некуда сохранять.",
   createDatabase: "Создать базу",
@@ -310,7 +295,7 @@ const RU: typeof EN = {
   removeFallback: "Убрать резерв",
   fallbackOrderHint: (n: number) => `Резерв ${n}`,
   treeSummary: (roles, running, errors, open) =>
-    `ролей: ${roles} · в работе: ${running}${errors ? ` · с ошибкой: ${errors}` : ""} · пакетов: ${open}`,
+    `ролей: ${roles} · в работе: ${running}${errors ? ` · с ошибкой: ${errors}` : ""} · открытых задач: ${open}`,
   pausedTag: "пауза",
   missingRoles: (names) => `Ещё не созданы: ${names}`,
   spawnMissing: "Создать недостающих",
@@ -1298,8 +1283,8 @@ function TeamBlock({
         {role.executionState?.kind === "error" && (
           <div role="alert" className="px-3 py-1 text-xs text-destructive">
             {role.executionState.errorCode==="resource_hold"?(language==="ru"?"Работа ждёт решения по ресурсам.":"Work awaits a resource decision."):(language === "ru" ? "Передача сессии остановлена." : "Session handoff stopped.")}
-            {role.executionState.errorMessage && ` ${role.executionState.errorMessage}`}
-            {recoveryAction(language, role.name, role.executionState) && ` · ${recoveryAction(language, role.name, role.executionState)}`}
+            <details><summary>{language==="ru"?"Подробности остановки":"Stop details"}</summary>{role.executionState.errorMessage}{role.executionState.safeAction&&<p>{role.executionState.safeAction}</p>}</details>
+
           </div>
         )}
         {role.helpers.map((helper, index) => (
@@ -1324,7 +1309,7 @@ function TeamBlock({
         <button type="button" onClick={onToggle} aria-expanded={expanded} className="flex items-center gap-1.5 text-sm font-semibold text-foreground">
           <span className="w-3 text-muted-foreground">{expanded ? "▾" : "▸"}</span>
           <TeamIcon /> {team}
-          {snapshot.teamTitle && <span className="font-normal text-muted-foreground">— {snapshot.teamTitle}</span>}
+          {snapshot.teamTitle && snapshot.teamTitle!==snapshot.team && <span className="font-normal text-muted-foreground">— {snapshot.teamTitle}</span>}
         </button>
         <span className="text-xs text-muted-foreground">
           {labels.treeSummary(snapshot.roles.filter((r) => r.enabled).length, running, errors, tasks.length)}
@@ -1428,7 +1413,7 @@ function TeamBlock({
               onCancel={() => onAdding(false)}
             />
           )}
-          <ResourcePanel snapshot={snapshot} language={language} onChanged={async()=>{await onAction(async()=>language==="ru"?"Решение по ресурсам сохранено.":"Resource decision saved.");}}/>
+          <ResourcePanel snapshot={snapshot} language={language} onSelectRole={role=>onSelect({team,role})} onChanged={async()=>{await onAction(async()=>language==="ru"?"Решение по ресурсам сохранено.":"Resource decision saved.");}}/>
           <div className="flex flex-col">
             {lead && roleRow(lead, 0)}
             {executors.map((role, index) => roleRow(role, lead ? 1 : 0, index === executors.length - 1))}

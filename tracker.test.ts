@@ -455,6 +455,14 @@ describe("task tracker", () => {
       defaultKind = "beads";
     });
 
+    it("stores manual recovery and resource decisions in Beads design without changing the description",async()=>{
+      const scope=scopeOf(workspaceOf("decision",repo),"manual-decisions");
+      const task=await tracker.add(scope,{role:"lead",title:"Coordinate",status:"in-progress",note:"Original requirements"});
+      const result=await tracker.update(scope,task.id,{decisions:"Explicit four-turn continuation; previous checkpoint retained"});
+      expect(result.task.decisions).toContain("four-turn");expect(result.task.note).toBe("Original requirements");
+      expect((await tracker.read(scope)).tasks.find(t=>t.id===task.id)?.decisions).toContain("checkpoint retained");
+    });
+
     it("fails explicitly without a database, without fallback", async () => {
       const empty = await tempDir("tracker-bd-empty-");
       const workspace = workspaceOf("p1", empty);

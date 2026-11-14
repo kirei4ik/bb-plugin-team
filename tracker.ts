@@ -69,7 +69,7 @@ export interface TaskTracker {
   update(
     scope: TrackerScope,
     id: TaskId,
-    patch: { status?: TaskStatus; title?: string; note?: string | null },
+    patch: { status?: TaskStatus; title?: string; note?: string | null; decisions?:string },
   ): Promise<{ task: TeamTask; previous: TeamTask }>;
   remove(scope: TrackerScope, id: TaskId): Promise<TeamTask>;
   /** Ready TODO ids; Beads dependencies, blocked/deferred/review excluded. */
@@ -550,7 +550,7 @@ export function createTaskTracker(
   const update = async (
     scope: TrackerScope,
     id: TaskId,
-    patch: { status?: TaskStatus; title?: string; note?: string | null },
+    patch: { status?: TaskStatus; title?: string; note?: string | null; decisions?:string },
   ): Promise<{ task: TeamTask; previous: TeamTask }> => {
     const { kind } = await getConfig(scope);
     if (kind === "builtin") {
@@ -566,6 +566,7 @@ export function createTaskTracker(
       const previous = projectIssue(await showIssue(scope, id));
       const args = ["update", String(id)];
       if (patch.title !== undefined) args.push("--title", patch.title);
+      if (patch.decisions !== undefined) args.push("--design", patch.decisions);
       if (patch.note !== undefined) args.push("-d", patch.note ?? "");
       if (patch.status !== undefined)
         args.push(...updateStatusArgs(patch.status));

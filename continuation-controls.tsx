@@ -3,6 +3,7 @@ import { useRpc } from "@get-bb/plugin-sdk/app";
 import type { rpcContract } from "./server";
 import type { Language } from "./snapshot";
 import type { ExecutionFallbackSelection } from "./execution-policy";
+import {RoleModelRecovery} from "./role-model-recovery";
 import { exhaustedOllama, type OllamaUsage } from "./ollama-usage";
 
 export function OllamaQuotaCard({projectId,team,language}:{projectId:string;team:string;language:Language}) {
@@ -25,28 +26,25 @@ export function OllamaQuotaCard({projectId,team,language}:{projectId:string;team
 }
 
 export function RoleContinuationControls({projectId,team,role,threadId,language,onChanged}:{projectId:string;team:string;role:string;threadId:string|null;language:Language;onChanged:()=>Promise<void>}) {
-  const rpc=useRpc<typeof rpcContract>(),ru=language==="ru";
-  const [state,setState]=useState<{paused:boolean;threadId:string|null;fallbacks:ExecutionFallbackSelection[];actual?:ExecutionFallbackSelection|null}|null>(null);
-  const [selection,setSelection]=useState(""),[busy,setBusy]=useState(false),[error,setError]=useState<string|null>(null);
-  useEffect(()=>{let alive=true;setState(null);void rpc.call("roleControl",{projectId,team,role,action:"status"}).then(v=>{if(alive)setState(v);},()=>{});return()=>{alive=false;};},[rpc,projectId,team,role,threadId]);
-  const act=async(action:"pause"|"resume"|"switch")=>{
-    if(!state?.threadId||busy)return;setBusy(true);setError(null);
-    try{setState(await rpc.call("roleControl",{projectId,team,role,action,expectedThreadId:state.threadId,...(action==="switch"&&selection!==""?{selection:state.fallbacks[Number(selection)]}: {})}));await onChanged();}
-    catch(e){setError((e instanceof Error?e.message:String(e)).split("\n")[0]!.slice(0,500));try{setState(await rpc.call("roleControl",{projectId,team,role,action:"status"}));}catch{/* Keep the last known state; never retry a switch. */}}finally{setBusy(false);}
-  };
-  if(!state?.threadId)return null;
-  return <section aria-label={ru?"Продолжение работы":"Continue work"} className="flex flex-col gap-2 border-t border-border pt-2 text-xs">
-    {state.actual&&<p>{ru?"Текущая модель сессии":"Current session model"}: {state.actual.provider} · {state.actual.model}</p>}
-    <strong>{state.paused?(ru?"Сотрудник на паузе":"Employee paused"):(ru?"Новые ходы разрешены":"New turns enabled")}</strong>
-    <button disabled={busy} onClick={()=>void act(state.paused?"resume":"pause")}>{state.paused?(ru?"Продолжить сотрудника":"Resume employee"):(ru?"Пауза сотрудника":"Pause employee")}</button>
-    {!state.paused&&<button disabled={busy} onClick={()=>void act("resume")}>{ru?"Продолжить очередь":"Check queued work and continue"}</button>}
-    <p>{ru?"Продолжение очереди может запустить модель и расходовать её лимит.":"Continuing queued work may start a model turn and consume usage."}</p>
-    <p>{ru?"Пауза удерживает следующие ходы, включая сообщения человека. Текущая операция завершается; кнопка Send-now в BB может обойти ограничение.":"Pause holds future turns, including human messages. Current work finishes; BB Send-now can bypass the hold."}</p>
-    {state.fallbacks.length>0?<>
-      <label>{ru?"Продолжить на резервной модели":"Continue on backup model"}<select value={selection} onChange={e=>setSelection(e.target.value)}><option value="">{ru?"Выберите утверждённую модель":"Choose an approved model"}</option>{state.fallbacks.map((f,i)=><option key={`${f.provider}:${f.model}`} value={i}>{f.provider} · {f.model}</option>)}</select></label>
-      <button disabled={busy||selection===""} onClick={()=>void act("switch")}>{ru?"Подготовить передачу на выбранную модель":"Prepare handoff to selected model"}</button>
-      <p>{ru?"Нужны сохранённое состояние и завершённые операции. Задача и окружение сохраняются. Новая сессия остаётся на паузе до вашего продолжения. Если условия не выполнены, появится причина; повторный агент не запускается.":"Needs saved state and finished operations. Task and environment are retained; the new session stays paused until resumed. Unsafe conditions produce an error, without a duplicate agent."}</p>
-    </>:<p>{ru?"Резервные модели не назначены. Задайте их в настройках моделей сотрудника или решите, ждать ли восстановления лимита.":"No approved backups. Configure employee models or decide to wait for quota reset."}</p>}
-    {error&&<><p role="alert">{ru?(/active operation/.test(error)?"Дождитесь завершения текущей операции. Новые ходы уже на паузе.":/checkpoint|Checkpoint/.test(error)?"Нужно актуальное сохранённое состояние задачи. Если квота исчерпана, требуется ручная проверка или ожидание сброса.":/queue|queued/.test(error)?"В очереди есть сообщения. Проверьте их перед передачей; автоматического удаления нет.":/resource limit/.test(error)?"Сначала разрешите ресурсную блокировку в разделе ресурсов.":"Передача требует вашего решения. Сотрудник не перезапускается автоматически."):"Handoff needs your decision. The employee will not restart automatically."}</p><details><summary>{ru?"Техническая причина":"Technical cause"}</summary>{error}</details></>}
-  </section>;
+ const rpc=useRpc<typeof rpcContract>(),ru=language==="ru";
+ const [state,setState]=useState<{paused:boolean;threadId:string|null;fallbacks:ExecutionFallbackSelection[];actual?:ExecutionFallbackSelection|null}|null>(null);
+ const [busy,setBusy]=useState(false),[error,setError]=useState<string|null>(null);
+ useEffect(()=>{let alive=true;setState(null);void rpc.call("roleControl",{projectId,team,role,action:"status"}).then(v=>{if(alive)setState(v);},()=>{});return()=>{alive=false;};},[rpc,projectId,team,role,threadId]);
+ const act=async(action:"pause"|"resume")=>{if(!state?.threadId||busy)return;setBusy(true);setError(null);
+  try{setState(await rpc.call("roleControl",{projectId,team,role,action,expectedThreadId:state.threadId}));await onChanged();}
+  catch{setError(ru?"Продолжение не подтверждено. Проверьте ограничения команды и состояние сотрудника.":"Continuation was not confirmed. Inspect team limits and employee state.");}
+  finally{setBusy(false);}
+ };
+ if(!threadId)return null;
+ return <section aria-label={ru?"Продолжение работы":"Continue work"} className="flex flex-col gap-2 border-t border-border pt-2 text-xs">
+  {state?.actual&&<p>{ru?"Текущая модель сессии":"Current session model"}: {state.actual.provider} · {state.actual.model}</p>}
+  {state?.paused&&<strong>{ru?"Сотрудник на паузе":"Employee paused"}</strong>}
+  {state&&<button disabled={busy} onClick={()=>void act(state.paused?"resume":"pause")}>{state.paused?(ru?"Продолжить сотрудника":"Resume employee"):(ru?"Приостановить после текущей операции":"Pause after current operation")}</button>}
+  <RoleModelRecovery projectId={projectId} team={team} role={role} threadId={threadId} language={language} onChanged={onChanged}/>
+  <details><summary>{ru?"Очередь и дополнительные действия":"Queue and additional actions"}</summary>
+   <p>{ru?"Продолжение очереди может запустить модель. Пауза удерживает следующие ходы и не обрывает текущую операцию.":"Continuing queued work may start a model turn. Pause holds future turns without interrupting current work."}</p>
+   <button disabled={busy||!state} onClick={()=>void act("resume")}>{ru?"Продолжить очередь":"Check queued work and continue"}</button>
+  </details>
+  {error&&<p role="alert">{error}</p>}
+ </section>;
 }

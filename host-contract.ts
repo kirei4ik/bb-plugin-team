@@ -77,6 +77,7 @@ const BD_COMMAND_GRAMMAR: Record<
   update: {
     flags: {
       "--title": 1,
+      "--design": 1,
       "-d": 1,
       "--description": 1,
       "-s": 1,

@@ -293,3 +293,36 @@ The team-wide quota display is scoped to the canonical project host. Execution
 admission and backup validation use the employee's actual environment host.
 A different remote execution host is not represented by that one project-host
 balance; multi-host quota aggregation remains outside this iteration.
+
+
+### Guided recovery and the team summary
+
+The main Team view explains current work, the next step and why a decision is
+needed. Limits, quota diagnostics and historical holds are collapsed under
+“Limits, quotas and history”. Historical unknown outcomes are not presented as
+a demand to retry old work.
+
+When the configured coordination task reaches its cap, the summary can grant
+four additional lead turns for that task. This is an explicit potentially
+billable action, not a policy-wide increase or a guarantee to complete a stage.
+The decision is recorded in the chosen task tracker, counts remain intact,
+and provider/team limits still apply. Replayed or stale requests do not grant
+another allowance.
+
+Employee → “Change provider or model” is one flow: select an exact model from
+the actual environment's catalog, check handoff readiness, explicitly authorize
+this choice, transfer work, then continue the paused new session. No fallback
+configuration is required for this manual choice. It applies only to this task,
+including its later sessions; the configured primary and automatic fallback
+policy are unchanged. Price/remaining capacity are never inferred from a name
+or a catalog entry. Known exhausted pools and unavailable model options refuse
+before switching.
+
+If an agent-authored checkpoint is missing/stale, the user can explicitly choose
+recovery from the task and current files. The plugin captures only verified Git
+facts and records prior progress as unconfirmed. It preserves any old checkpoint
+in the task's decisions before replacing it; oversized history refuses instead
+of trimming. The new model first inventories work, saves a substantive checkpoint
+and asks about unverifiable external effects. It does not call the exhausted
+model or treat the old output as a checkpoint. Busy/queued/uncertain operations,
+missing environment access and Team limits are never bypassed by this option.

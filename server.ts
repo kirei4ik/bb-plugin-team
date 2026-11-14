@@ -1,3 +1,4 @@
+import { recoveryViewSchema, manualExecutionApprovalSchema, type RecoveryView, type RecoveryBlocker } from "./recovery-view";
 import { hostContract } from "./host-contract";
 import { ollamaUsageSchema, isOllamaCloud, exhaustedOllama, type OllamaUsage } from "./ollama-usage";
 import { verifyQuotaBoundary } from "./checkpoint";
@@ -92,7 +93,7 @@ import {
 } from "./snapshot";
 import { strings, type Strings } from "./strings";
 import { createTaskTracker, isTrackerAbsentError } from "./tracker";
-import { captureCheckpoint, verifyCheckpoint, workCheckpointSchema } from "./checkpoint";
+import { captureCheckpoint, environmentState, verifyCheckpoint, workCheckpointSchema } from "./checkpoint";
 import { acceptanceGate, latestDecision, type AcceptanceCaller, type AcceptanceDecision } from "./review";
 import { replaceSession, readReplacementIntent, isPreparedReplacement, activeSessionKey, type ReplacementIntent, type ReplacementResult } from "./sessions";
 import {
@@ -438,8 +439,14 @@ export const rpcContract = defineRpcContract({
   ollamaUsage: {
     input:z.object({projectId:projectIdSchema,team:teamSchema,refresh:z.boolean().optional()}).strict(),output:ollamaUsageSchema,
   },
+  roleRecovery: {
+    input:z.object({projectId:projectIdSchema,team:teamSchema,role:z.string(),selection:executionPolicySchema.shape.fallbacks.element.optional()}).strict(),output:recoveryViewSchema,
+  },
+  continueCoordination: {
+    input:z.object({projectId:projectIdSchema,team:teamSchema,taskId:z.union([z.string(),z.number()]),expectedStarts:z.number().int().nonnegative(),expectedUsed:z.number().int().nonnegative()}).strict(),output:z.custom<ResourceSummary>(),
+  },
   roleControl: {
-    input:z.object({projectId:projectIdSchema,team:teamSchema,role:z.string(),action:z.enum(["status","pause","resume","switch"]),expectedThreadId:z.string().optional(),selection:executionPolicySchema.shape.fallbacks.element.optional()}).strict(),
+    input:z.object({projectId:projectIdSchema,team:teamSchema,role:z.string(),action:z.enum(["status","pause","resume","switch"]),expectedThreadId:z.string().optional(),selection:executionPolicySchema.shape.fallbacks.element.optional(),approveSelection:z.boolean().optional(),recoverFromWorkspace:z.boolean().optional(),expectedRecoveryRevision:z.string().optional()}).strict(),
     output:z.object({paused:z.boolean(),threadId:z.string().nullable(),fallbacks:z.array(executionPolicySchema.shape.fallbacks.element),actual:executionPolicySchema.shape.fallbacks.element.nullable().optional()}),
   },
   resources: {
@@ -1376,7 +1383,7 @@ export default async function plugin(bb: BbPluginApi) {
     scope: Scope,
     roleName: string,
     oldThreadId: string,
-    options: { keep?: boolean; pending?: ReplacementIntent | null; execution?: ExecutionFallbackSelection } = {},
+    options: { keep?: boolean; pending?: ReplacementIntent | null; execution?: ExecutionFallbackSelection; manualApproval?:boolean } = {},
   ): Promise<{ result: ReplacementResult; continuing: boolean; kept: boolean }> => {
     const { lang, t, m } = await loadLang();
     const pending = options.pending ?? null;
@@ -1391,10 +1398,14 @@ export default async function plugin(bb: BbPluginApi) {
     const oldMeta=await bb.sdk.threads.getPluginMetadata({threadId:oldThreadId}) as Record<string,unknown>;
     const configuredExecution=JSON.stringify([configuredRole.provider,configuredRole.model,configuredRole.reasoningLevel,configuredRole.serviceTier]);
     const savedSelection=oldMeta.teamExecution as ExecutionFallbackSelection|undefined;
+    const manual=manualExecutionApprovalSchema.safeParse(oldMeta.teamExecutionApproval);
+    const linkedTask=await bb.storage.kv.get<TaskId>(sessionTaskKey(scope,oldThreadId));
+    const manualTask=manual.success&&manual.data.taskId===linkedTask?(await readTasks(scope)).tasks.find(t=>t.id===linkedTask&&t.role===roleName&&["in-progress","review"].includes(t.status)):undefined;
+    const manualApproved=!!manualTask&&manual.success&&manual.data.role===roleName&&JSON.stringify(manual.data.selection)===JSON.stringify(savedSelection);
     const stillApproved=savedSelection&&configuredRole.executionPolicy?.fallbacks.some(c=>JSON.stringify(c)===JSON.stringify(savedSelection));
     const pendingQuota=(await resources.inspect(scope)).fallbacks.find(f=>f.threadId===oldThreadId&&f.selection&&f.stage!=="complete");
     const quotaApproved=pendingQuota?.selection&&configuredRole.executionPolicy?.fallbacks.some(c=>JSON.stringify(c)===JSON.stringify(pendingQuota.selection));
-    const execution=options.execution??(quotaApproved?pendingQuota!.selection!:oldMeta.teamConfiguredExecution===configuredExecution&&stillApproved?savedSelection:undefined);
+    const execution=options.execution??(quotaApproved?pendingQuota!.selection!:(manualApproved||oldMeta.teamExecutionApproval===undefined&&oldMeta.teamConfiguredExecution===configuredExecution&&stillApproved)?savedSelection:undefined);
     const role=core.roleSchema.parse({...configuredRole,...(execution?{provider:execution.provider,model:execution.model,reasoningLevel:execution.reasoningLevel,serviceTier:execution.serviceTier}:{})});
     const old = await bb.sdk.threads.get({ threadId: oldThreadId });
     const ref = await bb.storage.kv.get<{taskId:TaskId}>(checkpointRefKey(scope, roleName));
@@ -1448,7 +1459,7 @@ export default async function plugin(bb: BbPluginApi) {
         environment:{type:"reuse",environmentId:checkpoint.environmentId},sectionId,
         parentThreadId:leadThreadId ?? undefined,
         parentNotifications:leadThreadId ? role.parentNotifications ?? defaults.parentNotifications : undefined,
-        pluginMetadata:{...teamMetadata(role,scope.team),...(execution?{teamExecution:execution,teamConfiguredExecution:configuredExecution}:{})}, prompt,
+        pluginMetadata:{...teamMetadata(role,scope.team),...(execution?{teamExecution:execution,teamConfiguredExecution:configuredExecution,...((options.manualApproval||manualApproved)&&continuing?{teamExecutionApproval:{taskId:checkpoint.taskId,role:roleName,selection:execution,manual:true}}:{})}:{})}, prompt,
       },
       beforeSwitch: async () => {
         const saved = workCheckpointSchema.parse(await tracker.readCheckpoint(scope,ref.taskId));
@@ -2491,6 +2502,74 @@ export default async function plugin(bb: BbPluginApi) {
     return checks;
   };
 
+  const inspectRoleRecovery=async(scope:Scope,roleName:string,selection?:ExecutionFallbackSelection):Promise<RecoveryView>=>{
+    const {t}=await loadLang();
+    const view:RecoveryView={threadId:null,taskId:null,taskTitle:null,environmentId:null,actual:null,revision:"",blockers:[],quota:"unknown"};
+    let checkpoint:unknown=null;let queueIds:string[]=[];let configRevision="";let workspaceFingerprint="";
+    const add=(reason:RecoveryBlocker)=>{if(!view.blockers.includes(reason))view.blockers.push(reason);};
+    try {
+      const {rows,loaded}=await teamContext(scope,t);const list=rows.get(roleName)??[];
+      configRevision=createHash("sha256").update(JSON.stringify(loaded?.config??null)).digest("hex");
+      if(list.length!==1)add("no_session");
+      else {
+        view.threadId=list[0]!.threadId;
+        const thread=await bb.sdk.threads.get({threadId:view.threadId});view.environmentId=thread.environmentId;
+        if(RUNNING.includes(thread.status)||!["idle","error"].includes(thread.status))add("busy");
+        const descendants=await bb.sdk.threads.experimental_listDescendants({threadIds:[view.threadId]});
+        const childIds=descendants.threads.find(r=>r.threadId===view.threadId)?.descendantIds??[];
+        for(const id of childIds){if((await bb.sdk.threads.get({threadId:id})).lifecycleOwnerThreadId===view.threadId)add("lifecycle_owner");}
+        const meta=await bb.sdk.threads.getPluginMetadata({threadId:view.threadId}) as {teamExecution?:unknown};
+        const configured=loaded?.config.roles.find(r=>r.name===roleName);
+        const actual=executionPolicySchema.shape.fallbacks.element.safeParse(meta.teamExecution??{provider:configured?.provider,model:configured?.model,...(configured?.reasoningLevel?{reasoningLevel:configured.reasoningLevel}:{}),...(configured?.serviceTier?{serviceTier:configured.serviceTier}:{})});
+        view.actual=actual.success?actual.data:null;
+        const queue=await bb.sdk.threads.queuedMessages.list({threadId:view.threadId});queueIds=queue.map(q=>q.id);
+        if(queue.length||thread.queuedMessageCount>0)add("queue");
+        const row=(await bb.sdk.threads.list({projectId:scope.projectId})).find(r=>r.id===view.threadId);
+        if(row?.hasPendingInteraction)add("interaction");
+        const a=row?.activity as Record<string,number>|undefined;
+        if(thread.activeBackgroundAgentCount>0||a&&[a.activeBackgroundAgentCount,a.activeBackgroundCommandCount,a.activeGoalCount,a.activePlanModeCount,a.activeWorkflowCount].some(n=>typeof n==="number"&&n>0))add("background");
+        view.taskId=await bb.storage.kv.get<TaskId>(sessionTaskKey(scope,view.threadId))??null;
+        const task=view.taskId!==null?(await readTasks(scope)).tasks.find(task=>task.id===view.taskId):undefined;
+        if(!task)add("no_task");
+        else {
+          view.taskTitle=task.title;if(task.role!==roleName)add("task_reassigned");
+          if(!["in-progress","review"].includes(task.status))add("task_finished");
+          const ref=await bb.storage.kv.get<{taskId:TaskId}>(checkpointRefKey(scope,roleName));
+          if(!ref||ref.taskId!==task.id)add("checkpoint_missing");
+          else {
+            checkpoint=await tracker.readCheckpoint(scope,ref.taskId);
+            const cp=workCheckpointSchema.safeParse(checkpoint);
+            if(!cp.success)add("checkpoint_missing");
+            else if(cp.data.threadId!==view.threadId||cp.data.role!==roleName||cp.data.taskId!==task.id)add("checkpoint_stale");
+            else try{await verifyCheckpoint(bb,cp.data);}catch(error){add((error as {code?:string}).code==="checkpoint_stale"?"checkpoint_stale":"checkpoint_unavailable");}
+          }
+        }
+        if(view.blockers.includes("checkpoint_missing")||view.blockers.includes("checkpoint_stale")){
+          try{workspaceFingerprint=(await environmentState(bb,view.threadId)).state.fingerprint;}catch{add("checkpoint_unavailable");}
+        }
+        const intent=await readReplacementIntent(bb,scope.projectId,scope.team,roleName);
+        if(intent&&(intent.stage!=="complete"||intent.delivery==="uncertain"))add("replacement_pending");
+        if(selection&&view.environmentId){
+          const selectionOwner=await resourceOwner(view.threadId);
+          if(selectionOwner&&await resources.quotaExcluded(selectionOwner,selection))add("quota_exhausted");
+          const catalog=await bb.sdk.providers.models({environmentId:view.environmentId,providerId:selection.provider});
+          const model=catalog.models.find(m=>m.id===selection.model||m.model===selection.model);
+          if(catalog.modelLoadError||!catalog.providers.some(p=>p.id===selection.provider&&p.available)||!model||selection.reasoningLevel&&!model.supportedReasoningEfforts.some(r=>r.reasoningEffort===selection.reasoningLevel)||selection.serviceTier&&!model.supportedServiceTiers?.some(tier=>tier.id===selection.serviceTier))add("model_unavailable");
+          if(isOllamaCloud(selection.provider,selection.model)){
+            const owner=await resourceOwner(view.threadId);const usage=owner?.hostId?await cloudUsage(owner.hostId):undefined;
+            view.quota=usage?.status==="ready"?exhaustedOllama(usage)?"exhausted":"available":"unknown";
+            if(view.quota!=="available")add(view.quota==="exhausted"?"quota_exhausted":"quota_unknown");
+          }
+        }
+      }
+      if(await readPause(scope))add("team_paused");
+      if((await resources.inspect(scope)).blocked)add("resource_limit");
+    }catch{add("state_unavailable");}
+    // No timestamps or token estimates: only state relevant to this task/choice.
+    view.revision=createHash("sha256").update(JSON.stringify([view.threadId,view.taskId,view.taskTitle,view.environmentId,view.actual,view.blockers,checkpoint,queueIds,selection,configRevision,workspaceFingerprint])).digest("hex");
+    return view;
+  };
+
   /* ── Lifecycle: helpers, live panel, opt-in lead notifications ── */
 
   const onTeamThreadEvent = async (
@@ -2967,7 +3046,24 @@ export default async function plugin(bb: BbPluginApi) {
       const {t}=await loadLang();const scope=await scopeFor(projectId,team,t);
       return cloudUsage(scope.hostId,refresh);
     },
-    async roleControl({projectId,team,role:roleName,action,expectedThreadId,selection:requestedSelection}) {
+    async roleRecovery({projectId,team,role,selection}) {
+      const {t}=await loadLang();return inspectRoleRecovery(await scopeFor(projectId,team,t),role,selection);
+    },
+    async continueCoordination({projectId,team,taskId,expectedStarts,expectedUsed}) {
+      const {t}=await loadLang();const scope=await scopeFor(projectId,team,t);
+      return withScopeLock(scope,async()=>{
+        const {lead,rows}=await teamContext(scope,t);const list=lead?rows.get(lead)??[]:[];
+        const task=(await readTasks(scope)).tasks.find(t=>t.id===taskId&&t.role===lead&&["in-progress","review"].includes(t.status));
+        if(!task||list.length!==1)throw new experimental_PluginRpcRefusal({code:"conflict",message:"Coordination task or session changed; refresh the team"});
+        const owner=await resourceOwner(list[0]!.threadId);
+        if(!owner||owner.taskId!==taskId)throw new experimental_PluginRpcRefusal({code:"conflict",message:"Coordination task is no longer bound"});
+        const reason=currentLang==="ru"?`Пользователь разрешил ещё 4 хода координации задачи «${task.title}»: проверить текущий результат, принять или вернуть конкретные замечания. Общие лимиты и квоты провайдеров не изменяются.`:`User allowed four more coordination turns for "${task.title}": inspect the current result, accept it or return concrete feedback. Other budgets and provider quotas are unchanged.`;
+        const decisions=[task.decisions,reason].filter(Boolean).join("\n\n");if(decisions.length>24000)throw new experimental_PluginRpcRefusal({code:"conflict",message:"Decision history is full; inspect the task manually"});
+        const result=await resources.extendCoordination(owner,expectedStarts,expectedUsed,async()=>{await tracker.update(scope,taskId,{decisions});});
+        publishChange(projectId);await bb.experimental_hooks.recheck("message.dispatch");return result;
+      });
+    },
+    async roleControl({projectId,team,role:roleName,action,expectedThreadId,selection:requestedSelection,approveSelection,recoverFromWorkspace,expectedRecoveryRevision}) {
       const {t}=await loadLang();const scope=await scopeFor(projectId,team,t);
       return withScopeLock(scope,async()=>{
         const {loaded,rows}=await teamContext(scope,t);
@@ -2983,8 +3079,15 @@ export default async function plugin(bb: BbPluginApi) {
           const current=(await teamContext(scope,t)).rows.get(roleName)??[];threadId=current.length===1?current[0]!.threadId:null;
         }
         if(action==="switch") {
-          const selection=configured.executionPolicy?.fallbacks.find(c=>JSON.stringify(c)===JSON.stringify(requestedSelection));
-          if(!configured.executionPolicy?.noAdditionalCost||!selection)throw new experimental_PluginRpcRefusal({code:"invalid",message:"Select an explicitly approved backup model"});
+          const savedSelection=configured.executionPolicy?.noAdditionalCost?configured.executionPolicy.fallbacks.find(c=>JSON.stringify(c)===JSON.stringify(requestedSelection)):undefined;
+          const selection=approveSelection?requestedSelection:savedSelection;
+          if(!selection)throw new experimental_PluginRpcRefusal({code:"invalid",message:"Select an explicitly approved backup model"});
+          if(approveSelection){
+            const recovery=await inspectRoleRecovery(scope,roleName,selection);
+            if(!expectedRecoveryRevision||expectedRecoveryRevision!==recovery.revision)throw new experimental_PluginRpcRefusal({code:"conflict",message:"recovery_changed"});
+            const blockers=recoverFromWorkspace?recovery.blockers.filter(b=>b!=="checkpoint_missing"&&b!=="checkpoint_stale"):recovery.blockers;
+            if(blockers.length)throw new experimental_PluginRpcRefusal({code:"conflict",message:`recovery_blocked:${blockers.join(",")}`});
+          }
           const owner=await resourceOwner(threadId!);
           const usage=isOllamaCloud(selection.provider,selection.model)?owner?.hostId?await cloudUsage(owner.hostId,true):{status:"unavailable" as const,checkedAtMs:Date.now(),windows:[],reason:"host_unavailable" as const}:undefined;
           if(usage&&(usage.status!=="ready"||exhaustedOllama(usage)))throw new experimental_PluginRpcRefusal({code:"conflict",message:"Backup quota is exhausted or unavailable; choose an independent model or wait"});
@@ -2993,7 +3096,43 @@ export default async function plugin(bb: BbPluginApi) {
           const pending=await readReplacementIntent(bb,projectId,team,roleName);
           if(pending&&pending.stage!=="complete")throw new experimental_PluginRpcRefusal({code:"conflict",message:"Resolve the unfinished replacement before starting another switch"});
           await bb.storage.kv.set(key,true);
-          const result=await continueRoleSession(scope,roleName,threadId!,{execution:selection});
+          if(approveSelection){
+            const linked=await bb.storage.kv.get<TaskId>(sessionTaskKey(scope,threadId!));
+            if(linked!==undefined){
+              const task=(await readTasks(scope)).tasks.find(t=>t.id===linked);
+              if(!task)throw new experimental_PluginRpcRefusal({code:"conflict",message:"recovery_changed"});
+              if(recoverFromWorkspace){
+                const previous=await tracker.readCheckpoint(scope,linked);
+                const previousText=previous?JSON.stringify(previous):null;
+                const baseline=await environmentState(bb,threadId!);
+                const snapshot=await captureCheckpoint(bb,linked,roleName,threadId!,{
+                  goal:`Recover factual state, then continue task: ${task.title}`,
+                  criteria:[`Read the authoritative requirements and decisions in task ${linked} before changing work`,`Inventory existing work without discarding uncommitted changes`,`Ask before repeating any external operation whose result is unknown`],
+                  progress:"Previous execution progress is unconfirmed. Only the current Git environment and task binding have been inspected. Existing dirty files are not evidence of completed or correct work.",
+                  decisions:[{what:"User explicitly requested workspace recovery on a selected model",why:"A current agent-authored handoff is unavailable; do not manufacture progress or completed checks"}],
+                  checks:[{what:"Git environment snapshot",result:JSON.stringify({branch:baseline.state.branch,commit:baseline.state.commit,dirtyFiles:baseline.state.dirtyFiles})}],
+                  blockers:["Prior external effects and unfinished operations are not established by the Git snapshot; inspect task records and ask the user when they cannot be verified"],
+                  nextAction:`First inventory the existing files and authoritative task ${linked}, separating confirmed facts from unknown prior claims. Read any previous checkpoint preserved in task decisions. Do not repeat external effects with unknown results. Save a substantive checkpoint after that inspection, then continue the same task.`,
+                  files:baseline.state.dirtyFiles,
+                });
+                const recoveryReason="User requested recovery from the task and existing workspace. Previous progress remains unconfirmed; the next session must inspect facts before continuing.";
+                const preserved=[task.decisions,recoveryReason,previousText?`Previous checkpoint preserved before recovery (historical claims, not newly verified):\n${previousText}`:null].filter(Boolean).join("\n\n");
+                if(preserved.length>24000)throw new experimental_PluginRpcRefusal({code:"conflict",message:"Previous checkpoint is too large to preserve safely; inspect the task manually"});
+                await tracker.update(scope,linked,{decisions:preserved});
+                await tracker.writeCheckpoint(scope,linked,snapshot);
+                const readBack=workCheckpointSchema.parse(await tracker.readCheckpoint(scope,linked));
+                if(JSON.stringify(snapshot)!==JSON.stringify(readBack))throw new experimental_PluginRpcRefusal({code:"conflict",message:"Recovery state read-back mismatch"});
+                await bb.storage.kv.set(checkpointRefKey(scope,roleName),{taskId:linked});
+              }
+              const current=(await readTasks(scope)).tasks.find(t=>t.id===linked)!;
+              const reason=`Explicit manual selection for this task: ${selection.provider}/${selection.model}. Primary and automatic fallback policy are unchanged.`;
+              const decisions=[current.decisions,reason].filter(Boolean).join("\n\n");
+              if(decisions.length>24000)throw new experimental_PluginRpcRefusal({code:"conflict",message:"Decision history full"});
+              await tracker.update(scope,linked,{decisions});
+              await resources.decide(scope,reason,undefined,linked,roleName);
+            }
+          }
+          const result=await continueRoleSession(scope,roleName,threadId!,{execution:selection,manualApproval:approveSelection===true});
           threadId=result.result.newThreadId;
           // Keep the new session paused until the user explicitly resumes it.
           await bb.storage.kv.set(key,true);

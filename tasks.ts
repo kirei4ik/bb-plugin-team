@@ -129,7 +129,7 @@ export function findTask(store: TaskStore, id: TaskId): TeamTask {
 export function updateTask(
   store: TaskStore,
   id: TaskId,
-  patch: { status?: TaskStatus; title?: string; note?: string | null; role?: string },
+  patch: { status?: TaskStatus; title?: string; note?: string | null; role?: string; decisions?:string },
   nowMs: number,
 ): { store: TaskStore; task: TeamTask; previous: TeamTask } {
   const previous = findTask(store, id);
@@ -138,6 +138,7 @@ export function updateTask(
     status: patch.status ?? previous.status,
     title: patch.title !== undefined ? cleanTitle(patch.title) : previous.title,
     note: patch.note !== undefined ? cleanNote(patch.note) : previous.note,
+    ...(patch.decisions!==undefined?{decisions:patch.decisions}:{}),
     role: patch.role ?? previous.role,
     updatedAtMs: nowMs,
   };

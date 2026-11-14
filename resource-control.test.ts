@@ -155,3 +155,22 @@ it("distinguishes Ollama and OpenRouter upstream accounts inside Pi while blocki
  const result=await f.control.failed(f.fail(),[{provider:"pi",model:"ollama-cloud/two"},{provider:"pi",model:"openrouter/approved-free"}]);
  expect(result?.selection?.model).toBe("openrouter/approved-free");
 });
+it("grants only four extra lead turns for one task, preserving policy, history and other holds",async()=>{
+ const f=fixture();const owner={...f.scope,role:"lead",taskId:"coord",isLead:true};f.owners.set("lead",owner);
+ await f.control.decide(f.scope,"Finite coordination",{...DEFAULT_RESOURCE_POLICY,coordinationAttempts:1});
+ await f.control.admit(f.ctx("lead","one"));await f.control.settle("lead","completed");f.tick();let records=0;
+ const next=await f.control.extendCoordination(owner,1,1,async()=>{records++;});
+ expect(next.starts).toBe(1);expect(next.policy.coordinationAttempts).toBe(1);expect(next.taskLimits?.["task:coord"]).toBe(5);
+ await expect(f.control.extendCoordination(owner,1,1,async()=>{records++;})).rejects.toThrow(/changed/);expect(records).toBe(1);
+ f.restart();for(let i=0;i<4;i++){expect((await f.control.admit(f.ctx("lead",`more-${i}`))).action).toBe("proceed");await f.control.settle("lead","completed");f.tick();}
+ expect((await f.control.admit(f.ctx("lead","sixth"))).action).toBe("wait");
+});
+it("cannot grant around the team cap or a failed tracker write",async()=>{
+ const f=fixture();const owner={...f.scope,role:"lead",taskId:"coord",isLead:true};f.owners.set("lead",owner);
+ await f.control.decide(f.scope,"Finite coordination",{...DEFAULT_RESOURCE_POLICY,coordinationAttempts:1,teamStarts:1});
+ await f.control.admit(f.ctx("lead","one"));await f.control.settle("lead","completed");
+ await expect(f.control.extendCoordination(owner,1,1,async()=>{})).rejects.toThrow(/changed/);
+ await f.control.decide(f.scope,"Keep overall room",{...DEFAULT_RESOURCE_POLICY,coordinationAttempts:1});
+ await expect(f.control.extendCoordination(owner,1,1,async()=>{throw new Error("tracker offline");})).rejects.toThrow("tracker offline");
+ expect((await f.control.inspect(f.scope)).taskLimits).toEqual({});
+});

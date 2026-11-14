@@ -6,6 +6,7 @@ import { loadPluginApp, renderSlot } from "@get-bb/plugin-sdk/testing/app";
 import type { PluginBrowserBbSdk } from "@get-bb/plugin-sdk/app";
 import type { TeamSnapshot } from "./snapshot";
 import type { ResourceSummary } from "./resource-control";
+import type {RecoveryView} from "./recovery-view";
 import type { SessionView } from "./session-view";
 import { builtinTemplates, type TeamTemplate } from "./templates";
 
@@ -204,7 +205,7 @@ const QA: TeamSnapshot = {
 };
 
 async function mount(
-  options: { snapshots?: TeamSnapshot[]; providers?: { enabled: string[]; disabled: string[] }; templates?: TeamTemplate[]; defaultTemplate?: string; session?: Partial<SessionView>; language?: "en" | "ru"; rotate?: () => Promise<SessionView> } = {},
+  options: { snapshots?: TeamSnapshot[]; providers?: { enabled: string[]; disabled: string[] }; templates?: TeamTemplate[]; defaultTemplate?: string; session?: Partial<SessionView>; language?: "en" | "ru"; rotate?: () => Promise<SessionView>; recovery?:Partial<RecoveryView> } = {},
 ) {
   const app = await loadPluginApp(() => import("./app"));
   const calls: Array<{ method: string; input: unknown }> = [];
@@ -214,6 +215,8 @@ async function mount(
   let snapshots = options.snapshots ?? [SNAPSHOT];
   let requested = false;
   const pausedRoles=new Set<string>();
+  const actualModels=new Map<string,{provider:string;model:string;reasoningLevel?:string}>();
+  const roleThreads=new Map<string,string>();
   const session = (role: string): SessionView => ({threadId: role === "developer" ? "thr_d" : "thr_l", taskId: role === "developer" ? 7 : null, context: {kind: "unavailable", usedTokens: null, limitTokens: null}, checkpoint: "missing", phase: requested ? "awaiting-checkpoint" : "idle", reason: requested ? "context" : null, blockedReason: role === "developer" ? null : "no_task", errorCode: null, ...options.session});
   const slot = renderSlot(
     app.navPanels[0]!,
@@ -261,9 +264,16 @@ async function mount(
           log("resources")(input);const current=snapshots[0]!.resources!;const result={...current,...(input.policy?{policy:input.policy}:{}),blocked:null};
           snapshots=snapshots.map(snapshot=>({...snapshot,resources:result}));return result;
         },
-        roleControl: (input:{role:string;action:string;expectedThreadId?:string;selection?:unknown})=>{
-          log("roleControl")(input);if(input.action==="pause")pausedRoles.add(input.role);if(input.action==="resume")pausedRoles.delete(input.role);
-          return {paused:pausedRoles.has(input.role),threadId:input.role==="developer"?"thr_d":"thr_l",fallbacks:[]};
+        roleRecovery: (input:{role:string;selection?:unknown})=>{
+          log("roleRecovery")(input);return {threadId:roleThreads.get(input.role)??"thr_d",taskId:7,taskTitle:"Implement profile",environmentId:"env_1",actual:actualModels.get(input.role)??{provider:"codex",model:"gpt-4",reasoningLevel:"none"},revision:"preview-1",blockers:[],quota:"unknown",...options.recovery};
+        },
+        continueCoordination:(input:{taskId:string|number;expectedStarts:number;expectedUsed:number})=>{
+          log("continueCoordination")(input);const current=snapshots[0]!.resources!;snapshots=snapshots.map(s=>({...s,resources:{...current,blocked:null}}));return {...current,blocked:null};
+        },
+        roleControl: (input:{role:string;action:string;expectedThreadId?:string;selection?:{provider:string;model:string;reasoningLevel?:string}})=>{
+          log("roleControl")(input);if(input.action==="pause"||input.action==="switch")pausedRoles.add(input.role);if(input.action==="resume")pausedRoles.delete(input.role);
+          if(input.action==="switch"&&input.selection){actualModels.set(input.role,input.selection);roleThreads.set(input.role,"thr_changed");snapshots=snapshots.map(s=>({...s,roles:s.roles.map(r=>r.name===input.role?{...r,threads:r.threads.map(t=>({...t,threadId:"thr_changed"}))}:r)}));}
+          return {paused:pausedRoles.has(input.role),threadId:roleThreads.get(input.role)??(input.role==="developer"?"thr_d":"thr_l"),fallbacks:[],actual:actualModels.get(input.role)??null};
         },
         rolePolicy: (input: {policy?: unknown}) => {
           log("rolePolicy")(input);
@@ -928,6 +938,8 @@ it("resource status is read-only and a retry/limit decision needs explicit groun
  const resources:ResourceSummary={sinceMs:1000,policy:{taskAttempts:2,teamStarts:10,tokens:null,minutes:null},starts:2,remainingStarts:8,reportedTokens:null,usageCoverage:"unavailable",blocked:"Task start limit reached",holds:{"task:7":"Repeated failure needs another approach"},attempts:[],taskCounts:[{taskId:7,role:"developer",starts:2,returns:0}],quotaBlocks:[],fallbacks:[],results:{accepted:1,review:0,reports:1,recent:[{id:6,title:"Accepted profile",result:"Profile delivered",checks:[{what:"diff inspected",result:"matches",notApplicable:null}],acceptanceReason:"Compared with criteria"}]}};
  const {slot,calls}=await mount({snapshots:[{...SNAPSHOT,resources}]});
  const panel=within(await slot.findByRole("region",{name:"Team resource control"}));
+ expect((panel.getByText("Limits, quotas and history").parentElement as HTMLDetailsElement).open).toBe(false);
+ fireEvent.click(panel.getByText("Limits, quotas and history"));
  expect(panel.getByText(/Reported cumulative tokens.*unavailable/)).toBeTruthy();
  expect(panel.getByText(/Profile delivered/).closest("details")?.open).toBe(false);expect(panel.getByText(/Compared with criteria/)).toBeTruthy();
  expect(calls.filter(c=>c.method==="resources")).toHaveLength(0);
@@ -944,8 +956,48 @@ it("employee pause/resume is separate from team pause and does not request rotat
  const {slot,calls}=await mount();
  fireEvent.click(await slot.findByText("Developer"));
  const region=within(await slot.findByRole("region",{name:"Continue work"}));
- fireEvent.click(region.getByText("Pause employee"));await region.findByText("Employee paused");
+ fireEvent.click(await region.findByText("Pause after current operation"));await region.findByText("Employee paused");
  expect(calls.filter(c=>c.method==="roleControl").at(-1)?.input).toMatchObject({action:"pause",expectedThreadId:"thr_d"});
- fireEvent.click(region.getByText("Resume employee"));await region.findByText("New turns enabled");
+ fireEvent.click(region.getByText("Resume employee"));await region.findByText("Pause after current operation");
  expect(calls.some(c=>c.method==="sessionRotate")).toBe(false);slot.lifecycle.unmount();
+});
+
+
+it("changes provider through one recovery flow without preconfiguring fallback models",async()=>{
+ const {slot,calls}=await mount();fireEvent.click(await slot.findByText("Developer"));
+ fireEvent.click(await slot.findByText("Change provider or model"));
+ const wizard=within(await slot.findByRole("region",{name:"Change provider and model"}));
+ await wizard.findByLabelText("Provider ID");await act(async()=>{});
+ fireEvent.change(wizard.getByLabelText("Provider ID"),{target:{value:"pi"}});fireEvent.change(wizard.getByLabelText("Model"),{target:{value:"qwen3"}});fireEvent.change(wizard.getByLabelText("Reasoning level"),{target:{value:"low"}});fireEvent.click(wizard.getByText("Apply execution selection"));
+ await waitFor(()=>expect((wizard.getByLabelText("Provider ID") as HTMLInputElement).value).toBe("pi"));
+ fireEvent.click(wizard.getByText("2. Check handoff readiness"));
+ const consent=await wizard.findByLabelText("I authorize this provider and model for this task under my account terms");
+ const apply=wizard.getByText("3. Transfer work to selected model") as HTMLButtonElement;expect(apply.disabled).toBe(true);expect(calls.filter(c=>c.method==="roleControl"&&(c.input as {action:string}).action==="switch")).toHaveLength(0);
+ fireEvent.click(consent);fireEvent.click(apply);
+ await wizard.findByText(/Work transferred/);
+ const switches=calls.filter(c=>c.method==="roleControl"&&(c.input as {action:string}).action==="switch");expect(switches).toHaveLength(1);expect(switches[0]?.input).toMatchObject({approveSelection:true,expectedThreadId:"thr_d",expectedRecoveryRevision:"preview-1",selection:{provider:"pi",model:"qwen3",reasoningLevel:"low"}});
+ fireEvent.click(wizard.getByText("Continue work on selected model"));await wizard.findByText(/Continuation requested/);
+ expect(calls.filter(c=>c.method==="roleControl").at(-1)?.input).toMatchObject({action:"resume",expectedThreadId:"thr_changed"});expect(calls.some(c=>c.method==="rolePolicy")).toBe(false);slot.lifecycle.unmount();
+});
+it("recovery explains missing work state and never offers a blind transfer",async()=>{
+ const {slot,calls}=await mount({recovery:{blockers:["checkpoint_missing","queue"]}});fireEvent.click(await slot.findByText("Developer"));fireEvent.click(await slot.findByText("Change provider or model"));
+ const wizard=within(await slot.findByRole("region",{name:"Change provider and model"}));await wizard.findByText(/Work state has not been saved/);expect(wizard.getByText(/Queued messages need inspection/)).toBeTruthy();
+ expect(wizard.queryByText("3. Transfer work to selected model")).toBeNull();expect(calls.filter(c=>c.method==="roleControl"&&(c.input as {action:string}).action==="switch")).toHaveLength(0);slot.lifecycle.unmount();
+});
+it("team summary grants a finite allowance without exposing the manual budget form",async()=>{
+ const leadTask={id:"coord",role:"lead",title:"Coordinate MVP",status:"in-progress" as const,note:null,createdAtMs:0,updatedAtMs:0};
+ const resources:ResourceSummary={sinceMs:1000,policy:{taskAttempts:8,teamStarts:100,tokens:null,minutes:null},starts:63,remainingStarts:37,reportedTokens:null,usageCoverage:"unavailable",blocked:"Task attempt limit reached (task:coord: 12/8); a new card or session cannot reset it",holds:{},attempts:[],taskCounts:[{taskId:"coord",role:"lead",starts:12,returns:0}],quotaBlocks:[],fallbacks:[]};
+ const {slot,calls}=await mount({snapshots:[{...SNAPSHOT,roles:[{...SNAPSHOT.roles[0]!,tasks:[leadTask]},SNAPSHOT.roles[1]!],resources}]});
+ const summary=within(await slot.findByRole("region",{name:"Team work status"}));expect(summary.getByText("Lead needs permission to continue")).toBeTruthy();
+ expect((slot.getByText("Limits, quotas and history").parentElement as HTMLDetailsElement).open).toBe(false);
+ fireEvent.click(summary.getByText("Allow 4 more lead turns"));await waitFor(()=>expect(calls.filter(c=>c.method==="continueCoordination")).toHaveLength(1));expect(calls.find(c=>c.method==="continueCoordination")?.input).toMatchObject({taskId:"coord",expectedStarts:63,expectedUsed:12});expect(calls.some(c=>c.method==="resources")).toBe(false);slot.lifecycle.unmount();
+});
+
+it("offers explicit task-and-files recovery without claiming prior progress is verified",async()=>{
+ const {slot,calls}=await mount({recovery:{blockers:["checkpoint_missing"]}});fireEvent.click(await slot.findByText("Developer"));fireEvent.click(await slot.findByText("Change provider or model"));
+ const wizard=within(await slot.findByRole("region",{name:"Change provider and model"}));
+ const recovery=await wizard.findByLabelText("Recover work from task and files instead of a ready checkpoint");fireEvent.click(recovery);await wizard.findByLabelText("Provider ID");
+ fireEvent.click(wizard.getByText("2. Check handoff readiness"));
+ const consent=await wizard.findByLabelText("I authorize this provider and model for this task under my account terms");expect(wizard.getByText(/recovery baseline with explicitly unknown progress/)).toBeTruthy();fireEvent.click(consent);fireEvent.click(wizard.getByText("3. Transfer work to selected model"));await wizard.findByText(/Work transferred/);
+ expect(calls.filter(c=>c.method==="roleControl"&&(c.input as {action:string}).action==="switch")[0]?.input).toMatchObject({recoverFromWorkspace:true,approveSelection:true});slot.lifecycle.unmount();
 });

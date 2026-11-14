@@ -1,0 +1,29 @@
+import { z } from "zod";
+import { executionFallbackSelectionSchema } from "./execution-policy";
+import type { TeamSnapshot } from "./snapshot";
+
+export const recoveryBlockerSchema=z.enum(["no_session","session_changed","no_task","task_reassigned","task_finished","busy","queue","background","interaction","lifecycle_owner","checkpoint_missing","checkpoint_stale","checkpoint_unavailable","replacement_pending","team_paused","resource_limit","model_unavailable","quota_exhausted","quota_unknown","state_unavailable"]);
+export type RecoveryBlocker=z.infer<typeof recoveryBlockerSchema>;
+export const recoveryViewSchema=z.object({
+ threadId:z.string().nullable(),taskId:z.union([z.string(),z.number()]).nullable(),taskTitle:z.string().nullable(),environmentId:z.string().nullable(),
+ actual:executionFallbackSelectionSchema.nullable(),revision:z.string(),blockers:z.array(recoveryBlockerSchema),
+ quota:z.enum(["available","exhausted","unknown"]),
+});
+export type RecoveryView=z.infer<typeof recoveryViewSchema>;
+export const manualExecutionApprovalSchema=z.object({taskId:z.union([z.string(),z.number()]),role:z.string(),selection:executionFallbackSelectionSchema,manual:z.literal(true)}).strict();
+
+export const RECOVERY_COPY:Record<"ru"|"en",Record<RecoveryBlocker,string>>={
+ ru:{lifecycle_owner:"Есть дочерние операции с привязкой к этой сессии. Требуется ручной разбор перед заменой.",no_session:"У сотрудника нет однозначно выбранной рабочей сессии.",session_changed:"Сессия изменилась. Обновите проверку.",no_task:"Нет связанной задачи для передачи. Сначала назначьте работу сотруднику.",task_reassigned:"Задача уже назначена другому сотруднику.",task_finished:"Задача завершена. Новую работу нужно назначить отдельно.",busy:"Сотрудник ещё выполняет операцию. Дождитесь её завершения и повторите проверку.",queue:"Есть отложенные сообщения. Откройте сотрудника и разберите очередь; сообщения не будут удалены автоматически.",background:"Есть фоновые операции. Дождитесь их завершения.",interaction:"Сотрудник ждёт ответа на вопрос или разрешение. Откройте его тред и ответьте.",checkpoint_missing:"Состояние работы ещё не сохранено. Если модель недоступна, дождитесь её восстановления или разберите работу вручную.",checkpoint_stale:"После сохранения работа изменилась. Нужна актуальная передача состояния; чистая новая ветка не создаётся.",checkpoint_unavailable:"Не удалось проверить сохранённую работу или окружение. Восстановите доступ и повторите проверку.",replacement_pending:"Предыдущее переключение не завершено. Сначала нужно восстановить его; второй агент не создаётся.",team_paused:"Автозапуск всей команды приостановлен. Продолжите команду перед передачей.",resource_limit:"Сначала разрешите ограничение работы Team в сводке команды. Смена модели не сбрасывает бюджет.",model_unavailable:"Выбранная модель или её параметры недоступны на рабочем хосте. Выберите другой вариант.",quota_exhausted:"У выбранного аккаунта закончилась квота. Другая модель того же сервиса её не восстановит.",quota_unknown:"Не удалось проверить квоту выбранной модели Ollama. Восстановите проверку либо выберите другой сервис.",state_unavailable:"Состояние команды сейчас недоступно. Обновите проверку; запуск не выполнялся."},
+ en:{lifecycle_owner:"Child operations are owned by this session. Inspect them before replacement.",no_session:"No unambiguous work session is available.",session_changed:"The session changed. Check again.",no_task:"No task is linked for handoff. Assign work first.",task_reassigned:"The task was assigned to another employee.",task_finished:"The task is finished. Assign new work separately.",busy:"An operation is running. Wait for it to finish, then check again.",queue:"Queued messages need inspection in the employee thread; none are removed automatically.",background:"Background operations are running. Wait for them to finish.",interaction:"The employee needs an answer or permission. Open the thread.",checkpoint_missing:"Work state has not been saved. If the model is unavailable, wait for recovery or inspect the work manually.",checkpoint_stale:"Work changed after the checkpoint. Save current state; no clean branch is created.",checkpoint_unavailable:"Work state or its environment could not be verified. Restore access and check again.",replacement_pending:"An earlier switch is unfinished. Recover it before creating another agent.",team_paused:"The team is paused. Resume it before handoff.",resource_limit:"Resolve the Team work limit in the team summary first; changing models cannot reset it.",model_unavailable:"The model or its options are unavailable on the work host. Choose another selection.",quota_exhausted:"The selected account quota is exhausted. Another model on the same service does not restore it.",quota_unknown:"Ollama quota could not be checked. Restore the check or choose another service.",state_unavailable:"Team state is unavailable. Check again; no work was started."},
+};
+
+export function teamRecoverySummary(snapshot:TeamSnapshot){
+ const tasks=snapshot.roles.flatMap(r=>r.tasks);
+ const active=snapshot.roles.filter(r=>r.threads.some(t=>["active","starting"].includes(t.status)));
+ const lead=snapshot.roles.find(r=>r.lead);
+ const current=tasks.find(t=>t.status==="review"&&!snapshot.roles.find(r=>r.name===t.role)?.lead)??tasks.find(t=>t.status==="in-progress"&&t.role!==lead?.name)??tasks.find(t=>t.status==="todo"&&t.role!==lead?.name)??null;
+ const match=snapshot.resources?.blocked?.match(/Task attempt limit reached \(task:([^:]+): (\d+)\/(\d+)\)/);
+ const coordination=lead?.tasks.find(t=>String(t.id)===match?.[1]&&["in-progress","review"].includes(t.status));
+ const modelProblem=snapshot.roles.find(r=>r.threads.some(t=>t.status==="error")||r.executionState?.kind==="error"&&!snapshot.resources?.blocked);
+ return {active,current,lead,coordination:coordination&&match?{task:coordination,used:Number(match[2]),limit:Number(match[3])}:null,modelProblem};
+}

@@ -1,3 +1,4 @@
+import {TeamRecoverySummary} from "./team-recovery-summary";
 import {OllamaQuotaCard} from "./continuation-controls";
 import {isOllamaCloud} from "./ollama-usage";
 import {useEffect,useState} from "react";
@@ -13,7 +14,7 @@ function stopLabel(reason:string,ru:boolean):string {
  return ru?"Новые ходы удерживаются. Откройте причину и выберите дальнейший подход.":"New turns are held. Inspect the cause and decide how to continue.";
 }
 /** Event-backed status; opening it calls neither a model nor an observer thread. */
-export function ResourcePanel({snapshot,language,onChanged}:{snapshot:TeamSnapshot;language:Language;onChanged:()=>Promise<void>}){
+export function ResourcePanel({snapshot,language,onChanged,onSelectRole}:{snapshot:TeamSnapshot;language:Language;onChanged:()=>Promise<void>;onSelectRole?:(role:string)=>void}){
  const rpc=useRpc<typeof rpcContract>(),navigate=useBbNavigate(),ru=language==="ru";
  const state=snapshot.resources;
  const [limits,setLimits]=useState({taskAttempts:"8",coordinationAttempts:"40",teamStarts:"100",tokens:"",minutes:""});
@@ -36,9 +37,12 @@ export function ResourcePanel({snapshot,language,onChanged}:{snapshot:TeamSnapsh
  const outcome:Record<string,string>=ru?{reserved:"зарезервировано",running:"выполняется",completed:"завершено",failed:"ошибка",interrupted:"прервано",unknown:"исход неизвестен",cancelled:"отменено"}:{};
  const tasks=snapshot.roles.flatMap(r=>r.tasks);
  const accepted=state.results?.accepted??tasks.filter(t=>t.status==="done").length,review=state.results?.review??tasks.filter(t=>t.status==="review").length;
- return <details className="rounded-md border border-border p-2 text-xs" open={!!state.blocked||Object.keys(state.holds).length>0}>
-  <summary>{ru?"Ресурсы и попытки":"Resources and attempts"}: {state.starts}/{state.policy.teamStarts} · {ru?"осталось":"remaining"} {state.remainingStarts}</summary>
-  <section aria-label={ru?"Контроль ресурсов команды":"Team resource control"} className="mt-2 flex flex-col gap-2">
+ return <section aria-label={ru?"Контроль ресурсов команды":"Team resource control"} className="flex flex-col gap-2">
+  <TeamRecoverySummary snapshot={snapshot} language={language} onChanged={onChanged} onSelectRole={onSelectRole}/>
+  <details className="rounded-md border border-border p-2 text-xs">
+  <summary>{ru?"Лимиты, квоты и история":"Limits, quotas and history"}</summary>
+  <div className="mt-2 flex flex-col gap-2">
+  <p>{ru?"Запуски команды":"Team starts"}: {state.starts}/{state.policy.teamStarts} · {ru?"осталось":"remaining"} {state.remainingStarts}</p>
    {snapshot.roles.some(r=>isOllamaCloud(r.provider??"",r.model))&&<OllamaQuotaCard projectId={snapshot.projectId} team={snapshot.team} language={language}/>}
    {state.blocked&&<><p role="alert">{stopLabel(state.blocked,ru)}</p><details><summary>{ru?"Техническая причина":"Technical cause"}</summary>{state.blocked}</details></>}
    <details><summary>{ru?"Что учитывается":"Accounting details"}</summary><p>{ru?"Учёт с":"Accounting since"} {new Date(state.sinceMs).toLocaleString()} · {ru?"Допуски запусков, включая зарезервированные; это не число внутренних запросов провайдера.":"Start admissions include reservations; these are not the provider's internal API calls."}</p>
@@ -46,7 +50,7 @@ export function ResourcePanel({snapshot,language,onChanged}:{snapshot:TeamSnapsh
    <p>{ru?`В текущем снимке: принято ${accepted}, на ревью ${review}. Отчёты и проверки — в задачах ниже.`:`Current snapshot: ${accepted} accepted, ${review} in review. Task reports and checks are below.`}</p>
    <p>{ru?"Результаты и основания читаются из трекера; перечисленные проверки — заявления исполнителя, а не автоматическое подтверждение качества.":"Results and grounds come from the tracker; listed checks are the executor’s claims, not automatic quality verification."}</p>
    </details>
-   <details><summary>{ru?"Учёт по задачам":"Per-task accounting"}</summary>{state.taskCounts.map(t=><p key={`${t.taskId}:${t.role}`}>#{t.taskId??"—"} · {t.role} · {ru?"допусков":"admissions"} {t.starts} · {ru?"возвратов":"returns"} {t.returns}{t.taskId!==null?` · ${t.starts+t.returns}/${snapshot.roles.find(r=>r.name===t.role)?.lead?(state.policy.coordinationAttempts??state.policy.taskAttempts):state.policy.taskAttempts}`:""}</p>)}
+   <details><summary>{ru?"Учёт по задачам":"Per-task accounting"}</summary>{state.taskCounts.map(t=><p key={`${t.taskId}:${t.role}`}>#{t.taskId??"—"} · {t.role} · {ru?"допусков":"admissions"} {t.starts} · {ru?"возвратов":"returns"} {t.returns}{t.taskId!==null?` · ${t.starts+t.returns}/${state.taskLimits?.[`task:${t.taskId}`]??(snapshot.roles.find(r=>r.name===t.role)?.lead?(state.policy.coordinationAttempts??state.policy.taskAttempts):state.policy.taskAttempts)}`:""}</p>)}
    </details>
    <details><summary>{ru?"Завершённые задачи и основания приёмки":"Completed tasks and acceptance grounds"}</summary>{state.results?.recent.map(task=><div key={task.id} className="rounded border border-border p-2">#{task.id} {task.title}: {task.result??(ru?"результат не указан":"no result recorded")}<br/>{ru?"Основание приёмки":"Acceptance grounds"}: {task.acceptanceReason??"—"}<ul>{task.checks.map((check,i)=><li key={i}>{check.what}: {check.result??`N/A: ${check.notApplicable}`}</li>)}</ul></div>)}
    </details>
@@ -65,6 +69,7 @@ export function ResourcePanel({snapshot,language,onChanged}:{snapshot:TeamSnapsh
    {state.quotaBlocks.map((q,i)=><p key={i}>{ru?"Исключённый пул квоты":"Excluded quota pool"}: {q.provider} · {q.hostId??"?"} · {q.resetAtMs?new Date(q.resetAtMs).toLocaleString():(ru?"reset неизвестен; нужна проверка":"reset unknown; inspection required")}</p>)}
    {state.fallbacks.map(f=><p key={f.requestId}>{ru?"Замена после квоты":"Quota handoff"} · #{f.taskId??"—"} · {f.stage} · {f.selection?`${f.selection.provider}/${f.selection.model}`:"—"} · {f.reason}{f.newThreadId&&` → ${f.newThreadId}`}</p>)}
    <details><summary>{ru?"Последние 100 допусков запусков":"Last 100 start admissions"}</summary><ul className="flex flex-col gap-1">{state.attempts.map(a=><li key={a.id}>#{a.taskId??"—"} · {a.role} · <button onClick={()=>navigate.toThread(a.threadId)} className="underline">{a.threadId}</button> · {a.provider} / {a.model??(ru?"модель неизвестна":"model unknown")} · {outcome[a.outcome]??a.outcome} · {new Date(a.atMs).toLocaleString()} → {a.endedAtMs?new Date(a.endedAtMs).toLocaleString():"—"} · {a.tokens??"?"} tokens{a.reason&&` · ${a.reason}`}</li>)}</ul></details>
-  </section>
- </details>;
+  </div>
+ </details>
+ </section>;
 }
