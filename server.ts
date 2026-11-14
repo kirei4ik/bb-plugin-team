@@ -433,7 +433,7 @@ export const rpcContract = defineRpcContract({
     output: z.object({ role: z.string(), threadId: z.string().nullable() }),
   },
   rolePolicy: {
-    input:z.object({projectId:projectIdSchema,team:teamSchema,role:z.string(),primary:templateRoleSchema.pick({provider:true,model:true,reasoningLevel:true,serviceTier:true}).strict().optional(),policy:executionPolicySchema.nullable().optional(),expectedRevision:z.string().optional()}).strict(),
+    input:z.object({projectId:projectIdSchema,team:teamSchema,role:z.string(),primary:templateRoleSchema.pick({provider:true,model:true,reasoningLevel:true,serviceTier:true}).strict().optional(),policy:executionPolicySchema.nullable().optional(),expectedRevision:z.string().optional(),futureOnly:z.boolean().optional(),expectedThreadId:z.string().optional()}).strict(),
     output:z.object({role:templateRoleSchema,source:z.string(),revision:z.string()}),
   },
   ollamaUsage: {
@@ -1692,7 +1692,7 @@ export default async function plugin(bb: BbPluginApi) {
           return;
         }
       }
-      if (await readPause(scope) || await isRolePaused(scope,role)) return; // resume() retries
+      if (await readPause(scope) || await isRolePaused(scope,role) || (await resources.inspect(scope)).blocked) return; // an explicit decision/resume retries
       // A substantive checkpoint must come from the agent. Missing or stale →
       // explicit wait plus a notification; never a fabricated checkpoint.
       const ref = await bb.storage.kv.get<{taskId: TaskId}>(checkpointRefKey(scope, role));
@@ -1881,8 +1881,10 @@ export default async function plugin(bb: BbPluginApi) {
     return true;
   };
 
-  // Restart safety: advance durable auto-continue requests that survived a
-  // plugin restart; their event triggers may have fired while it was down.
+  // Host RPC is unavailable during factory registration. Restore once only
+  // after startup; keep the SDK service alive until disposal (no polling).
+  bb.background.service("restore-auto-continuation",{async start(signal){
+    if(signal.aborted)return;
   try {
     const { t } = await loadLang();
     for (const key of await bb.storage.kv.list("auto-continue:")) {
@@ -1899,6 +1901,9 @@ export default async function plugin(bb: BbPluginApi) {
   } catch (error) {
     bb.log.warn(`auto-continue restore failed: ${(error as Error).message}`);
   }
+
+    if(!signal.aborted)await new Promise<void>(resolve=>signal.addEventListener("abort",()=>resolve(),{once:true}));
+  }});
 
   const taskOutput = (
     result: { task: TeamTask; previous: TeamTask; busy: TeamTask[] },
@@ -2336,9 +2341,13 @@ export default async function plugin(bb: BbPluginApi) {
       const actualParsed=executionPolicySchema.shape.fallbacks.element.safeParse(actualMeta.teamExecution);
       const actual=actualParsed.success?actualParsed.data:undefined;
       const quotaOwner=isOllamaCloud(actual?.provider??role.provider??"",actual?.model??role.model)&&role.threads[0]?await resourceOwner(role.threads[0].threadId):null;
-      const resourceReason=resourceSummary.blocked??resourceSummary.holds[task?`task:${task.id}`:`role:${role.name}`]??(quotaOwner?.hostId===scope.hostId&&exhaustedOllama(resourceSummary.ollamaUsage)?"Ollama Cloud account quota exhausted; refresh quota after reset or choose an approved independent model":null);
+      const sharedHold=resourceSummary.blocked;
+      const ownsSharedHold=!!sharedHold&&(role.tasks.some(t=>sharedHold.includes(`(task:${t.id}:`))||role.lead&&!sharedHold.includes("(task:"));
+      const resourceReason=resourceSummary.holds[task?`task:${task.id}`:`role:${role.name}`]??(ownsSharedHold?sharedHold:null)??(quotaOwner?.hostId===scope.hostId&&exhaustedOllama(resourceSummary.ollamaUsage)?"Ollama Cloud account quota exhausted; refresh quota after reset or choose an approved independent model":null);
       if(!active&&resourceReason&&executionState?.kind!=="error")executionState={kind:"error",taskId:task?.id??null,errorCode:"resource_hold",errorMessage:resourceReason,safeAction:"Inspect Team resources and record a concrete decision; replacing the session cannot reset the budget",atMs:Date.now()};
-      withExecutionState.push(executionState ? {...role, executionState} : role);
+      if(!active&&sharedHold&&!ownsSharedHold&&!resourceReason&&executionState?.kind!=="error"&&executionState?.kind!=="awaiting-acceptance")executionState={kind:"awaiting-team-decision",taskId:task?.id??null,errorCode:null,safeAction:null,atMs:Date.now()};
+      const presented={...role,threads:role.threads.map(thread=>({...thread,...(actual&&actual.provider===thread.provider?{model:actual.model}:{} )}))};
+      withExecutionState.push(executionState ? {...presented, executionState} : presented);
     }
     return {
       projectId: scope.projectId,
@@ -3018,7 +3027,7 @@ export default async function plugin(bb: BbPluginApi) {
       const result = await addRole(scope, { ...role, threadId }, lang, t, m, true);
       return { role: result.role, threadId: result.threadId };
     },
-    async rolePolicy({projectId,team,role:roleName,primary,policy,expectedRevision}) {
+    async rolePolicy({projectId,team,role:roleName,primary,policy,expectedRevision,futureOnly,expectedThreadId}) {
       const {t}=await loadLang(); const scope=await scopeFor(projectId,team,t);
       return withScopeLock(scope,async()=>{
         const loaded=await readTeamConfig(bb,scope,team,t);
@@ -3029,6 +3038,10 @@ export default async function plugin(bb: BbPluginApi) {
         if(!role) throw new PluginCliError("Role is not in the team config",{code:"not_found"});
         if(policy===undefined && primary===undefined) return {role,source:loaded.source,revision};
         if(expectedRevision!==revision) throw new PluginCliError("Team config changed; reopen the profile before saving",{code:"conflict"});
+        if(futureOnly){
+          const {rows}=await teamContext(scope,t);const current=rows.get(roleName)??[];
+          if(current.length!==1||current[0]!.threadId!==expectedThreadId||busyTasks(await readTasks(scope),roleName).length)throw new experimental_PluginRpcRefusal({code:"conflict",message:"Work started or session changed; reopen the recovery flow"});
+        }
         const parsed=(loaded.source.endsWith(".json")?JSON.parse(raw):loadYaml(raw)) as {roles:Array<Record<string,unknown>>};
         const entry=parsed.roles.find(r=>r.name===roleName)!;
         if(primary!==undefined) for(const key of ["provider","model","reasoningLevel","serviceTier"] as const) {
@@ -3037,6 +3050,14 @@ export default async function plugin(bb: BbPluginApi) {
         if(policy===null) delete entry.executionPolicy; else if(policy!==undefined) entry.executionPolicy=policy;
         const next=loaded.source.endsWith(".json")?`${JSON.stringify(parsed,null,2)}\n`:dumpYaml(parsed,{lineWidth:120,noRefs:true});
         core.parseTeamConfig(next,loaded.source,t);
+        if(primary!==undefined&&role.provider&&role.model){
+          const {rows}=await teamContext(scope,t);
+          const current=rows.get(roleName)??[];
+          if(current.length===1){
+            const meta=await bb.sdk.threads.getPluginMetadata({threadId:current[0]!.threadId}) as {teamExecution?:unknown};
+            if(meta.teamExecution===undefined)await bb.sdk.threads.updatePluginMetadata({threadId:current[0]!.threadId,set:{teamExecution:{provider:role.provider,model:role.model,...(role.reasoningLevel?{reasoningLevel:role.reasoningLevel}:{}),...(role.serviceTier?{serviceTier:role.serviceTier}:{})},teamConfiguredExecution:JSON.stringify([role.provider,role.model,role.reasoningLevel,role.serviceTier])}});
+          }
+        }
         await writeWorkspaceFile(bb,scope,loaded.source,next);publishChange(projectId);
         const updated=core.parseTeamConfig(next,loaded.source,t).roles.find(r=>r.name===roleName)!;
         return {role:updated,source:loaded.source,revision:createHash("sha256").update(next).digest("hex")};

@@ -326,3 +326,13 @@ of trimming. The new model first inventories work, saves a substantive checkpoin
 and asks about unverifiable external effects. It does not call the exhausted
 model or treat the old output as a checkpoint. Busy/queued/uncertain operations,
 missing environment access and Team limits are never bypassed by this option.
+
+
+When there is no unfinished task, the same recovery flow saves a future primary
+through the existing revision-checked role profile API, without restarting or
+changing the current session. It refuses if work started while the form was
+open. Actual current model metadata remains separate from the future profile.
+Startup restoration now runs through the SDK background lifecycle after factory
+registration, not before host RPC is available; no polling or observer model.
+A global Team hold does not trigger checkpoint requests/cold replacement sessions,
+and a worker's submitted review remains awaiting acceptance rather than an error.

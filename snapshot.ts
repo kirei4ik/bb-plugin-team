@@ -31,6 +31,7 @@ export interface TeamTask {
 }
 
 export interface SnapshotThread {
+  model?:string;
   threadId: string;
   status: string;
   provider: string;
@@ -99,6 +100,7 @@ export type ExecutionStateKind =
   /** The session executes an open package (or the thread is running). */
   | "working"
   /** Package in review: waits for the lead (or a human) decision. */
+  | "awaiting-team-decision"
   | "awaiting-acceptance"
   /** Accepted package consumed the session; the agent must save its checkpoint. */
   | "awaiting-checkpoint"

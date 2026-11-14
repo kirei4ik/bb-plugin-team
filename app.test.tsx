@@ -977,7 +977,7 @@ it("changes provider through one recovery flow without preconfiguring fallback m
  await wizard.findByText(/Work transferred/);
  const switches=calls.filter(c=>c.method==="roleControl"&&(c.input as {action:string}).action==="switch");expect(switches).toHaveLength(1);expect(switches[0]?.input).toMatchObject({approveSelection:true,expectedThreadId:"thr_d",expectedRecoveryRevision:"preview-1",selection:{provider:"pi",model:"qwen3",reasoningLevel:"low"}});
  fireEvent.click(wizard.getByText("Continue work on selected model"));await wizard.findByText(/Continuation requested/);
- expect(calls.filter(c=>c.method==="roleControl").at(-1)?.input).toMatchObject({action:"resume",expectedThreadId:"thr_changed"});expect(calls.some(c=>c.method==="rolePolicy")).toBe(false);slot.lifecycle.unmount();
+ expect(calls.filter(c=>c.method==="roleControl").at(-1)?.input).toMatchObject({action:"resume",expectedThreadId:"thr_changed"});expect(calls.some(c=>c.method==="rolePolicy"&&!!(c.input as {primary?:unknown}).primary)).toBe(false);slot.lifecycle.unmount();
 });
 it("recovery explains missing work state and never offers a blind transfer",async()=>{
  const {slot,calls}=await mount({recovery:{blockers:["checkpoint_missing","queue"]}});fireEvent.click(await slot.findByText("Developer"));fireEvent.click(await slot.findByText("Change provider or model"));
@@ -1000,4 +1000,13 @@ it("offers explicit task-and-files recovery without claiming prior progress is v
  fireEvent.click(wizard.getByText("2. Check handoff readiness"));
  const consent=await wizard.findByLabelText("I authorize this provider and model for this task under my account terms");expect(wizard.getByText(/recovery baseline with explicitly unknown progress/)).toBeTruthy();fireEvent.click(consent);fireEvent.click(wizard.getByText("3. Transfer work to selected model"));await wizard.findByText(/Work transferred/);
  expect(calls.filter(c=>c.method==="roleControl"&&(c.input as {action:string}).action==="switch")[0]?.input).toMatchObject({recoverFromWorkspace:true,approveSelection:true});slot.lifecycle.unmount();
+});
+
+it("a completed-task employee can save a provider/model for future work without a handoff",async()=>{
+ const {slot,calls}=await mount({recovery:{blockers:["task_finished"]}});fireEvent.click(await slot.findByText("Developer"));fireEvent.click(await slot.findByText("Change provider or model"));
+ const wizard=within(await slot.findByRole("region",{name:"Change provider and model"}));
+ const consent=await wizard.findByLabelText("I authorize this model for the employee’s future tasks");expect(wizard.getByText(/No unfinished task needs handoff/)).toBeTruthy();await wizard.findByLabelText("Model");
+ fireEvent.click(consent);fireEvent.click(wizard.getByText("Save model for future tasks"));await wizard.findByText(/Model saved for future tasks/);
+ expect(calls.filter(c=>c.method==="rolePolicy").at(-1)?.input).toMatchObject({expectedRevision:"rev-1",primary:{provider:"codex",model:"gpt-4"}});
+ expect(calls.filter(c=>c.method==="roleControl"&&(c.input as {action:string}).action!=="status")).toHaveLength(0);slot.lifecycle.unmount();
 });

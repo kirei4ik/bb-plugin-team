@@ -62,6 +62,7 @@ interface Fixture {
   writeAfterCheckpoint: () => Promise<void>;
   asCli: (args:string[],threadId:string) => Promise<{exitCode:number;stdout:string;stderr:string}>;
   spawnSelections: Array<{providerId:unknown;model:unknown;environment:unknown}>;
+  restore:()=>{stop:()=>Promise<void>};
   dispose: () => Promise<void>;
 }
 
@@ -165,6 +166,7 @@ async function setup(opts: { spawnFailures?: number; fallbacks?:ExecutionFallbac
           ],
         },
         files: {
+          write:async({path,content}:{path:string;content:string})=>{await writeFile(path,content);return {outcome:"written",sha256:"unused",sizeBytes:content.length};},
           read: async ({ path }: { path: string }) => ({ content: await readFile(path, "utf8"), sha256: "unused" }),
           list: async ({ path }: { path: string }) => ({ files: (await readdir(path)).map((name) => ({ name, path: name })), truncated: false }),
         },
@@ -258,6 +260,7 @@ async function setup(opts: { spawnFailures?: number; fallbacks?:ExecutionFallbac
       control:input=>harness!.behavior.callRpc("roleControl",{projectId:"proj_flow",team:"main",role:"dev",...input}) as never,
       doctor:()=>harness!.behavior.runCli(["doctor","--project","flow","--json"]),
       setQueued:(id,value)=>{if(value)queued.set(id,[{type:"text",text:"Original queued work",mentions:[]}]);else queued.delete(id);},
+      restore:()=>{const service=harness!.behavior.runService("restore-auto-continuation");return {stop:async()=>{service.controller.abort();await service.done;}};},
       spawnSelections,
       resources:()=>harness!.behavior.callRpc("resources",{projectId:"proj_flow",team:"main"}) as Promise<ResourceSummary>,
       quota:async(requestId="quota-1",inputAccepted=false,uncovered=false)=>{
@@ -1171,5 +1174,48 @@ it("a manual model choice expires after the task instead of becoming a new perma
   await f.control({action:"resume",expectedThreadId:switched.threadId});await f.emitIdle(switched.threadId!);await f.cli(["checkpoint","1","--file","checkpoint.json"]);
   await f.cli(["task","done","1","--reason","Manually inspected the completed work"]);await f.cli(["task","add","dev","Second","--send"]);
   expect(f.spawnSelections).toHaveLength(2);expect(f.spawnSelections[1]?.providerId).not.toBe("opencode2");
+ }finally{await f.dispose();}
+});
+
+it("startup restoration runs as an SDK service after registration",async()=>{
+ const f=await setup();let service:ReturnType<Fixture["restore"]>|undefined;try{
+  await f.cli(["task","add","dev","Profile","--send"]);
+  await f.setKv("auto-continue:proj_flow:main:dev",{taskId:1,reason:"context",originThreadId:"thr_dev",stage:"awaiting-safe-boundary",errorCode:null,error:null,notifiedStage:null,requestedAtMs:Date.now(),updatedAtMs:Date.now()});
+  expect(f.spawnCount()).toBe(0);service=f.restore();
+  await expect.poll(async()=>((await f.kv("auto-continue:proj_flow:main:dev")) as {stage:string}).stage).toBe("awaiting-checkpoint");expect(f.spawnCount()).toBe(0);
+ }finally{await service?.stop();await f.dispose();}
+});
+it("future primary model changes retain the actual current session model and do not restart it",async()=>{
+ const f=await setup({fallbacks:[{provider:"opencode2",model:"approved/free"}]});try{
+  const profile=await f.rpc("rolePolicy",{projectId:"proj_flow",team:"main",role:"dev"}) as {revision:string};
+  await f.rpc("rolePolicy",{projectId:"proj_flow",team:"main",role:"dev",expectedRevision:profile.revision,primary:{provider:"opencode2",model:"approved/free",reasoningLevel:"low"}});
+  const current=await f.control({action:"status"}) as {actual?:{provider:string;model:string}};expect(current.actual).toMatchObject({provider:"pi",model:"ollama-cloud/original"});expect(f.spawnCount()).toBe(0);
+  const saved=await f.rpc("rolePolicy",{projectId:"proj_flow",team:"main",role:"dev"}) as {role:{provider:string}};expect(saved.role.provider).toBe("opencode2");
+ }finally{await f.dispose();}
+});
+
+it("future-only profile editing refuses when unfinished work appeared",async()=>{
+ const f=await setup();try{
+  const profile=await f.rpc("rolePolicy",{projectId:"proj_flow",team:"main",role:"dev"}) as {revision:string};
+  await f.cli(["task","add","dev","Started after the form opened","--send"]);
+  await expect(f.rpc("rolePolicy",{projectId:"proj_flow",team:"main",role:"dev",expectedRevision:profile.revision,futureOnly:true,expectedThreadId:"thr_dev",primary:{provider:"opencode2",model:"approved/free"}})).rejects.toThrow(/Work started/);expect(f.spawnCount()).toBe(0);
+ }finally{await f.dispose();}
+});
+
+it("budget-held auto continuation does not ask a model for a checkpoint or create a cold session",async()=>{
+ const f=await setup();try{
+  await f.cli(["task","add","dev","Profile","--send"]);
+  await f.rpc("resources",{projectId:"proj_flow",team:"main",reason:"One start",policy:{taskAttempts:8,teamStarts:1,tokens:null,minutes:null}});
+  await f.startAttempt("thr_dev","one");await f.emitIdle("thr_dev");
+  await f.setKv("auto-continue:proj_flow:main:dev",{taskId:1,reason:"context",originThreadId:"thr_dev",stage:"awaiting-safe-boundary",errorCode:null,error:null,notifiedStage:null,requestedAtMs:Date.now(),updatedAtMs:Date.now()});
+  const sent=f.sent.length;await f.emitIdle("thr_dev");expect(f.sent).toHaveLength(sent);expect(f.spawnCount()).toBe(0);
+ }finally{await f.dispose();}
+});
+
+it("a lead coordination hold does not falsely turn a worker's submitted review into an execution error",async()=>{
+ const f=await setup();try{
+  await f.cli(["task","add","lead","Coordinate","--send"]);await f.cli(["task","add","dev","Profile","--send"]);await f.cli(["task","update","2","--status","review"]);
+  await f.rpc("resources",{projectId:"proj_flow",team:"main",reason:"Finite coordination",policy:{taskAttempts:8,coordinationAttempts:1,teamStarts:100,tokens:null,minutes:null}});await f.startAttempt("thr_lead","one");await f.emitIdle("thr_lead");
+  expect((await f.snapshotRole("lead")).executionState).toMatchObject({kind:"error",errorCode:"resource_hold"});expect((await f.snapshotRole("dev")).executionState).toMatchObject({kind:"awaiting-acceptance"});
  }finally{await f.dispose();}
 });

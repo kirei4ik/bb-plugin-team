@@ -50,6 +50,7 @@ import { builtinPrompt, type TeamTemplate, type TemplateRole } from "./templates
 const EXECUTION_LABELS: Record<Language, Record<RoleExecutionState["kind"], string>> = {
   en: {
     working: "Working",
+    "awaiting-team-decision": "Waiting for a team decision",
     "awaiting-acceptance": "Awaiting acceptance or decision",
     "awaiting-checkpoint": "Awaiting saved checkpoint",
     "awaiting-safe-boundary": "Waiting for operations to finish",
@@ -59,6 +60,7 @@ const EXECUTION_LABELS: Record<Language, Record<RoleExecutionState["kind"], stri
   },
   ru: {
     working: "Работает",
+    "awaiting-team-decision": "Ждёт решения по команде",
     "awaiting-acceptance": "Ждёт приёмки или решения",
     "awaiting-checkpoint": "Ждёт сохранения состояния",
     "awaiting-safe-boundary": "Ждёт окончания операций",
@@ -1252,6 +1254,7 @@ function TeamBlock({
     const tone: StatusTone = thread ? statusTone(thread.status) : "missing";
     const status = thread ? l.threadStatus[thread.status] ?? thread.status : l.missing;
     const provider = thread?.provider ?? role.provider ?? labels.defaultProvider;
+    const actualModel=thread?.model??(thread?.provider===role.provider?role.model:null);
     const broken =
       !role.lead && thread && leadThread && thread.parentThreadId !== leadThread ? labels.notUnderLead : undefined;
     return (
@@ -1261,7 +1264,7 @@ function TeamBlock({
           last={last && role.helpers.length === 0}
           tone={tone}
           title={role.title}
-          meta={`${role.name} · ${provider}${role.model ? ` · ${role.model}` : ""} · ${status}${
+          meta={`${role.name} · ${provider}${actualModel ? ` · ${actualModel}` : ""} · ${status}${
             thread ? ` · ${relativeAgo(thread.updatedAtMs, nowMs)}` : ""
           }`}
           warn={broken}
@@ -1631,7 +1634,7 @@ function RoleDetails({
       </div>
       <div className="flex flex-col gap-1 text-xs">
         <span className="text-muted-foreground">
-          {labels.provider}: <span className="text-foreground">{role.threads[0]?.provider ?? role.provider ?? labels.defaultProvider}</span>
+          {language==="ru"?"Профиль для следующих задач":"Profile for future tasks"}: <span className="text-foreground">{role.provider ?? labels.defaultProvider}</span>
           {role.model ? ` · ${role.model}` : ""}
         </span>
         {role.threads.map((thread) => (
