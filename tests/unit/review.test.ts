@@ -317,3 +317,15 @@ describe("acceptance gate: return from review", () => {
     expect(REVIEW_RECORD_MAX_BYTES).toBe(65536);
   });
 });
+
+it("decision-only review omits missing submission and stays JSON-safe",()=>{
+ const decision={decision:"accept",reason:"Manual inspection of existing result",decidedBy:"manual",basis:"manual",atMs:NOW};
+ const normalized=normalizeReviewRecord({decisions:[decision]})!;
+ expect(Object.hasOwn(normalized,"submission")).toBe(false);
+ expect(normalized).toEqual(JSON.parse(JSON.stringify(normalized)));
+ expect(normalized.decisions).toEqual([decision]);
+ const merged=mergeReviewRecord(undefined,{decision});
+ expect(Object.hasOwn(merged,"submission")).toBe(false);
+ expect(merged).toEqual(normalized);
+ expect(normalizeReviewRecord({submission:{invalid:true},decisions:[decision]})).toEqual(normalized);
+});

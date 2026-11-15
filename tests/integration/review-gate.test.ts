@@ -332,3 +332,23 @@ describe("verifiable acceptance flow (bbt-iwi.2)", () => {
     expect(foreign.stderr).toContain("only the lead accepts");
   });
 });
+
+it("tree RPC accepts a task with a manual decision and no submission", async()=>{
+ const {bb,harness}=makeHost(THREADS.filter(t=>!t.team&&!t.projectId));
+ try{
+  await plugin(bb);
+  const added=await harness.behavior.runCli(["task","add","tester","Manual result","--project","demo","--team","main"]);
+  expect(added.exitCode,added.stderr).toBe(0);
+  const accepted=await harness.behavior.runCli(["task","done","1","--reason","Inspected the result manually","--project","demo","--team","main"]);
+  expect(accepted.exitCode,accepted.stderr).toBe(0);
+  const tree=await harness.behavior.callRpc("tree",{projectId:"proj_1"}) as {snapshots:Array<{roles:Array<{tasks:Array<{review?:{submission?:unknown;decisions:unknown[]}}>}>}>};
+  // Closed tasks are available through taskList; seed the decision-only record
+  // onto an open task so the tree exercises the same shape as the incident.
+  const [task]=await listTasks(harness);
+  await harness.behavior.runCli(["task","update","1","--status","todo","--project","demo","--team","main"]);
+  const openTree=await harness.behavior.callRpc("tree",{projectId:"proj_1"}) as typeof tree;
+  const projected=openTree.snapshots.flatMap(s=>s.roles.flatMap(r=>r.tasks)).find(t=>t.review)!;
+  expect(projected.review?.decisions).toEqual(task.review?.decisions);
+  expect(Object.hasOwn(projected.review!,"submission")).toBe(false);
+ }finally{await harness.lifecycle.dispose();}
+});

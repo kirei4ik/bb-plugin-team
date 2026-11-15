@@ -732,6 +732,17 @@ describe("task tracker", () => {
       expect(store.tasks[0]!.checkpoint).toBeUndefined();
     });
 
+    it("projects decision-only Beads metadata without an undefined submission",async()=>{
+      const scope=scopeOf(workspaceOf("p1",repo),"manual-review");
+      const task=await tracker.add(scope,{role:"dev",title:"Manual review",note:null,status:"todo"});
+      const decision={decision:"accept" as const,reason:"Inspected the result",decidedBy:"manual" as const,basis:"manual" as const,atMs:1};
+      await tracker.review(scope,task.id,{decision});
+      const projected=(await tracker.read(scope)).tasks.find(t=>t.id===task.id)!;
+      expect(projected.review?.decisions).toEqual([decision]);
+      expect(Object.hasOwn(projected.review!,"submission")).toBe(false);
+      expect(projected).toEqual(JSON.parse(JSON.stringify(projected)));
+    });
+
     it("remove deletes the issue and reports it", async () => {
       const workspace = workspaceOf("p1", repo);
       const scope = scopeOf(workspace, "epsilon");

@@ -138,7 +138,7 @@ export function normalizeReviewRecord(raw: unknown): TaskReviewRecord | undefine
         .map((parsed) => parsed.data as AcceptanceDecision)
     : [];
   if (!submission && decisions.length === 0) return undefined;
-  return { version: 1, submission, decisions };
+  return { version: 1, ...(submission ? { submission } : {}), decisions };
 }
 
 /** Serialize the record; throws when it cannot fit a tracker row/metadata. */
@@ -182,7 +182,7 @@ export function mergeReviewRecord(
       );
     }
   }
-  const record: TaskReviewRecord = { version: 1, submission, decisions };
+  const record: TaskReviewRecord = { version: 1, ...(submission ? { submission } : {}), decisions };
   const bytes = reviewRecordBytes(record);
   if (bytes > REVIEW_RECORD_MAX_BYTES) {
     throw new Error(
