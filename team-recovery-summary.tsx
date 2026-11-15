@@ -31,9 +31,11 @@ export function TeamRecoverySummary({snapshot,language,onChanged,onSelectRole}:{
   </> }
   {routerRows.length>0&&<div className="flex flex-col gap-1">
    {routerRows.filter((row,index)=>!row.usage.keyId||routerRows.findIndex(other=>other.usage.keyId===row.usage.keyId)===index).map(({role,usage})=>{
-     const names=routerRows.filter(r=>usage.keyId?r.usage.keyId===usage.keyId:r.role?.name===role?.name).map(r=>r.role?.title??"?").join(", ");
-     return <p key={role?.name}>OpenRouter · {names}: {usage.status!=="ready"?(ru?"свежая квота не подтверждена; ":"fresh quota unconfirmed; "):""}{usage.freeDaily?`${ru?"бесплатных запросов осталось":"free requests remaining"} ${usage.freeDaily.remaining}/${usage.freeDaily.limit}`:(ru?"суточный остаток не сообщён":"daily balance not reported")}{usage.keyRemainingUsd!==null?` · ${ru?"лимит ключа":"key cap"} $${usage.keyRemainingUsd}`:""}. {ru?"Одинаковый ключ используется совместно; разные ключи могут относиться к одному аккаунту.":"The same key is shared; different keys may belong to one account."}</p>;
+     const members=routerRows.filter(r=>usage.keyId?r.usage.keyId===usage.keyId:r.role?.name===role?.name);
+     const names=members.slice(0,3).map(r=>r.role?.title??"?").join(", ")+(members.length>3?` +${members.length-3}`:"");
+     return <p className="text-xs" key={role?.name}>OpenRouter · {names}: {usage.status!=="ready"?(ru?"остаток не подтверждён":"balance unconfirmed"):""}{usage.freeDaily?`${usage.status!=="ready"?" · ":""}${ru?"бесплатных запросов осталось":"free requests remaining"} ${usage.freeDaily.remaining}/${usage.freeDaily.limit}`:usage.status==="ready"?(ru?"суточный остаток не сообщён":"daily balance not reported"):""}{usage.keyRemainingUsd!==null?` · ${ru?"лимит ключа":"key cap"} $${Number(usage.keyRemainingUsd.toFixed(4))}`:""}</p>;
    })}
+   <p className="text-xs text-muted-foreground">{ru?"Один ключ — общая квота. Разные ключи могут принадлежать одному аккаунту.":"One key shares a quota; different keys may belong to one account."}</p>
    {routerHeld.length>0&&<><p>{ru?"Новые ходы затронутых сотрудников удерживаются. Выберите продолжение позже или независимый сервис; смена агента OpenRouter квоту не обновляет.":"Affected employees' new turns are held. Schedule later or select an independent service; changing the OpenRouter agent does not reset quota."}</p><div className="flex flex-wrap gap-2">{routerHeld.map(({role})=>role&&<button key={role.name} onClick={()=>onSelectRole?.(role.name)}>{ru?"Настроить продолжение":"Set continuation"}: {role.title}</button>)}</div></>}
   </div>}
   {view.active.length>0&&<p>{ru?"Сейчас работают":"Working now"}: {view.active.map(r=>r.title).join(", ")}. {ru?"Их операции не прерываются.":"Their operations are not interrupted."}</p>}
