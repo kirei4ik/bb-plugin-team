@@ -15,12 +15,12 @@
         "team": "./assets/team.svg"
       }
     },
-    "server": "./server.ts",
-    "host": "./host.ts",
+    "server": "./src/server/server.ts",
+    "host": "./src/host/host.ts",
     "skills": [
       "skills"
     ],
-    "app": "./app.tsx"
+    "app": "./src/app/app.tsx"
   },
   "dependencies": {
     "js-yaml": "^4.1.0",

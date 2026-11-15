@@ -6,6 +6,8 @@ back to it. Several teams per project, created from templates.
 
 Русская версия: [README.ru.md](README.ru.md).
 
+Development: [source layout and checks](docs/STRUCTURE.md).
+
 ## Install
 
 ```bash
@@ -224,7 +226,7 @@ sending a message to the role manually. `resume` also rechecks queued readiness
 after external dependency changes.
 
 See [README.ru.md](README.ru.md) for a complete checkpoint example.
-`npx vitest run acceptance.test.ts` exercises real temporary Git worktrees and
+`npx vitest run tests/integration/acceptance.test.ts` exercises real temporary Git worktrees and
 Beads without model calls; BB threads are SDK fixtures, so this does not verify
 the installed server's live UI/provider behavior.
 

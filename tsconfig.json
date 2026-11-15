@@ -13,7 +13,7 @@
     ],
     "paths": {
       "@/*": [
-        "./*"
+        "./src/*"
       ]
     },
     "noEmit": true,
@@ -21,20 +21,7 @@
     "jsx": "react-jsx"
   },
   "include": [
-    "server.ts",
-    "host.ts",
-    "host-contract.ts",
-    "tracker.ts",
-    "checkpoint.ts",
-    "sessions.ts",
-    "app.tsx",
-    "core.ts",
-    "execution-policy.ts",
-    "strings.ts",
-    "snapshot.ts",
-    "tasks.ts",
-    "report.ts",
-    "messages.ts",
-    "templates.ts"
+    "src/**/*.ts",
+    "src/**/*.tsx"
   ]
 }
