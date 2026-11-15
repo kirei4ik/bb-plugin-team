@@ -246,6 +246,11 @@ async function mount(
           snapshots = [SNAPSHOT];
           return { team: "main", spawned: 4, leadThreadId: "thr_l" };
         },
+        bindingRepair: (input:unknown) => {
+          log("bindingRepair")(input);
+          snapshots = snapshots.map(s => ({...s,bindingIssues:[]}));
+          return {repaired:true};
+        },
         teamSpawn: (input: unknown) => {
           log("teamSpawn")(input);
           return { spawned: 1 };
@@ -465,6 +470,17 @@ describe("панель Team: дерево команд", () => {
     fireEvent.click(slot.getByText("Add"));
     await slot.findByText('Role "junior" added.');
     expect((calls.filter((c) => c.method === "roleAdd")[1]!.input as { threadId: string }).threadId).toBe("thr_free");
+    slot.lifecycle.unmount();
+  });
+
+  it("восстановление привязки не создаёт сотрудника и объясняет паузу", async () => {
+    const {slot,calls} = await mount({language:"ru",snapshots:[{...QA,bindingIssues:[{role:"tester",currentThreadId:"old",candidates:["fresh"],state:"repairable"}]}]});
+    await slot.findByText("Команда требует восстановления сессий");
+    expect(slot.queryByText("Создать недостающих")).toBeNull();
+    fireEvent.click(slot.getByText("Восстановить привязку"));
+    await slot.findByText("Привязка восстановлена. Сотрудник на паузе — откройте его карточку.");
+    expect(calls.find(c => c.method === "bindingRepair")?.input).toEqual({projectId:"proj_1",team:"qa",role:"tester",currentThreadId:"old",candidateThreadId:"fresh"});
+    expect(calls.filter(c => c.method === "teamSpawn" || c.method === "tell")).toHaveLength(0);
     slot.lifecycle.unmount();
   });
 
@@ -990,7 +1006,7 @@ it("changes provider through one recovery flow without preconfiguring fallback m
  await wizard.findByText(/Work transferred/);
  const switches=calls.filter(c=>c.method==="roleControl"&&(c.input as {action:string}).action==="switch");expect(switches).toHaveLength(1);expect(switches[0]?.input).toMatchObject({approveSelection:true,expectedThreadId:"thr_d",expectedRecoveryRevision:"preview-1",selection:{provider:"pi",model:"qwen3",reasoningLevel:"low"}});
  fireEvent.click(wizard.getByText("Continue work on selected model"));await wizard.findByText(/Continuation requested/);
- expect(calls.filter(c=>c.method==="roleControl").at(-1)?.input).toMatchObject({action:"resume",expectedThreadId:"thr_changed"});expect(calls.some(c=>c.method==="rolePolicy"&&!!(c.input as {primary?:unknown}).primary)).toBe(false);slot.lifecycle.unmount();
+ expect(calls.filter(c=>c.method==="roleControl"&&(c.input as {action:string}).action==="resume").at(-1)?.input).toMatchObject({action:"resume",expectedThreadId:"thr_changed"});expect(calls.some(c=>c.method==="rolePolicy"&&!!(c.input as {primary?:unknown}).primary)).toBe(false);slot.lifecycle.unmount();
 });
 it("recovery explains missing work state and never offers a blind transfer",async()=>{
  const {slot,calls}=await mount({recovery:{blockers:["checkpoint_missing","queue"]}});fireEvent.click(await slot.findByText("Developer"));fireEvent.click(await slot.findByText("Change provider or model"));

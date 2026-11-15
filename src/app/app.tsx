@@ -1382,6 +1382,22 @@ function TeamBlock({
       </div>
       {expanded && (
         <>
+          {!!snapshot.bindingIssues?.length && <Notice tone="error">
+            <strong>{language === "ru" ? "Команда требует восстановления сессий" : "Team sessions need recovery"}</strong>
+            <p>{language === "ru" ? "Сообщение руководителю само по себе не устраняет эту остановку. Сначала восстановите сотрудников ниже. Лимиты и задачи сохранятся." : "Messaging the lead cannot repair this stop. Restore the employees below first. Tasks and budgets are preserved."}</p>
+            {snapshot.bindingIssues.map(issue => <div key={issue.role} className="mt-2">
+              <b>{snapshot.roles.find(r => r.name === issue.role)?.title ?? issue.role}</b>{": "}
+              {issue.state === "repairable" ? <>
+                {language === "ru" ? "новая сессия существует, но Team привязан к архивной. Восстановление оставит сотрудника на паузе; затем откройте его карточку и продолжите работу." : "An existing session is hidden by an archived binding. Recovery leaves the employee paused; then open their card to continue."}
+                <Button onClick={() => void onAction(async () => {
+                  await rpc.call("bindingRepair", {projectId, team, role:issue.role, currentThreadId:issue.currentThreadId, candidateThreadId:issue.candidates[0]!});
+                  return language === "ru" ? "Привязка восстановлена. Сотрудник на паузе — откройте его карточку." : "Binding restored. Employee paused — open their card.";
+                })}>{language === "ru" ? "Восстановить привязку" : "Restore binding"}</Button>
+              </> : issue.state === "missing" ?
+                (language === "ru" ? "прежняя сессия архивирована, действующей нет. Используйте «Создать недостающих» ниже — это запустит модель." : "The former session is archived; there is no live session. Use Create missing below — this starts the model.") :
+                (language === "ru" ? "автоматическое восстановление небезопасно: несколько сессий, незавершённая замена или недоступное окружение. Нужна проверка; повторное создание заблокировано." : "Recovery is unsafe: multiple sessions, an unfinished replacement or inaccessible environment. Inspect before continuing; duplicate creation is blocked.")}
+            </div>)}
+          </Notice>}
           {snapshot.configError && <Notice tone="error">{l.configError(snapshot.configError)}</Notice>}
           {!snapshot.configSource && <Notice>{l.noConfig}</Notice>}
           {templateId !== null && (
@@ -1427,7 +1443,7 @@ function TeamBlock({
             {lead && roleRow(lead, 0)}
             {executors.map((role, index) => roleRow(role, lead ? 1 : 0, index === executors.length - 1))}
           </div>
-          {missing.length > 0 && snapshot.configSource && (
+          {missing.length > 0 && snapshot.configSource && !snapshot.bindingIssues?.some(issue => issue.state !== "missing") && (
             <div className="flex items-center gap-2 px-1 pt-1">
               <span className="text-xs text-muted-foreground">{labels.missingRoles(missing.map((r) => r.name).join(", "))}</span>
               <Button

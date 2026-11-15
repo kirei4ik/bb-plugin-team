@@ -1,3 +1,4 @@
+import { inspectBindings, repairBinding } from "./bindings";
 import {openRouterUsageSchema,emptyOpenRouter,openRouterHeadroom,isOpenRouterModel,quotaSourceSchema,type OpenRouterUsage,type QuotaSource} from "../shared/openrouter-usage";
 import { queuedFingerprint, deferredKey, deferredContinuationSchema, readDeferred, scheduleDeferred, cancelDeferred } from "./deferred-continuation";
 import { recoveryViewSchema, manualExecutionApprovalSchema, type RecoveryView, type RecoveryBlocker } from "../shared/recovery-view";
@@ -323,6 +324,10 @@ export const rpcContract = defineRpcContract({
   teamSpawn: {
     input: z.object({ projectId: projectIdSchema, team: teamSchema }).strict(),
     output: z.object({ spawned: z.number() }),
+  },
+  bindingRepair: {
+    input: z.object({projectId: projectIdSchema, team: teamSchema, role: z.string().min(1).max(100), currentThreadId: z.string().min(1), candidateThreadId: z.string().min(1)}).strict(),
+    output: z.object({repaired: z.boolean()}),
   },
   sessionView: {
     input: z.object({ projectId: projectIdSchema, team: teamSchema, role: z.string().min(1).max(100) }).strict(),
@@ -2130,7 +2135,7 @@ export default async function plugin(bb: BbPluginApi) {
     t: Strings,
     m: Messages,
     options: { only?: string[] } = {},
-  ) => {
+  ) => withScopeLock(scope, async () => {
     const settingsValues = await settings.get();
     const loaded = await readTeamConfig(bb, scope, scope.team, t);
     const { config, source } = loaded;
@@ -2141,6 +2146,8 @@ export default async function plugin(bb: BbPluginApi) {
     const defaults = config.defaults ?? {};
     const wanted = (role: Role) => !options.only || options.only.includes(role.name) || role.name === lead.name;
     await validateProviders(bb, roles.filter((r) => !r.threadId && wanted(r)), t);
+    const bindingIssues = await inspectBindings(bb, scope.projectId, scope.team, roles.filter(wanted).map(r => r.name));
+    if (bindingIssues.some(issue => issue.state !== "missing")) throw new PluginCliError("Team session bindings need recovery. Open Team and restore the existing employee; do not create duplicate threads.", {code:"binding_recovery_required"});
     const scan = await scanTeamThreads(bb, scope.projectId);
     const existingRows = roleThreadsOf(scan, scope.team);
     const existing = new Map(
@@ -2199,7 +2206,7 @@ export default async function plugin(bb: BbPluginApi) {
         parentNotifications: parentThreadId
           ? entry.role.parentNotifications ?? defaults.parentNotifications
           : undefined,
-        pluginMetadata: teamMetadata(entry.role, scope.team),
+        pluginMetadata: {...teamMetadata(entry.role, scope.team), teamReplacement: true},
         prompt,
       };
       // A brand-new environment can fail its first spawn while provisioning;
@@ -2237,6 +2244,9 @@ export default async function plugin(bb: BbPluginApi) {
 
     const upsert = async (entry: PlanEntry, parent: string | undefined) => {
       const result = entry.role.threadId ? await adoptRole(entry, parent) : await spawnRole(entry, parent);
+      await bb.storage.kv.set(activeSessionKey(scope.projectId, scope.team, entry.role.name), result.threadId);
+      await bb.sdk.threads.updatePluginMetadata({threadId: result.threadId, set:{teamReplacement:false, teamRetired:false}});
+      await bb.experimental_hooks.recheck("message.dispatch");
       roleThreads.set(entry.role.name, result.threadId);
       roleProviders.set(entry.role.name, result.providerId);
       spawned.push({
@@ -2298,7 +2308,7 @@ export default async function plugin(bb: BbPluginApi) {
     }
     publishChange(scope.projectId);
     return { source, leadThreadId, sectionId, spawned, existing, rosterQueued, relinked };
-  };
+  });
 
   /** Add a role to a team config (append keeps comments), then spawn or adopt it. */
   const addRole = async (
@@ -2526,6 +2536,7 @@ export default async function plugin(bb: BbPluginApi) {
       generatedAtMs: Date.now(),
       tracker: (await tracker.getConfig(scope)).kind,
       trackerError,
+      bindingIssues: loaded ? await inspectBindings(bb, scope.projectId, scope.team, loaded.config.roles.filter(r => r.enabled !== false).map(r => r.name)) : [],
     };
   };
 
@@ -2621,7 +2632,14 @@ export default async function plugin(bb: BbPluginApi) {
           threadWarnings += 1;
           add(m.check.threads, "warn", detail);
         };
+        const bindingIssues = await inspectBindings(bb, scope.projectId, scope.team, roles.map(r => r.name));
         for (const role of roles) {
+          const binding = bindingIssues.find(issue => issue.role === role.name);
+          if (binding && binding.state !== "missing") {
+            threadWarnings += 1;
+            add("session binding", "fail", `${role.name}: ${binding.state}; ${lang === "ru" ? "Откройте Team → восстановление сессий. Не создавайте повторный тред." : "Open Team → session recovery. Do not create a duplicate thread."}`);
+            continue;
+          }
           const list = rows.get(role.name) ?? [];
           if (list.length === 0) {
             warnThread(m.doctorMissingThread(role.name));
@@ -3031,6 +3049,18 @@ export default async function plugin(bb: BbPluginApi) {
       const { lang, t, m } = await loadLang();
       const scope = await scopeFor(projectId, team, t);
       return { spawned: (await spawnTeam(scope, lang, t, m)).spawned.length };
+    },
+    async bindingRepair({projectId, team, role, currentThreadId, candidateThreadId}) {
+      const {t} = await loadLang();
+      const scope = await scopeFor(projectId, team, t);
+      return withScopeLock(scope, async () => {
+        const {config} = await readTeamConfig(bb, scope, scope.team, t);
+        if (!config.roles.some(r => r.name === role && r.enabled !== false)) throw new experimental_PluginRpcRefusal({code:"not_found", message:"Role not found"});
+        try { await repairBinding(bb, projectId, team, {role, currentThreadId, candidates:[candidateThreadId], state:"repairable"}); }
+        catch(error) { throw new experimental_PluginRpcRefusal({code:"conflict", message:(error as Error).message}); }
+        publishChange(projectId);
+        return {repaired:true};
+      });
     },
     async sessionView({ projectId, team, role }) {
       const { t } = await loadLang();

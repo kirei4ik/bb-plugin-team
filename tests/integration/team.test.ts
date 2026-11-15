@@ -718,6 +718,7 @@ describe("bb team create: vars и notifyOn", () => {
       spawns.find((s) => (s.pluginMetadata as { teamRole: string }).teamRole === role)!;
     const developer = byRole("developer");
     expect(developer.pluginMetadata).toEqual({
+      teamReplacement: true,
       teamRole: "developer",
       teamName: "main",
       teamNotifyOn: ["idle"],

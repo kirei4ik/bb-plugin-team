@@ -58,7 +58,15 @@ export interface SnapshotRole {
   executionState?: RoleExecutionState;
 }
 
+export interface BindingIssue {
+  role: string;
+  currentThreadId: string;
+  candidates: string[];
+  state: "repairable" | "missing" | "ambiguous" | "blocked";
+}
+
 export interface TeamSnapshot {
+  bindingIssues?: BindingIssue[];
   projectId: string;
   projectName: string;
   team: string;

@@ -418,3 +418,16 @@ loop. Unknown first-time counters are shown as unknown, not availability.
 Checks are cached up to three minutes before turns, not model-API request by
 request; a single active turn or other users can exhaust quota during that time.
 The reserve reduces risk and does not guarantee uninterrupted completion.
+
+### Restoring an archived session binding
+
+If Team hides an existing employee behind a pointer to an archived session,
+its main panel shows **Team sessions need recovery**. **Restore binding** only
+adopts a unique, already marked live session in the same environment, after
+checking that no replacement is unfinished. It leaves the employee paused,
+preserves tasks/budgets and never spawns or sends a message. Open the employee
+card afterwards and explicitly continue when ready. Multiple candidates,
+inaccessible old state and environment differences require inspection.
+If all sessions for a role were archived, **Create missing** creates a new
+session and starts its model; it is a separate action, not read-only recovery.
+Creation refuses hidden/uncertain candidates rather than adding duplicates.

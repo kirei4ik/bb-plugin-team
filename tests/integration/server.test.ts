@@ -429,6 +429,7 @@ function makeHost(
         }),
       },
       threads: {
+        updatePluginMetadata: async () => ({ok:true}),
         list: async () => [],
         experimental_listPluginMetadata: async ({ threadIds }: { threadIds: string[] }) => ({
           threads: threadIds.map((threadId) => ({ threadId, metadata: {} })),
@@ -460,7 +461,7 @@ describe("bb team CLI (поведение)", () => {
     await plugin(bb);
 
     const result = await harness.behavior.runCli(["create", "--project", "demo"]);
-    expect(result.exitCode).toBe(0);
+    expect(result.exitCode, result.stderr).toBe(0);
 
     const spawns = harness.inspection.sdk.callsTo("threads.spawn");
     expect(spawns).toHaveLength(2);
@@ -471,6 +472,9 @@ describe("bb team CLI (поведение)", () => {
     expect(leadSpawn.parentThreadId).toBeUndefined();
     expect(testerSpawn.parentThreadId).toBe("thr_gen1");
     expect((leadSpawn.pluginMetadata as Record<string, unknown>).teamRole).toBe("lead");
+    expect((leadSpawn.pluginMetadata as Record<string, unknown>).teamReplacement).toBe(true);
+    expect(await bb.storage.kv.get("active-session:proj_1:main:lead")).toBe("thr_gen1");
+    expect(await bb.storage.kv.get("active-session:proj_1:main:tester")).toBe("thr_gen2");
     expect((testerSpawn.pluginMetadata as Record<string, unknown>).teamRole).toBe("tester");
     // Плейсхолдер руководителя подставлен в промпт исполнителя.
     expect(String(testerSpawn.prompt)).toContain("thr_gen1");
@@ -486,6 +490,25 @@ describe("bb team CLI (поведение)", () => {
     expect(sectionCreates).toHaveLength(1);
     expect((sectionCreates[0]![0] as { name: string }).name).toBe("Team");
     expect(testerSpawn.sectionId).toBe("sec_team");
+  });
+
+  it("repair RPC restores an existing employee paused and create refuses hidden duplicates", async () => {
+    const {bb,harness}=makeHost();
+    const old=makeThreadResponse({id:"old",projectId:"proj_1",environmentId:"env_1",archivedAt:1});
+    const candidate=makeThreadResponse({id:"fresh",projectId:"proj_1",environmentId:"env_1"});
+    harness.sdk.stub("threads.list",async()=>[candidate]);
+    harness.sdk.stub("threads.get",async()=>old);
+    harness.sdk.stub("threads.experimental_listPluginMetadata",async()=>({threads:[{threadId:"fresh",metadata:{teamRole:"tester",teamName:"main"}}]}));
+    await bb.storage.kv.set("active-session:proj_1:main:tester","old");
+    await plugin(bb);
+    const create=await harness.behavior.runCli(["create","--project","demo"]);
+    expect(create.exitCode).toBe(1);
+    expect(create.stderr).toContain("recovery");
+    expect(harness.inspection.sdk.callsTo("threads.spawn")).toHaveLength(0);
+    expect(await harness.behavior.callRpc("bindingRepair",{projectId:"proj_1",team:"main",role:"tester",currentThreadId:"old",candidateThreadId:"fresh"})).toEqual({repaired:true});
+    expect(await bb.storage.kv.get("active-session:proj_1:main:tester")).toBe("fresh");
+    expect(await bb.storage.kv.get("role-paused:proj_1:main:tester")).toBe(true);
+    expect(harness.inspection.sdk.callsTo("threads.send")).toHaveLength(0);
   });
 
   it("create: ростер уходит руководителю", async () => {
