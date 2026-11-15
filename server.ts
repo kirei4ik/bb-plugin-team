@@ -444,7 +444,7 @@ export const rpcContract = defineRpcContract({
     input:z.object({projectId:projectIdSchema,team:teamSchema,policy:quotaPolicySchema.optional()}).strict(),output:quotaPolicySchema,
   },
   deferredContinuation: {
-    input:z.object({projectId:projectIdSchema,team:teamSchema,role:z.string(),action:z.enum(["status","schedule","cancel","check"]),expectedThreadId:z.string().optional(),sendAt:z.number().finite().optional()}).strict(),
+    input:z.object({projectId:projectIdSchema,team:teamSchema,role:z.string(),action:z.enum(["status","schedule","cancel","check"]),expectedThreadId:z.string().optional(),sendAt:z.number().finite().optional(),resumePaused:z.boolean().optional()}).strict(),
     output:z.object({record:deferredContinuationSchema.nullable()}),
   },
   roleRecovery: {
@@ -3136,7 +3136,7 @@ export default async function plugin(bb: BbPluginApi) {
       if(policy){await bb.storage.kv.set(`quota-policy:${projectId}:${team}`,policy);publishChange(projectId);}
       return readQuotaPolicy(scope);
     },
-    async deferredContinuation({projectId,team,role:roleName,action,expectedThreadId,sendAt}) {
+    async deferredContinuation({projectId,team,role:roleName,action,expectedThreadId,sendAt,resumePaused}) {
       const {t}=await loadLang();const scope=await scopeFor(projectId,team,t);const key=deferredKey(projectId,team,roleName);
       if(action==="status")return {record:await readDeferred(bb,key)};
       return withScopeLock(scope,async()=>{
@@ -3156,7 +3156,9 @@ export default async function plugin(bb: BbPluginApi) {
           await cancelDeferred(bb,key);publishChange(projectId);return {record:null};
         }
         if(!sendAt)throw new experimental_PluginRpcRefusal({code:"invalid",message:"Choose a future time"});
-        if(await readPause(scope)||await isRolePaused(scope,roleName))throw new experimental_PluginRpcRefusal({code:"conflict",message:"Resume the explicit team/employee pause first; scheduling never overrides a manual pause"});
+        if(await readPause(scope))throw new experimental_PluginRpcRefusal({code:"conflict",message:"The team is manually paused; scheduling cannot override it"});
+        const employeePaused=await isRolePaused(scope,roleName);
+        if(employeePaused&&!resumePaused)throw new experimental_PluginRpcRefusal({code:"conflict",message:"Confirm replacing the employee pause with a scheduled wait"});
         const intent=await readReplacementIntent(bb,projectId,team,roleName);
         if(intent&&intent.stage!=="complete")throw new experimental_PluginRpcRefusal({code:"conflict",message:"Resolve the unfinished session replacement first"});
         if((await resources.inspect(scope)).blocked)throw new experimental_PluginRpcRefusal({code:"conflict",message:"Resolve the task/team budget first; waiting cannot replenish it"});
@@ -3166,6 +3168,9 @@ export default async function plugin(bb: BbPluginApi) {
         const summary=await resources.inspect(scope);
         const failed=[...summary.attempts].reverse().find(a=>a.threadId===thread.id&&a.outcome==="failed");
         const record=await scheduleDeferred(bb,key,{threadId:thread.id,taskId:owner.taskId,sendAt,failed:thread.status==="error",...(failed?.requestId?{turnRequestId:failed.requestId}:{})});
+        // Future sendAt + the durable deferred guard hold all new turns. A
+        // fresh manual pause set after this RPC will still block the deadline.
+        if(employeePaused)await bb.storage.kv.delete(rolePauseKey(scope,roleName));
         publishChange(projectId);return {record};
       });
     },

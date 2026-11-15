@@ -74,4 +74,15 @@ describe("quota stop and native scheduled dispatch",()=>{
   }finally{await f.dispose();}
  });
 
+ it("requires explicit consent to replace an employee pause; a later pause still holds the due turn",async()=>{
+  const f=await setup();try{
+   await f.bb.storage.kv.set("role-paused:proj_q:main:lead",true);
+   const request={role:"lead",action:"schedule",expectedThreadId:"thr_lead",sendAt:Date.now()+120_000};
+   await expect(f.rpc("deferredContinuation",request)).rejects.toThrow();expect(f.retry).not.toHaveBeenCalled();
+   await f.rpc("deferredContinuation",{...request,resumePaused:true});expect(await f.bb.storage.kv.get("role-paused:proj_q:main:lead")).toBeUndefined();
+   f.remaining(80);f.advance(121_000);await f.bb.storage.kv.set("role-paused:proj_q:main:lead",true);
+   expect((await f.dispatch()).action).toBe("wait");expect((await f.rpc("resources") as {starts:number}).starts).toBe(0);
+  }finally{await f.dispose();}
+ });
+
 });

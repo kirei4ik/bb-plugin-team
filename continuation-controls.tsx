@@ -50,7 +50,7 @@ export function RoleContinuationControls({projectId,team,role,threadId,language,
   {state?.paused&&<strong>{ru?"Сотрудник на паузе":"Employee paused"}</strong>}
   {state&&<button disabled={busy} onClick={()=>void act(state.paused?"resume":"pause")}>{state.paused?(ru?"Продолжить сотрудника":"Resume employee"):(ru?"Приостановить после текущей операции":"Pause after current operation")}</button>}
   <RoleModelRecovery projectId={projectId} team={team} role={role} threadId={threadId} language={language} onChanged={onChanged}/>
-  <DeferredControls projectId={projectId} team={team} role={role} threadId={threadId} language={language} onChanged={onChanged} resetAtMs={reset}/>
+  <DeferredControls projectId={projectId} team={team} role={role} threadId={threadId} language={language} onChanged={async()=>{setState(await rpc.call("roleControl",{projectId,team,role,action:"status"}));await onChanged();}} resetAtMs={reset} paused={state?.paused}/>
   <details><summary>{ru?"Очередь и дополнительные действия":"Queue and additional actions"}</summary>
    <p>{ru?"Продолжение очереди может запустить модель. Пауза удерживает следующие ходы и не обрывает текущую операцию.":"Continuing queued work may start a model turn. Pause holds future turns without interrupting current work."}</p>
    <button disabled={busy||!state} onClick={()=>void act("resume")}>{ru?"Продолжить очередь":"Check queued work and continue"}</button>

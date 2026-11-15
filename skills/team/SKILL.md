@@ -353,7 +353,9 @@ limiting windows reset, or a local date/time. BB's native `sendAt` queue owns th
 schedule. The original pending row is moved; a failed turn uses native retry.
 Idle employees without queued work are not started. Multiple pending rows need
 inspection in the native thread queue first. Scheduling never increases a task
-or team budget, clears a manual pause, or creates a new session.
+or team budget, clears a team pause, or creates a new session. A paused employee requires an
+explicit checkbox to replace its manual pause with the scheduled wait; a new
+manual pause after scheduling still holds the deadline.
 
 At the deadline Team rechecks the exact session/task/queued row, fresh Ollama
 headroom and execution budgets. A changed task, unknown/low balance, unrelated

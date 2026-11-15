@@ -273,10 +273,11 @@ async function mount(
         },
         quotaPolicy:()=>({pauseBelowPercent:10}),
         ollamaUsage:()=>({status:"ready",checkedAtMs:Date.now(),windows:[{name:"weekly",remainingPercent:0,resetsAtMs:Date.now()+3600_000}],reason:null}),
-        deferredContinuation:(input:{action:string;expectedThreadId?:string;sendAt?:number})=>{
+        deferredContinuation:(input:{role:string;action:string;expectedThreadId?:string;sendAt?:number;resumePaused?:boolean})=>{
           log("deferredContinuation")(input);
           if(input.action==="schedule")deferred={threadId:input.expectedThreadId!,taskId:7,sendAt:input.sendAt!,stage:"scheduled",fingerprint:"fixture",queuedMessageId:"queued",owned:true,previousSendAt:null,reason:null};
-          if(input.action==="cancel")deferred=null;
+          if(input.action==="cancel"){deferred=null;pausedRoles.add(input.role);}
+          if(input.action==="schedule"&&input.resumePaused)pausedRoles.delete(input.role);
           return {record:deferred};
         },
         roleControl: (input:{role:string;action:string;expectedThreadId?:string;selection?:{provider:string;model:string;reasoningLevel?:string}})=>{
@@ -929,6 +930,7 @@ it("edits the existing employee profile with explicit approval and revision",asy
  const {slot,calls}=await mount();fireEvent.click(await slot.findByText("Developer"));
  fireEvent.click(slot.getByRole("button",{name:"Fallback models",exact:true}));
  const section=within(await slot.findByRole("region",{name:"Employee model profile"}));
+ await act(async()=>{}); // settle the loaded profile before adding an unsaved fallback slot
  expect(section.getByText(/later template edits are not inherited/)).toBeTruthy();
  fireEvent.click(section.getByText(labels.addFallback));
  await waitFor(()=>expect((section.getByRole("button",{name:"Save",exact:true}) as HTMLButtonElement).disabled).toBe(true));
@@ -1039,4 +1041,14 @@ it("shows one shared quota decision with affected employees and an honest reset"
  expect(summary.getByText(/Лимит Team ожиданием не сбрасывается/)).toBeTruthy();
  fireEvent.click(summary.getByRole("button",{name:"Настроить продолжение: Developer"}));
  expect(await slot.findByRole("region",{name:"Продолжить позже"})).toBeTruthy();slot.lifecycle.unmount();
+});
+
+it("requires the employee pause consent before scheduling",async()=>{
+ const {slot,calls}=await mount();fireEvent.click(await slot.findByText("Developer"));
+ fireEvent.click(await slot.findByText("Pause after current operation"));await slot.findByText("Employee paused");
+ const panel=within(slot.getByRole("region",{name:"Continue later"}));
+ expect((panel.getByText("In 30 minutes") as HTMLButtonElement).disabled).toBe(true);
+ fireEvent.click(panel.getByLabelText(/Replace the employee pause/));fireEvent.click(panel.getByText("In 30 minutes"));
+ await panel.findByText(/waiting in BB queue/);
+ expect(calls.find(c=>c.method==="deferredContinuation"&&(c.input as {action:string}).action==="schedule")?.input).toMatchObject({resumePaused:true});slot.lifecycle.unmount();
 });
