@@ -52,7 +52,9 @@ export async function readOpenRouterUsage(input:OpenRouterHostInput,signal?:Abor
        const parent=dirname(dir);if(parent===dir)break;if(depth===31)return {...result,reason:"auth_unsupported"};dir=parent;
      }
    }
-   const env={...config?.env,...deps.env};key=staticValue(env[name],env);result={...result,service:"openrouter",source:"qwen-settings"};
+   const env={...config?.env,...deps.env};
+   if(typeof env[name]!=="string"||env[name].startsWith("$")||env[name].startsWith("!"))return {...result,reason:"auth_unsupported"};
+   key=env[name];result={...result,service:"openrouter",source:"qwen-settings"};
   }else if(known){
    // Unknown launchers may override OPENROUTER_API_KEY. Explicit declaration is
    // required: never query an arbitrary host key and call it the execution key.

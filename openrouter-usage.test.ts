@@ -77,6 +77,7 @@ describe("OpenRouter upstream quota without inference",()=>{
   const profile={env:{KEY:key},modelProviders:{openai:[{id:"openrouter/free",baseUrl:"https://openrouter.ai/api/v1",envKey:"KEY"}]}};
   const deps=json({"/.qwen/settings.json":profile},{KEY:"actual-process-key"});
   const data=await readOpenRouterUsage({...pi,provider:"acp-qwen-code"},undefined,deps);expect(data.status).toBe("ready");expect(deps.fetch).toHaveBeenCalledWith("https://openrouter.ai/api/v1/key",expect.objectContaining({headers:{Authorization:"Bearer actual-process-key"}}));
+  const dynamic=json({"/.qwen/settings.json":{...profile,env:{KEY:"$OTHER"}}},{OTHER:key});expect((await readOpenRouterUsage({...pi,provider:"acp-qwen-code"},undefined,dynamic)).reason).toBe("auth_unsupported");expect(dynamic.fetch).not.toHaveBeenCalled();
   const d=json({"/.qwen/settings.json":profile,"/project/.env":"KEY=dotenv-key"});expect((await readOpenRouterUsage({...pi,provider:"acp-qwen-code"},undefined,d)).reason).toBe("auth_unsupported");expect(d.fetch).not.toHaveBeenCalled();
  });
 
