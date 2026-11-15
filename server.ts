@@ -991,7 +991,7 @@ export default async function plugin(bb: BbPluginApi) {
       const held=summary.holds[owner.taskId===null?`role:${owner.role}`:`task:${owner.taskId}`];
       if(held){
         if(!isOllamaCloud(ctx.requestedExecution?.providerId,ctx.requestedExecution?.model)||!["rate-limit","budget-exceeded"].includes(held))return wait("A provider or execution error still needs a manual decision: "+held);
-        await resources.decide(owner,"User scheduled continuation; fresh Ollama account quota verified",undefined,owner.taskId??undefined,owner.role);
+        await resources.decide(owner,"User scheduled continuation; fresh Ollama account quota verified",undefined,owner.taskId??undefined,owner.role,"capacity");
       }
     }
     const admission=await resources.admit(ctx);
@@ -3220,7 +3220,7 @@ export default async function plugin(bb: BbPluginApi) {
             if(await bb.storage.kv.get(quotaWaitKey(scope,roleName))||hold&&["rate-limit","budget-exceeded"].includes(hold)){
               const quota=quotaHeadroom(owner?.hostId?await cloudUsage(owner.hostId,true):undefined,await readQuotaPolicy(scope));
               if(quota.unknown||quota.held)throw new experimental_PluginRpcRefusal({code:"conflict",message:"Ollama quota is unknown or below the safety threshold; schedule later or choose an independent model"});
-              if(owner?.hostId){await resources.confirmOllamaCapacity(owner.hostId);if(hold)await resources.decide(owner,"User resumed after a fresh Ollama account quota check",undefined,owner.taskId??undefined,owner.role);}
+              if(owner?.hostId){await resources.confirmOllamaCapacity(owner.hostId);if(hold)await resources.decide(owner,"User resumed after a fresh Ollama account quota check",undefined,owner.taskId??undefined,owner.role,"capacity");}
             }
           }
           await bb.storage.kv.delete(quotaWaitKey(scope,roleName));

@@ -245,12 +245,12 @@ export class ResourceControl {
     return this.serial(async()=>this.isBlocked(selection.provider,owner.hostId,selection.model));
   }
   async inspect(owner:Pick<ResourceOwner,"projectId"|"team">){return this.serial(async()=>{const s=this.load(owner);await this.syncAll(s);this.save(owner,s);const summary=this.summary(s);summary.blocked??=this.limit(s);return summary;});}
-  async decide(owner:Pick<ResourceOwner,"projectId"|"team">,reason:string,policy?:ResourcePolicy,taskId?:TaskId,role?:string){
+  async decide(owner:Pick<ResourceOwner,"projectId"|"team">,reason:string,policy?:ResourcePolicy,taskId?:TaskId,role?:string,decisionSource:"tracker"|"capacity"="tracker"){
     if(!reason.trim())throw new Error("A concrete manual resource decision is required");
     return this.serial(async()=>{const s=this.load(owner);if(policy)s.policy=resourcePolicySchema.parse(policy);
       if(taskId!==undefined||role){delete s.holds[taskKey(taskId??null,role??"")];for(const f of Object.values(s.fallbacks))if((taskId!==undefined?f.taskId===taskId:f.taskId===null&&f.role===role)&&(f.stage==="blocked"||f.stage==="error")){f.stage="error";f.manualReleased=true;}}
       const limit=this.limit(s);s.blocked=limit;s.blockedAtMs=limit?this.now():null;
-      s.decisions.push({atMs:this.now(),reason:taskId!==undefined?"Concrete task approach decision is recorded in the selected tracker":safeText(reason),taskId:taskId??null,policy:{...s.policy}});this.save(owner,s);return this.summary(s);
+      s.decisions.push({atMs:this.now(),reason:taskId!==undefined&&decisionSource==="tracker"?"Concrete task approach decision is recorded in the selected tracker":safeText(reason),taskId:taskId??null,policy:{...s.policy}});this.save(owner,s);return this.summary(s);
     });
   }
   async extendCoordination(owner:ResourceOwner,expectedStarts:number,expectedUsed:number,record:()=>Promise<void>){
