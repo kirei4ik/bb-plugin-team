@@ -33,6 +33,7 @@ interface ResourceState {
 }
 export interface ResourceSummary {
   ollamaUsage?:OllamaUsage;
+  openrouterUsage?:Record<string,import("./openrouter-usage").OpenRouterUsage>;
   quotaPolicy?:import("./ollama-usage").QuotaPolicy;
   taskLimits?:Record<string,number>;
   sinceMs:number;policy:ResourcePolicy;starts:number;remainingStarts:number;reportedTokens:number|null;
@@ -235,6 +236,16 @@ export class ResourceControl {
   }
   // Positive fixed-endpoint balance can retire only this host's known Ollama
   // exclusions. Unknown Pi pools and independent upstream accounts stay held.
+  async confirmOpenRouterCapacity(owner:ResourceOwner,provider:string,model:string){return this.serial(async()=>{
+    const s=this.load(owner);
+    const requests=new Set(s.attempts.filter(a=>a.threadId===owner.ownerThreadId&&a.provider===provider&&a.model===model&&a.outcome==="failed").map(a=>a.requestId));
+    for(const row of this.db.prepare("SELECT id,data FROM team_resource_quota").all() as Array<{id:string;data:string}>){
+      const q=JSON.parse(row.data) as Quota;
+      // No provider-wide reset: other keys/accounts and other owners keep their
+      // exclusions until independently verified. Budgets/counters are untouched.
+      if(q.hostId===owner.hostId&&q.provider===provider&&requests.has(q.requestId))this.db.prepare("UPDATE team_resource_quota SET data=? WHERE id=?").run(JSON.stringify({...q,until:this.now()}),row.id);
+    }
+  });}
   async confirmOllamaCapacity(hostId:string){return this.serial(async()=>{
     for(const row of this.db.prepare("SELECT id,data FROM team_resource_quota").all() as Array<{id:string;data:string}>){
       const q=JSON.parse(row.data) as Quota;

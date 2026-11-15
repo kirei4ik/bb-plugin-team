@@ -364,3 +364,42 @@ retry loop. Other providers use known BB exclusions; Team cannot assert their
 unknown remaining balance. Cancellation leaves the employee paused and deletes
 only its own retry row; an existing user row keeps its content and prior date.
 A lost queue RPC response requires inspection, never blind duplicate retry.
+
+### OpenRouter behind different agents
+
+OpenRouter quota belongs to the upstream connection, not the BB provider name.
+Team reads its fixed `GET /api/v1/key` endpoint on the actual execution host.
+Standard Pi OpenRouter auth and a unique official Qwen Code model profile are
+recognized. Arbitrary wrappers need an explicit `quotaSource` on the role:
+
+```yaml
+quotaSource:
+  service: openrouter
+  credentialEnv: AGENT_OPENROUTER_KEY # variable name only; never the secret
+```
+
+The same controls are in templates, Add executor and the employee's **Models
+and quota profile**. This selects the source for current quota checks; it does
+not change the agent's credentials or model connection. Templates are copied,
+not live-linked. Omit `quotaSource` for automatic detection. Unsupported launch
+or project overrides, executable auth and ambiguous profiles remain unknown;
+Team never substitutes another agent's key. For wrappers, the operator must
+select the variable containing the key actually used by that connection.
+
+Daily free requests, key spending caps, applicable budgets and account balance
+are separate. Null is unknown/unset, not zero. The account credits endpoint is
+queried with the same credential; if management permission is absent, only that
+balance remains unknown. Team does not request a management key or enable paid
+usage. Per-minute/upstream-model availability is not confirmed by daily counts.
+Identical opaque key identities group employees; different keys do not prove
+independent accounts. Automatic quota fallback never treats two known
+OpenRouter launchers as independent merely because their BB provider differs.
+
+Existing threshold, durable pause/decision and native delayed continuation
+apply to known OpenRouter free-request and monetary limits. Paid caps are not
+misrepresented as free-request counts. An explicit resume/due-time continuation
+requires fresh relevant capacity; failure keeps the wait, not an automatic retry
+loop. Unknown first-time counters are shown as unknown, not availability.
+Checks are cached up to three minutes before turns, not model-API request by
+request; a single active turn or other users can exhaust quota during that time.
+The reserve reduces risk and does not guarantee uninterrupted completion.

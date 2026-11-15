@@ -1,3 +1,4 @@
+import {OpenRouterQuotaCard} from "./openrouter-quota-card";
 import {DeferredControls} from "./deferred-controls";
 import { useEffect, useState } from "react";
 import { useRpc, useRealtime } from "@get-bb/plugin-sdk/app";
@@ -49,6 +50,7 @@ export function RoleContinuationControls({projectId,team,role,threadId,language,
   {state?.actual&&<p>{ru?"Текущая модель сессии":"Current session model"}: {state.actual.provider} · {state.actual.model}</p>}
   {state?.paused&&<strong>{ru?"Сотрудник на паузе":"Employee paused"}</strong>}
   {state&&<button disabled={busy} onClick={()=>void act(state.paused?"resume":"pause")}>{state.paused?(ru?"Продолжить сотрудника":"Resume employee"):(ru?"Приостановить после текущей операции":"Pause after current operation")}</button>}
+  <OpenRouterQuotaCard projectId={projectId} team={team} role={role} model={state?.actual?.model} language={language} onReset={setReset}/>
   <RoleModelRecovery projectId={projectId} team={team} role={role} threadId={threadId} language={language} onChanged={onChanged}/>
   <DeferredControls projectId={projectId} team={team} role={role} threadId={threadId} language={language} onChanged={async()=>{setState(await rpc.call("roleControl",{projectId,team,role,action:"status"}));await onChanged();}} resetAtMs={reset} paused={state?.paused}/>
   <details><summary>{ru?"Очередь и дополнительные действия":"Queue and additional actions"}</summary>

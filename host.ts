@@ -1,3 +1,4 @@
+import {readOpenRouterUsage} from "./openrouter-usage-host";
 // The Team plugin's singular `bb.host` entry (manifest: bb.host).
 //
 // Runs on the daemon of the host that holds a project's canonical checkout
@@ -122,6 +123,7 @@ const assertAbsolute = (cwd: string): void => {
 };
 
 const handlers = {
+  async openrouterUsage(input:Parameters<typeof readOpenRouterUsage>[0],context:{signal:AbortSignal}){return readOpenRouterUsage(input,context.signal);},
   async ollamaUsage(_input: Record<string, never>, context: {signal: AbortSignal}) { return readOllamaUsage(context.signal); },
   /** Restricted bd runner; see host-contract.ts for the argv policy. */
   async bd(

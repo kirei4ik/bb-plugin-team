@@ -1,3 +1,4 @@
+import {quotaSourceSchema} from "./openrouter-usage";
 // Team templates: built-in role prompts by role kind, built-in team presets,
 // the user template schema, and team.yaml generation (en | ru).
 //
@@ -231,6 +232,7 @@ export const templateRoleSchema = z.object({
   notifyOn: z.array(z.enum(["idle", "error"])).optional(),
   prompt: z.string().max(20000).optional(),
   executionPolicy: executionPolicySchema.optional(),
+  quotaSource:quotaSourceSchema.optional(),
 });
 export type TemplateRole = z.infer<typeof templateRoleSchema>;
 
@@ -424,6 +426,7 @@ export function teamFilesFromTemplate(
     if (item.reasoningLevel) out.reasoningLevel = item.reasoningLevel;
     if (item.serviceTier) out.serviceTier = item.serviceTier;
     if (item.executionPolicy) out.executionPolicy = item.executionPolicy;
+    if (item.quotaSource) out.quotaSource = item.quotaSource;
     if (item.environment) out.environment = item.environment;
     if (item.notifyOn && item.notifyOn.length > 0) out.notifyOn = item.notifyOn;
     const adopted = options.adopt?.[item.name];

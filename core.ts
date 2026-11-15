@@ -1,3 +1,4 @@
+import {quotaSourceSchema} from "./openrouter-usage";
 // Core of bb-plugin-team: workspace and team resolution, config reading,
 // thread scanning (roles + helpers), environments, prompts, providers.
 // SDK-dependent helpers live here so server.ts stays the plugin wiring.
@@ -64,6 +65,7 @@ export const roleSchema = z.object({
   prompt: z.string().optional(),
   promptFile: z.string().optional(),
   executionPolicy: executionPolicySchema.optional(),
+  quotaSource:quotaSourceSchema.optional(),
 });
 
 export const teamConfigSchema = z.object({

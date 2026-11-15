@@ -1,3 +1,5 @@
+import {QuotaSourceEditor} from "./quota-source-editor";
+import type {QuotaSource} from "./openrouter-usage";
 // bb-plugin-team — UI: the Team panel and the template editor (Settings → Team).
 //
 // Panel: team tabs per project, a creation wizard (template → editable roles
@@ -769,6 +771,7 @@ function RolesEditor({
           readOnly={readOnly}
         />
       ))}
+      {roles.map((role,index)=><QuotaSourceEditor key={`quota-${role.name}`} name={role.name} value={role.quotaSource} onChange={quotaSource=>update(index,{quotaSource})} language={labels===LABELS.ru?"ru":"en"} readOnly={readOnly}/>)}
       {withPrompt &&
         roles.map((role, index) => {
           const starter = builtinPrompt(labels === RU ? "ru" : "en", role);
@@ -1003,6 +1006,7 @@ function AddExecutor({
   const [title, setTitle] = useState("");
   const [executionModel, setExecutionModel] = useState<ExecutionModel | undefined>(undefined);
   const [executionPolicy, setExecutionPolicy] = useState<ExecutionPolicy | undefined>(undefined);
+  const [quotaSource,setQuotaSource]=useState<QuotaSource|undefined>();
   const [threadId, setThreadId] = useState("");
   const [free, setFree] = useState<Array<{ id: string; title: string; status: string; provider: string }>>([]);
   const [busy, setBusy] = useState(false);
@@ -1050,6 +1054,7 @@ function AddExecutor({
         ...(mode === "new" && executionModel?.reasoningLevel ? { reasoningLevel: executionModel.reasoningLevel } : {}),
         ...(mode === "new" && executionModel?.serviceTier ? { serviceTier: executionModel.serviceTier } : {}),
         ...(mode === "new" && executionPolicy ? { executionPolicy } : {}),
+        ...(mode === "new" && quotaSource ? {quotaSource} : {}),
       };
       await rpc.call("roleAdd", { projectId, team, role, ...(mode === "existing" ? { threadId } : {}) });
       onDone(labels.roleAdded(roleName));
@@ -1138,6 +1143,7 @@ function AddExecutor({
           routing={routing}
         />
       )}
+      {mode==="new"&&<QuotaSourceEditor name={roleName} value={quotaSource} onChange={setQuotaSource} language={labels===LABELS.ru?"ru":"en"}/>}
       {problems.map((problem) => (
         <Notice key={problem} tone="warn">
           {problem}
@@ -1545,12 +1551,13 @@ function ExistingRolePolicy({projectId,team,role,labels,onAction}: {
   const [data,setData]=useState<{role:TemplateRole;source:string;revision:string}|null>(null);
   const [providers,setProviders]=useState<{enabled:string[];disabled:string[]}>({enabled:[],disabled:[]});
   const [policy,setPolicy]=useState<ExecutionPolicy|undefined>();
+  const [quotaSource,setQuotaSource]=useState<QuotaSource|undefined>();
   const [primary,setPrimary]=useState<ExecutionModel|undefined>();
   const [problem,setProblem]=useState<string|null>(null);const [error,setError]=useState<string|null>(null);
   const [busy,setBusy]=useState(false);
   const ru=labels===LABELS.ru;
   useEffect(()=>{let active=true;Promise.all([rpc.call("rolePolicy",{projectId,team,role}),rpc.call("providers",null)]).then(([d,p])=>{
-    if(active){setData(d);setPolicy(d.role.executionPolicy);setProviders(p);setPrimary({providerId:d.role.provider,model:d.role.model,reasoningLevel:d.role.reasoningLevel,serviceTier:d.role.serviceTier});}
+    if(active){setData(d);setPolicy(d.role.executionPolicy);setQuotaSource(d.role.quotaSource);setProviders(p);setPrimary({providerId:d.role.provider,model:d.role.model,reasoningLevel:d.role.reasoningLevel,serviceTier:d.role.serviceTier});}
   },e=>{if(active)setError(errorText(e));});return()=>{active=false;};},[rpc,projectId,team,role]);
   if(error) return <Notice>{error}</Notice>;
   if(!data) return <p>{ru?"Загрузка профиля…":"Loading profile…"}</p>;
@@ -1561,9 +1568,10 @@ function ExistingRolePolicy({projectId,team,role,labels,onAction}: {
 
     <p>{ru?"Шаблон скопирован при создании команды; последующие правки шаблона сюда не наследуются. Очистка списка означает отсутствие резервов, а не автоматический выбор модели.":"Templates are copied when creating a team; later template edits are not inherited. Clearing the list means no backups, not automatic model selection."}</p>
     <ExecutionPolicyEditor role={data.role} policy={policy} onChange={setPolicy} onValidityChange={setProblem} providers={providers} routing={routing} labels={labels}/>
-    <p>{ru?"Сохранение переформатирует конфиг и удалит YAML-комментарии. Профиль получат новые и заменённые сессии; текущая сессия не меняется.":"Saving reformats the config and removes YAML comments. New and replacement sessions receive the profile; the current session is unchanged."}</p>
+    <QuotaSourceEditor name={role} value={quotaSource} onChange={setQuotaSource} language={ru?"ru":"en"}/>
+    <p>{ru?"Сохранение переформатирует конфиг и удалит YAML-комментарии. Профиль модели получат новые и заменённые сессии. Источник квоты применяется к текущим проверкам и не меняет ключ агента.":"Saving reformats the config and removes YAML comments. New and replacement sessions receive the model profile. The quota source applies to current checks and does not change the agent key."}</p>
     <Button disabled={busy||!!problem} onClick={()=>{setBusy(true);void onAction(async()=>{
-      const result=await rpc.call("rolePolicy",{projectId,team,role,primary:Object.fromEntries(Object.entries({provider:primary?.providerId,model:primary?.model,reasoningLevel:primary?.reasoningLevel,serviceTier:primary?.serviceTier}).filter(([,value])=>value!==undefined)),policy:policy??null,expectedRevision:data.revision});setData(result);
+      const result=await rpc.call("rolePolicy",{projectId,team,role,primary:Object.fromEntries(Object.entries({provider:primary?.providerId,model:primary?.model,reasoningLevel:primary?.reasoningLevel,serviceTier:primary?.serviceTier}).filter(([,value])=>value!==undefined)),policy:policy??null,quotaSource:quotaSource??null,expectedRevision:data.revision});setData(result);
       return ru?"Профиль сохранён для новых сессий.":"Profile saved for new sessions.";
     }).finally(()=>setBusy(false));}}>{labels.save}</Button>
   </section>;
@@ -1671,7 +1679,7 @@ function RoleDetails({
           </Button>
         )}
       </div>
-      {role.inConfig && <Button onClick={()=>setEditingPolicy(value=>!value)}>{labels.executionPolicy}</Button>}
+      {role.inConfig && <Button onClick={()=>setEditingPolicy(value=>!value)}>{language==="ru"?"Профиль моделей и квот":"Models and quota profile"}</Button>}
       {editingPolicy && <ExistingRolePolicy key={`${projectId}:${team}:${role.name}`} projectId={projectId} team={team} role={role.name} labels={labels} onAction={onAction}/>}
       {role.inConfig&&<RoleContinuationControls projectId={projectId} team={team} role={role.name} threadId={role.threads[0]?.threadId??null} language={language} onChanged={()=>onAction(async()=>language==="ru"?"Состояние сотрудника обновлено.":"Employee state updated.")}/>}
       <RoleSessionCard

@@ -1,3 +1,4 @@
+import {emptyOpenRouter,type OpenRouterUsage} from "./openrouter-usage";
 // @vitest-environment jsdom
 // UI: панель Team (вкладки команд, мастер создания, исполнители, пакеты) и редактор шаблонов.
 import { afterEach, describe, expect, it } from "vitest";
@@ -205,7 +206,7 @@ const QA: TeamSnapshot = {
 };
 
 async function mount(
-  options: { snapshots?: TeamSnapshot[]; providers?: { enabled: string[]; disabled: string[] }; templates?: TeamTemplate[]; defaultTemplate?: string; session?: Partial<SessionView>; language?: "en" | "ru"; rotate?: () => Promise<SessionView>; recovery?:Partial<RecoveryView> } = {},
+  options: { snapshots?: TeamSnapshot[]; providers?: { enabled: string[]; disabled: string[] }; templates?: TeamTemplate[]; defaultTemplate?: string; session?: Partial<SessionView>; language?: "en" | "ru"; rotate?: () => Promise<SessionView>; recovery?:Partial<RecoveryView>;openrouter?:OpenRouterUsage } = {},
 ) {
   const app = await loadPluginApp(() => import("./app"));
   const calls: Array<{ method: string; input: unknown }> = [];
@@ -272,6 +273,7 @@ async function mount(
           log("continueCoordination")(input);const current=snapshots[0]!.resources!;snapshots=snapshots.map(s=>({...s,resources:{...current,blocked:null}}));return {...current,blocked:null};
         },
         quotaPolicy:()=>({pauseBelowPercent:10}),
+        openrouterUsage:()=>options.openrouter??emptyOpenRouter("route_unknown","unknown"),
         ollamaUsage:()=>({status:"ready",checkedAtMs:Date.now(),windows:[{name:"weekly",remainingPercent:0,resetsAtMs:Date.now()+3600_000}],reason:null}),
         deferredContinuation:(input:{role:string;action:string;expectedThreadId?:string;sendAt?:number;resumePaused?:boolean})=>{
           log("deferredContinuation")(input);
@@ -928,7 +930,7 @@ it("acceptance in the panel requires grounds and sends the viewed report id", as
 
 it("edits the existing employee profile with explicit approval and revision",async()=>{
  const {slot,calls}=await mount();fireEvent.click(await slot.findByText("Developer"));
- fireEvent.click(slot.getByRole("button",{name:"Fallback models",exact:true}));
+ fireEvent.click(slot.getByRole("button",{name:"Models and quota profile",exact:true}));
  const section=within(await slot.findByRole("region",{name:"Employee model profile"}));
  await act(async()=>{}); // settle the loaded profile before adding an unsaved fallback slot
  expect(section.getByText(/later template edits are not inherited/)).toBeTruthy();
@@ -1051,4 +1053,25 @@ it("requires the employee pause consent before scheduling",async()=>{
  fireEvent.click(panel.getByLabelText(/Replace the employee pause/));fireEvent.click(panel.getByText("In 30 minutes"));
  await panel.findByText(/waiting in BB queue/);
  expect(calls.find(c=>c.method==="deferredContinuation"&&(c.input as {action:string}).action==="schedule")?.input).toMatchObject({resumePaused:true});slot.lifecycle.unmount();
+});
+
+it("saves an explicit upstream quota source without transporting a secret",async()=>{
+ const {slot,calls}=await mount();fireEvent.click(await slot.findByText("Developer"));fireEvent.click(slot.getByRole("button",{name:"Models and quota profile",exact:true}));
+ const section=within(await slot.findByRole("region",{name:"Employee model profile"}));await act(async()=>{});
+ const source=within(section.getByRole("group",{name:"Quota source · developer"}));fireEvent.change(source.getByLabelText("Service"),{target:{value:"openrouter"}});
+ fireEvent.change(source.getByLabelText("Execution-host variable holding the actual key (not the key itself)"),{target:{value:"AGENT_OPENROUTER_KEY"}});
+ fireEvent.click(section.getByRole("button",{name:"Save",exact:true}));await slot.findByText("Profile saved for new sessions.");
+ expect(calls.find(c=>c.method==="rolePolicy"&&(c.input as {quotaSource?:unknown}).quotaSource)?.input).toMatchObject({quotaSource:{service:"openrouter",credentialEnv:"AGENT_OPENROUTER_KEY"}});slot.lifecycle.unmount();
+});
+it("separates OpenRouter free requests, key budget and unknown account balance in the employee card",async()=>{
+ const usage={...emptyOpenRouter(null),status:"ready" as const,keyId:"a".repeat(64),freeDaily:{used:45,limit:50,remaining:5,resetsAtMs:Date.now()+3600000},keyRemainingUsd:12};
+ const {slot}=await mount({openrouter:usage});fireEvent.click(await slot.findByText("Developer"));
+ const title=await slot.findByText("OpenRouter quota / connection source");fireEvent.click(title);
+ await slot.findByText(/Daily free requests: remaining 5 \/ 50/);expect(slot.getByText("Key spending cap remaining: $12")).toBeTruthy();expect(slot.getByText(/Account balance: not reported by this key/)).toBeTruthy();slot.lifecycle.unmount();
+});
+it("groups employees using the same OpenRouter key in the team summary",async()=>{
+ const usage={...emptyOpenRouter(null),status:"ready" as const,keyId:"a".repeat(64),freeDaily:{used:50,limit:50,remaining:0,resetsAtMs:Date.now()+3600000}};
+ const resources:ResourceSummary={sinceMs:0,policy:{taskAttempts:8,teamStarts:100,tokens:null,minutes:null},starts:0,remainingStarts:100,reportedTokens:null,usageCoverage:"unavailable",blocked:null,holds:{},attempts:[],fallbacks:[],quotaBlocks:[],taskCounts:[],openrouterUsage:{lead:usage,developer:usage}};
+ const snapshot={...SNAPSHOT,resources,roles:SNAPSHOT.roles.map(r=>({...r,model:"openrouter/free",threads:r.threads.map(t=>({...t,model:"openrouter/free"}))}))};
+ const {slot}=await mount({snapshots:[snapshot]});const summary=within(await slot.findByRole("region",{name:"Team work status"}));expect(summary.getByText("OpenRouter quota needs a decision")).toBeTruthy();expect(summary.getAllByText(/free requests remaining 0\/50/)).toHaveLength(1);slot.lifecycle.unmount();
 });

@@ -1,3 +1,4 @@
+import {openRouterUsageSchema,quotaSourceSchema} from "./openrouter-usage";
 // Host contract for the Team plugin's singular `bb.host` entry.
 //
 // The entry is a thin, validated bridge between the plugin server and the
@@ -242,6 +243,7 @@ export const hostContract = defineRpcContract({
    * unstaged binary diffs and the contents of untracked files. Editing a
    * dirty or untracked file without renaming it changes the fingerprint.
    */
+  openrouterUsage:{input:z.object({provider:z.string().min(1).max(100),model:z.string().max(300),cwd:absolutePath,binding:quotaSourceSchema.optional()}).strict(),output:openRouterUsageSchema},
   ollamaUsage: {
     input: z.object({}).strict(),
     output: ollamaUsageSchema,
