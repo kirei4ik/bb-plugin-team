@@ -174,3 +174,17 @@ it("cannot grant around the team cap or a failed tracker write",async()=>{
  await expect(f.control.extendCoordination(owner,1,1,async()=>{throw new Error("tracker offline");})).rejects.toThrow("tracker offline");
  expect((await f.control.inspect(f.scope)).taskLimits).toEqual({});
 });
+
+it("fresh Ollama evidence clears only that upstream account, keeping OpenRouter and counters",async()=>{
+ const f=fixture();
+ const ollama={...f.ctx(),requestedExecution:{...f.ctx().requestedExecution,model:"ollama-cloud/a"}};
+ await f.control.admit(ollama);await f.control.failed(f.fail(),[]);
+ const router={...f.ctx("other","router"),requestedExecution:{...f.ctx().requestedExecution,model:"openrouter/free"}};
+ await f.control.admit(router);await f.control.failed(f.fail({threadId:"other",requestId:"req-router"}),[]);
+ expect(await f.control.quotaExcluded(f.scope,{provider:"pi",model:"ollama-cloud/b"})).toBe(true);
+ expect(await f.control.quotaExcluded(f.scope,{provider:"pi",model:"openrouter/free"})).toBe(true);
+ await f.control.confirmOllamaCapacity("different-host");expect(await f.control.quotaExcluded(f.scope,{provider:"pi",model:"ollama-cloud/b"})).toBe(true);
+ await f.control.confirmOllamaCapacity("host");expect(await f.control.quotaExcluded(f.scope,{provider:"pi",model:"ollama-cloud/b"})).toBe(false);
+ expect(await f.control.quotaExcluded(f.scope,{provider:"pi",model:"openrouter/free"})).toBe(true);
+ expect((await f.control.inspect(f.scope)).starts).toBe(2);
+});

@@ -1,3 +1,4 @@
+import {isOllamaCloud,quotaHeadroom} from "./ollama-usage";
 import {useState} from "react";
 import {useRpc} from "@get-bb/plugin-sdk/app";
 import type {rpcContract} from "./server";
@@ -13,10 +14,18 @@ export function TeamRecoverySummary({snapshot,language,onChanged,onSelectRole}:{
   catch{setError(ru?"Состояние изменилось или продолжение не подтверждено. Обновите команду; дополнительные разрешения автоматически не выдаются.":"State changed or continuation was not confirmed. Refresh; no automatic extra allowance.");}
   finally{setBusy(false);}
  };
+ const quota=quotaHeadroom(budget?.ollamaUsage,budget?.quotaPolicy);
+ const affected=snapshot.roles.filter(r=>isOllamaCloud(r.threads[0]?.provider??r.provider??"",r.threads[0]?.model??r.model));
  const blocked=!!budget?.blocked;
  const title=snapshot.configError||snapshot.trackerError?(ru?"Нужен доступ к настройкам или задачам":"Configuration or task access is needed"):snapshot.paused?(ru?"Автозапуск команды приостановлен":"Team autostart paused"):view.coordination?(ru?"Руководитель ждёт разрешения продолжить":"Lead needs permission to continue"):blocked?(ru?"Команда ждёт решения по ограничению":"Team needs a limit decision"):view.modelProblem?(ru?"Сотруднику нужна помощь с продолжением":"An employee needs help continuing"):view.active.length?(ru?"Команда работает":"Team is working"):view.current?.status==="review"?(ru?"Результат ждёт проверки":"Result awaits review"):view.current?(ru?"Работа ожидает продолжения":"Work awaits continuation"):(ru?"Команда готова к новой задаче":"Team is ready for a new task");
  return <section aria-label={ru?"Что происходит в команде":"Team work status"} className="flex flex-col gap-2 rounded border border-border p-3 text-sm">
-  <strong>{title}</strong>
+  <strong>{quota.held?(ru?"Команда ждёт решения по общей квоте Ollama":"Team needs a shared Ollama quota decision"):title}</strong>
+  {quota.held&&<>
+   <p>{ru?`Осталось ${quota.remainingPercent}%, порог остановки ${budget?.quotaPolicy?.pauseBelowPercent??10}%. Новые ходы Ollama удерживаются; активные операции заканчиваются.`:`${quota.remainingPercent}% remains; new Ollama turns are held. Active operations finish.`}</p>
+   <p>{quota.resetAtMs?`${ru?"Все ограничивающие окна сбросятся не раньше":"All limiting windows reset no earlier than"} ${new Date(quota.resetAtMs).toLocaleString()}`:(ru?"Время восстановления квоты не подтверждено.":"Quota recovery time is unknown.")}</p>
+   <p>{ru?"Решите: продолжить позже или выбрать независимого провайдера. Другая модель Ollama использует ту же квоту. Лимит Team ожиданием не сбрасывается.":"Choose: continue later or use an independent provider. Another Ollama model shares the same quota. Waiting cannot reset Team budgets."}</p>
+   <div className="flex flex-wrap gap-2">{affected.map(r=><button key={r.name} onClick={()=>onSelectRole?.(r.name)}>{ru?"Настроить продолжение":"Set continuation"}: {r.title}</button>)}</div>
+  </> }
   {view.active.length>0&&<p>{ru?"Сейчас работают":"Working now"}: {view.active.map(r=>r.title).join(", ")}. {ru?"Их операции не прерываются.":"Their operations are not interrupted."}</p>}
   {view.current&&<p>{ru?"Текущая работа":"Current work"}: {view.current.title}</p>}
   {view.coordination?<>

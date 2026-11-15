@@ -43,7 +43,7 @@ export function ResourcePanel({snapshot,language,onChanged,onSelectRole}:{snapsh
   <summary>{ru?"Лимиты, квоты и история":"Limits, quotas and history"}</summary>
   <div className="mt-2 flex flex-col gap-2">
   <p>{ru?"Запуски команды":"Team starts"}: {state.starts}/{state.policy.teamStarts} · {ru?"осталось":"remaining"} {state.remainingStarts}</p>
-   {snapshot.roles.some(r=>isOllamaCloud(r.provider??"",r.model))&&<OllamaQuotaCard projectId={snapshot.projectId} team={snapshot.team} language={language}/>}
+   {snapshot.roles.some(r=>isOllamaCloud(r.threads[0]?.provider??r.provider??"",r.threads[0]?.model??r.model))&&<OllamaQuotaCard projectId={snapshot.projectId} team={snapshot.team} language={language}/>}
    {state.blocked&&<><p role="alert">{stopLabel(state.blocked,ru)}</p><details><summary>{ru?"Техническая причина":"Technical cause"}</summary>{state.blocked}</details></>}
    <details><summary>{ru?"Что учитывается":"Accounting details"}</summary><p>{ru?"Учёт с":"Accounting since"} {new Date(state.sinceMs).toLocaleString()} · {ru?"Допуски запусков, включая зарезервированные; это не число внутренних запросов провайдера.":"Start admissions include reservations; these are not the provider's internal API calls."}</p>
    <p>{ru?"Накопленные сообщённые токены":"Reported cumulative tokens"}: {state.reportedTokens===null?(ru?"недоступны":"unavailable"):`${state.reportedTokens} (${ru?"неполный учёт":"partial coverage"})`}. {ru?"Контекст треда сюда не входит. Денежный расход неизвестен; жёсткий денежный предел не гарантируется.":"Context-window size is excluded. Monetary cost is unknown; no hard spending guarantee."}</p>

@@ -214,6 +214,7 @@ async function mount(
   };
   let snapshots = options.snapshots ?? [SNAPSHOT];
   let requested = false;
+  let deferred:import("./deferred-continuation").DeferredContinuation|null=null;
   const pausedRoles=new Set<string>();
   const actualModels=new Map<string,{provider:string;model:string;reasoningLevel?:string}>();
   const roleThreads=new Map<string,string>();
@@ -269,6 +270,14 @@ async function mount(
         },
         continueCoordination:(input:{taskId:string|number;expectedStarts:number;expectedUsed:number})=>{
           log("continueCoordination")(input);const current=snapshots[0]!.resources!;snapshots=snapshots.map(s=>({...s,resources:{...current,blocked:null}}));return {...current,blocked:null};
+        },
+        quotaPolicy:()=>({pauseBelowPercent:10}),
+        ollamaUsage:()=>({status:"ready",checkedAtMs:Date.now(),windows:[{name:"weekly",remainingPercent:0,resetsAtMs:Date.now()+3600_000}],reason:null}),
+        deferredContinuation:(input:{action:string;expectedThreadId?:string;sendAt?:number})=>{
+          log("deferredContinuation")(input);
+          if(input.action==="schedule")deferred={threadId:input.expectedThreadId!,taskId:7,sendAt:input.sendAt!,stage:"scheduled",fingerprint:"fixture",queuedMessageId:"queued",owned:true,previousSendAt:null,reason:null};
+          if(input.action==="cancel")deferred=null;
+          return {record:deferred};
         },
         roleControl: (input:{role:string;action:string;expectedThreadId?:string;selection?:{provider:string;model:string;reasoningLevel?:string}})=>{
           log("roleControl")(input);if(input.action==="pause"||input.action==="switch")pausedRoles.add(input.role);if(input.action==="resume")pausedRoles.delete(input.role);
@@ -922,7 +931,7 @@ it("edits the existing employee profile with explicit approval and revision",asy
  const section=within(await slot.findByRole("region",{name:"Employee model profile"}));
  expect(section.getByText(/later template edits are not inherited/)).toBeTruthy();
  fireEvent.click(section.getByText(labels.addFallback));
- expect((section.getByRole("button",{name:"Save",exact:true}) as HTMLButtonElement).disabled).toBe(true);
+ await waitFor(()=>expect((section.getByRole("button",{name:"Save",exact:true}) as HTMLButtonElement).disabled).toBe(true));
  const fallback=within(section.getByText(/Fallback models: developer/).parentElement!.parentElement!);
  fireEvent.click(fallback.getByText("Select model"));await fallback.findByLabelText("Model");await act(async()=>{});
  fireEvent.change(fallback.getByLabelText("Provider ID"),{target:{value:"pi"}});
@@ -1009,4 +1018,25 @@ it("a completed-task employee can save a provider/model for future work without 
  fireEvent.click(consent);fireEvent.click(wizard.getByText("Save model for future tasks"));await wizard.findByText(/Model saved for future tasks/);
  expect(calls.filter(c=>c.method==="rolePolicy").at(-1)?.input).toMatchObject({expectedRevision:"rev-1",primary:{provider:"codex",model:"gpt-4"}});
  expect(calls.filter(c=>c.method==="roleControl"&&(c.input as {action:string}).action!=="status")).toHaveLength(0);slot.lifecycle.unmount();
+});
+
+it("schedules native queued continuation explicitly and exposes cancellation",async()=>{
+ const {slot,calls}=await mount();fireEvent.click(await slot.findByText("Developer"));
+ const panel=within(await slot.findByRole("region",{name:"Continue later"}));
+ expect(calls.filter(c=>c.method==="deferredContinuation"&&(c.input as {action:string}).action==="schedule")).toHaveLength(0);
+ fireEvent.click(panel.getByText("In 30 minutes"));
+ await panel.findByText(/waiting in BB queue/);
+ expect(calls.find(c=>c.method==="deferredContinuation"&&(c.input as {action:string}).action==="schedule")?.input).toMatchObject({expectedThreadId:"thr_d",role:"developer",action:"schedule"});
+ fireEvent.click(panel.getByText("Cancel and leave paused"));await panel.findByText("In 30 minutes");
+ slot.lifecycle.unmount();
+});
+it("shows one shared quota decision with affected employees and an honest reset",async()=>{
+ const quotaSnapshot={...SNAPSHOT,roles:SNAPSHOT.roles.map(r=>({...r,provider:"pi",model:"ollama-cloud/test",threads:r.threads.map(t=>({...t,provider:"pi",model:"ollama-cloud/test"}))})),resources:{sinceMs:1000,policy:{taskAttempts:8,teamStarts:100,tokens:null,minutes:null},starts:61,remainingStarts:39,reportedTokens:null,usageCoverage:"unavailable" as const,blocked:null,holds:{},attempts:[],taskCounts:[],quotaBlocks:[],fallbacks:[],quotaPolicy:{pauseBelowPercent:10},ollamaUsage:{status:"ready" as const,checkedAtMs:Date.now(),windows:[{name:"weekly" as const,remainingPercent:0,resetsAtMs:Date.now()+3600_000}],reason:null}}};
+ const {slot}=await mount({snapshots:[quotaSnapshot],language:"ru"});
+ expect(await slot.findByText("Команда ждёт решения по общей квоте Ollama")).toBeTruthy();
+ const summary=within(slot.getByRole("region",{name:"Что происходит в команде"}));
+ expect(summary.getByText(/Осталось 0%, порог остановки 10%/)).toBeTruthy();
+ expect(summary.getByText(/Лимит Team ожиданием не сбрасывается/)).toBeTruthy();
+ fireEvent.click(summary.getByRole("button",{name:"Настроить продолжение: Developer"}));
+ expect(await slot.findByRole("region",{name:"Продолжить позже"})).toBeTruthy();slot.lifecycle.unmount();
 });

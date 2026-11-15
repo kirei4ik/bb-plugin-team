@@ -336,3 +336,29 @@ Startup restoration now runs through the SDK background lifecycle after factory
 registration, not before host RPC is available; no polling or observer model.
 A global Team hold does not trigger checkpoint requests/cold replacement sessions,
 and a worker's submitted review remains awaiting acceptance rather than an error.
+
+### Quota headroom and deferred continuation
+
+Team holds new Pi/Ollama Cloud turns at or below the team's remaining-quota
+threshold (default 10%, editable under resource details). All account windows
+matter; switching Ollama models does not change this shared quota. Checks run
+before new turns, cached up to three minutes, and do not interrupt active work.
+There is no quota polling or model call to monitor the account. Other projects
+may consume the same account, so the threshold is headroom, not a guarantee.
+
+After an early quota hold, a positive balance alone does not authorize restart.
+In an employee card, explicitly continue the queue, select an independent
+approved model, or choose **Continue later**: 30 minutes, two hours, after all
+limiting windows reset, or a local date/time. BB's native `sendAt` queue owns the
+schedule. The original pending row is moved; a failed turn uses native retry.
+Idle employees without queued work are not started. Multiple pending rows need
+inspection in the native thread queue first. Scheduling never increases a task
+or team budget, clears a manual pause, or creates a new session.
+
+At the deadline Team rechecks the exact session/task/queued row, fresh Ollama
+headroom and execution budgets. A changed task, unknown/low balance, unrelated
+error or exhausted Team budget requires another human decision, without a
+retry loop. Other providers use known BB exclusions; Team cannot assert their
+unknown remaining balance. Cancellation leaves the employee paused and deletes
+only its own retry row; an existing user row keeps its content and prior date.
+A lost queue RPC response requires inspection, never blind duplicate retry.

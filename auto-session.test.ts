@@ -1219,3 +1219,15 @@ it("a lead coordination hold does not falsely turn a worker's submitted review i
   expect((await f.snapshotRole("lead")).executionState).toMatchObject({kind:"error",errorCode:"resource_hold"});expect((await f.snapshotRole("dev")).executionState).toMatchObject({kind:"awaiting-acceptance"});
  }finally{await f.dispose();}
 });
+
+it("explicit employee resume re-arms only the deterministic old factory error",async()=>{
+ const fx=await setup();try{
+  const {task}=await fx.cli(["task","add","dev","First","--send"]) as {task:{id:number|string}};
+  const key="auto-continue:proj_flow:main:dev";
+  const record={taskId:task.id,originThreadId:"thr_dev",reason:"context",stage:"failed",errorCode:"auto_continue_failed",error:"bd list: host plugin calls are unavailable during factory registration; call from a handler, service, or timer",notifiedStage:null,requestedAtMs:Date.now(),updatedAtMs:Date.now()};
+  await fx.setKv(key,record);await fx.control({action:"resume",expectedThreadId:"thr_dev"});
+  expect((await fx.kv(key) as {stage:string}).stage).toBe("awaiting-checkpoint");expect(fx.spawnCalls()).toBe(0);
+  await fx.setKv(key,{...record,error:"spawn result unknown",errorCode:"spawn_uncertain"});await fx.control({action:"resume",expectedThreadId:"thr_dev"});
+  expect((await fx.kv(key) as {stage:string}).stage).toBe("failed");expect(fx.spawnCalls()).toBe(0);
+ }finally{await fx.dispose();}
+});

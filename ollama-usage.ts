@@ -28,3 +28,16 @@ export function parseOllamaBalance(raw: unknown, checkedAtMs: number): OllamaUsa
   }
   return windows.length ? {status:"ready",checkedAtMs,windows,reason:null} : bad;
 }
+
+// Shared upstream account: every window must have headroom. Unknown data is
+// explicitly unknown, never evidence of restored capacity.
+export const quotaPolicySchema = z.object({pauseBelowPercent:z.number().finite().min(0).max(50)}).strict();
+export const DEFAULT_QUOTA_POLICY = {pauseBelowPercent:10};
+export type QuotaPolicy = z.infer<typeof quotaPolicySchema>;
+export function quotaHeadroom(usage:OllamaUsage|undefined, policy:QuotaPolicy=DEFAULT_QUOTA_POLICY) {
+  const low=usage?.windows.filter(w=>w.remainingPercent<=policy.pauseBelowPercent)??[];
+  return {unknown:usage?.status!=="ready"||!usage.windows.length, held:low.length>0,
+    remainingPercent:usage?.windows.length?Math.min(...usage.windows.map(w=>w.remainingPercent)):null,
+    // All blocking windows must reset, not just the first one.
+    resetAtMs:low.length&&low.every(w=>w.resetsAtMs!==null)?Math.max(...low.map(w=>w.resetsAtMs!)):null};
+}

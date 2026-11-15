@@ -1,6 +1,7 @@
+import { queuedFingerprint, deferredKey, deferredContinuationSchema, readDeferred, scheduleDeferred, cancelDeferred } from "./deferred-continuation";
 import { recoveryViewSchema, manualExecutionApprovalSchema, type RecoveryView, type RecoveryBlocker } from "./recovery-view";
 import { hostContract } from "./host-contract";
-import { ollamaUsageSchema, isOllamaCloud, exhaustedOllama, type OllamaUsage } from "./ollama-usage";
+import { ollamaUsageSchema, isOllamaCloud, exhaustedOllama, quotaHeadroom, quotaPolicySchema, DEFAULT_QUOTA_POLICY, type OllamaUsage } from "./ollama-usage";
 import { verifyQuotaBoundary } from "./checkpoint";
 import { ResourceControl, resourcePolicySchema, withResourceResults, confirmedQuota, independentQuotaSelection, type ResourceOwner, type ResourceSummary } from "./resource-control";
 import { executionPolicySchema, withExecutionProfile, type ExecutionFallbackSelection } from "./execution-policy";
@@ -437,7 +438,14 @@ export const rpcContract = defineRpcContract({
     output:z.object({role:templateRoleSchema,source:z.string(),revision:z.string()}),
   },
   ollamaUsage: {
-    input:z.object({projectId:projectIdSchema,team:teamSchema,refresh:z.boolean().optional()}).strict(),output:ollamaUsageSchema,
+    input:z.object({projectId:projectIdSchema,team:teamSchema,refresh:z.boolean().optional(),role:z.string().optional()}).strict(),output:ollamaUsageSchema,
+  },
+  quotaPolicy: {
+    input:z.object({projectId:projectIdSchema,team:teamSchema,policy:quotaPolicySchema.optional()}).strict(),output:quotaPolicySchema,
+  },
+  deferredContinuation: {
+    input:z.object({projectId:projectIdSchema,team:teamSchema,role:z.string(),action:z.enum(["status","schedule","cancel","check"]),expectedThreadId:z.string().optional(),sendAt:z.number().finite().optional()}).strict(),
+    output:z.object({record:deferredContinuationSchema.nullable()}),
   },
   roleRecovery: {
     input:z.object({projectId:projectIdSchema,team:teamSchema,role:z.string(),selection:executionPolicySchema.shape.fallbacks.element.optional()}).strict(),output:recoveryViewSchema,
@@ -918,13 +926,19 @@ export default async function plugin(bb: BbPluginApi) {
       try {data=await quotaHost.call("ollamaUsage",{},{hostId,timeoutMs:12_000});}
       catch {data={status:"unavailable",checkedAtMs:Date.now(),windows:[],reason:"host_unavailable"};}
       // A failed refresh cannot silently release a previously exhausted account.
-      if(data.status!=="ready"&&prior.success&&exhaustedOllama(prior.data))data={...prior.data,status:"unavailable",reason:data.reason,checkedAtMs:data.checkedAtMs,observedAtMs:prior.data.observedAtMs??prior.data.checkedAtMs};
+      if(data.status!=="ready"&&prior.success&&quotaHeadroom(prior.data,{pauseBelowPercent:50}).held)data={...prior.data,status:"unavailable",reason:data.reason,checkedAtMs:data.checkedAtMs,observedAtMs:prior.data.observedAtMs??prior.data.checkedAtMs};
       await bb.storage.kv.set(key,data);return data;
     })();quotaPending.set(hostId,pending);
     try{return await pending;}finally{quotaPending.delete(hostId);}
   };
   const rolePauseKey=(scope:Pick<Scope,"projectId"|"team">,role:string)=>`role-paused:${scope.projectId}:${scope.team}:${role}`;
+  const quotaWaitKey=(scope:Pick<Scope,"projectId"|"team">,role:string)=>`quota-wait:${scope.projectId}:${scope.team}:${role}`;
   const isRolePaused=async(scope:Pick<Scope,"projectId"|"team">,role:string)=>await bb.storage.kv.get<boolean>(rolePauseKey(scope,role))===true;
+
+  const readQuotaPolicy=async(scope:Pick<Scope,"projectId"|"team">)=>{
+    const parsed=quotaPolicySchema.safeParse(await bb.storage.kv.get(`quota-policy:${scope.projectId}:${scope.team}`));
+    return parsed.success?parsed.data:DEFAULT_QUOTA_POLICY;
+  };
 
   bb.experimental_hooks.on("message.dispatch", async (ctx) => {
     const meta = await bb.sdk.threads.getPluginMetadata({threadId:ctx.thread.id}) as Record<string,unknown>;
@@ -939,11 +953,53 @@ export default async function plugin(bb: BbPluginApi) {
     const paused=pauseDecision(ctx.thread.id,{initiator:ctx.initiator,originPluginId:ctx.originPluginId},bb.pluginId,pausedThreads,messages(currentLang).pauseWaitReason);
     if(paused.action!=="proceed")return paused;
     if(mark && await isRolePaused({projectId:ctx.thread.projectId,team:mark.team},mark.role))return {action:"wait" as const,reason:currentLang==="ru"?"Сотрудник на паузе: новые ходы удерживаются. Продолжите его в Team.":"Employee is paused; resume the role in Team."};
-    if(isOllamaCloud(ctx.requestedExecution?.providerId,ctx.requestedExecution?.model)){
+    const scope=mark?{projectId:ctx.thread.projectId,team:mark.team}:null;
+    const key=scope&&mark?deferredKey(scope.projectId,scope.team,mark.role):null;
+    const deferred=key?await readDeferred(bb,key):null;
+    const scheduled=deferred&&deferred.stage!=="released"?deferred:null;
+    const wait=async(reason:string)=>{
+      if(scheduled&&key&&Date.now()>=scheduled.sendAt){await bb.storage.kv.set(key,{...scheduled,stage:"needs-decision",reason});publishChange(ctx.thread.projectId);}
+      return {action:"wait" as const,reason};
+    };
+    if(scheduled){
+      if(scheduled.stage!=="scheduled")return {action:"wait" as const,reason:scheduled.reason??"Inspect the scheduled continuation in Team before retrying"};
+      if(Date.now()<scheduled.sendAt)return {action:"wait" as const,reason:"Team: continuation scheduled for "+new Date(scheduled.sendAt).toISOString()};
+      if(scheduled.threadId!==ctx.thread.id||ctx.queuedMessages?.length!==1||ctx.queuedMessages[0]?.id!==scheduled.queuedMessageId||ctx.queuedMessages[0]?.sendAt!==scheduled.sendAt||queuedFingerprint(ctx.queuedMessages[0] as unknown as Record<string,unknown>)!==scheduled.fingerprint)return wait("Scheduled session or queued work changed; inspect the thread queue");
       const owner=await resourceOwner(ctx.thread.id);
-      if(owner?.hostId){const usage=await cloudUsage(owner.hostId);if(exhaustedOllama(usage))return {action:"wait" as const,reason:currentLang==="ru"?"Ollama Cloud: квота аккаунта исчерпана. Проверьте сброс или выберите утверждённую резервную модель в Team; смена модели Ollama не обновляет квоту.":"Ollama Cloud account quota exhausted; inspect reset or select an approved independent backup in Team."};}
+      if(!owner||owner.taskId!==scheduled.taskId)return wait("The task binding changed; inspect the current work before continuing");
+      if(owner.taskId!==null){
+        const {t}=await loadLang();const task=(await readTasks(await scopeFor(owner.projectId,owner.team,t))).tasks.find(task=>task.id===owner.taskId);
+        if(!task||task.role!==owner.role||task.status!=="in-progress")return wait("The task was finished, reassigned or submitted for review; inspect it before continuing");
+      }
     }
-    return resources.admit(ctx);
+    const owner=await resourceOwner(ctx.thread.id);
+    if(owner&&isOllamaCloud(ctx.requestedExecution?.providerId,ctx.requestedExecution?.model)){
+      const policy=await readQuotaPolicy(owner);
+      const usage=owner.hostId?await cloudUsage(owner.hostId,!!scheduled):undefined;
+      const quota=quotaHeadroom(usage,policy);
+      const quotaKey=quotaWaitKey(owner,owner.role);
+      if(quota.held||scheduled&&quota.unknown){
+        const reason=currentLang==="ru"?`Ollama Cloud: ${quota.unknown?"свежая квота не подтверждена":`осталось ${quota.remainingPercent}% при пороге ${policy.pauseBelowPercent}%`}. Новые ходы удерживаются. Выберите время продолжения или независимую модель в Team.`:`Ollama Cloud: quota headroom unavailable or at/below ${policy.pauseBelowPercent}%. Choose a continuation time or independent model in Team.`;
+        if(await bb.storage.kv.get(quotaKey)!==reason){await bb.storage.kv.set(quotaKey,reason);publishChange(owner.projectId);}
+        return wait(reason);
+      }
+      if(!scheduled&&await bb.storage.kv.get(quotaKey))return wait(currentLang==="ru"?"Квота восстановилась, но сотрудник ждёт вашего решения. Нажмите «Продолжить очередь» или назначьте время в Team.":"Quota recovered; waiting for your decision. Continue queued work or schedule it in Team.");
+      if(scheduled&&owner.hostId){await resources.confirmOllamaCapacity(owner.hostId);await bb.storage.kv.delete(quotaKey);}
+    }
+    if(scheduled&&owner){
+      const summary=await resources.inspect(owner);
+      const held=summary.holds[owner.taskId===null?`role:${owner.role}`:`task:${owner.taskId}`];
+      if(held){
+        if(!isOllamaCloud(ctx.requestedExecution?.providerId,ctx.requestedExecution?.model)||!["rate-limit","budget-exceeded"].includes(held))return wait("A provider or execution error still needs a manual decision: "+held);
+        await resources.decide(owner,"User scheduled continuation; fresh Ollama account quota verified",undefined,owner.taskId??undefined,owner.role);
+      }
+    }
+    const admission=await resources.admit(ctx);
+    if(scheduled&&key){
+      if(admission.action!=="proceed")return wait("Team/task budget or another execution guard still holds this continuation");
+      await bb.storage.kv.set(key,{...scheduled,stage:"released",reason:null});publishChange(ctx.thread.projectId);
+    }
+    return admission;
   });
 
   /** Team context: config (if any), lead, role threads and helpers. */
@@ -1693,6 +1749,17 @@ export default async function plugin(bb: BbPluginApi) {
         }
       }
       if (await readPause(scope) || await isRolePaused(scope,role) || (await resources.inspect(scope)).blocked) return; // an explicit decision/resume retries
+      const deferred=await readDeferred(bb,deferredKey(scope.projectId,scope.team,role));
+      if(deferred&&deferred.stage!=="released")return; // core's scheduled message owns this continuation
+      const currentMeta=await bb.sdk.threads.getPluginMetadata({threadId:thread.threadId}) as {teamExecution?:ExecutionFallbackSelection};
+      const currentRole=(await readTeamConfig(bb,scope,scope.team,t)).config.roles.find(r=>r.name===role);
+      if(isOllamaCloud(thread.provider,currentMeta.teamExecution?.model??currentRole?.model)){
+        const owner=await resourceOwner(thread.threadId);
+        if(owner?.hostId){
+          if(quotaHeadroom(await cloudUsage(owner.hostId),await readQuotaPolicy(scope)).held){await bb.storage.kv.set(quotaWaitKey(scope,role),"Ollama Cloud: account headroom is below the safety threshold; decide when/how to continue");return;}
+          if(await bb.storage.kv.get(quotaWaitKey(scope,role)))return;
+        }
+      }
       // A substantive checkpoint must come from the agent. Missing or stale →
       // explicit wait plus a notification; never a fabricated checkpoint.
       const ref = await bb.storage.kv.get<{taskId: TaskId}>(checkpointRefKey(scope, role));
@@ -2321,7 +2388,7 @@ export default async function plugin(bb: BbPluginApi) {
     }
     roles.sort((a, b) => Number(b.lead) - Number(a.lead));
     const resourceSummary=withResourceResults(await resources.inspect(scope),store.tasks);
-    if(roles.some(r=>isOllamaCloud(r.provider??"",r.model)))resourceSummary.ollamaUsage=await cloudUsage(scope.hostId);
+    if(roles.some(r=>isOllamaCloud(r.threads[0]?.provider??r.provider??"",r.threads[0]?.model??r.model))){resourceSummary.ollamaUsage=await cloudUsage(scope.hostId);resourceSummary.quotaPolicy=await readQuotaPolicy(scope);}
     const withExecutionState: SnapshotRole[] = [];
     for (const role of roles) {
       const intent = await readReplacementIntent(bb, scope.projectId, scope.team, role.name);
@@ -2343,7 +2410,8 @@ export default async function plugin(bb: BbPluginApi) {
       const quotaOwner=isOllamaCloud(actual?.provider??role.provider??"",actual?.model??role.model)&&role.threads[0]?await resourceOwner(role.threads[0].threadId):null;
       const sharedHold=resourceSummary.blocked;
       const ownsSharedHold=!!sharedHold&&(role.tasks.some(t=>sharedHold.includes(`(task:${t.id}:`))||role.lead&&!sharedHold.includes("(task:"));
-      const resourceReason=resourceSummary.holds[task?`task:${task.id}`:`role:${role.name}`]??(ownsSharedHold?sharedHold:null)??(quotaOwner?.hostId===scope.hostId&&exhaustedOllama(resourceSummary.ollamaUsage)?"Ollama Cloud account quota exhausted; refresh quota after reset or choose an approved independent model":null);
+      const quotaWait=await bb.storage.kv.get<string>(quotaWaitKey(scope,role.name));
+      const resourceReason=(isOllamaCloud(role.threads[0]?.provider??role.provider??"",role.threads[0]?.model??role.model)?quotaWait:null)??resourceSummary.holds[task?`task:${task.id}`:`role:${role.name}`]??(ownsSharedHold?sharedHold:null)??(quotaOwner?.hostId===scope.hostId&&quotaHeadroom(resourceSummary.ollamaUsage,resourceSummary.quotaPolicy).held?"Ollama Cloud account quota at/below the safety threshold; schedule continuation after reset or choose an independent model":null);
       if(!active&&resourceReason&&executionState?.kind!=="error")executionState={kind:"error",taskId:task?.id??null,errorCode:"resource_hold",errorMessage:resourceReason,safeAction:"Inspect Team resources and record a concrete decision; replacing the session cannot reset the budget",atMs:Date.now()};
       if(!active&&sharedHold&&!ownsSharedHold&&!resourceReason&&executionState?.kind!=="error"&&executionState?.kind!=="awaiting-acceptance")executionState={kind:"awaiting-team-decision",taskId:task?.id??null,errorCode:null,safeAction:null,atMs:Date.now()};
       const presented={...role,threads:role.threads.map(thread=>({...thread,...(actual&&actual.provider===thread.provider?{model:actual.model}:{} )}))};
@@ -2566,7 +2634,7 @@ export default async function plugin(bb: BbPluginApi) {
           if(catalog.modelLoadError||!catalog.providers.some(p=>p.id===selection.provider&&p.available)||!model||selection.reasoningLevel&&!model.supportedReasoningEfforts.some(r=>r.reasoningEffort===selection.reasoningLevel)||selection.serviceTier&&!model.supportedServiceTiers?.some(tier=>tier.id===selection.serviceTier))add("model_unavailable");
           if(isOllamaCloud(selection.provider,selection.model)){
             const owner=await resourceOwner(view.threadId);const usage=owner?.hostId?await cloudUsage(owner.hostId):undefined;
-            view.quota=usage?.status==="ready"?exhaustedOllama(usage)?"exhausted":"available":"unknown";
+            view.quota=usage?.status==="ready"?quotaHeadroom(usage,await readQuotaPolicy(scope)).held?"exhausted":"available":"unknown";
             if(view.quota!=="available")add(view.quota==="exhausted"?"quota_exhausted":"quota_unknown");
           }
         }
@@ -3063,8 +3131,52 @@ export default async function plugin(bb: BbPluginApi) {
         return {role:updated,source:loaded.source,revision:createHash("sha256").update(next).digest("hex")};
       });
     },
-    async ollamaUsage({projectId,team,refresh}) {
+    async quotaPolicy({projectId,team,policy}) {
       const {t}=await loadLang();const scope=await scopeFor(projectId,team,t);
+      if(policy){await bb.storage.kv.set(`quota-policy:${projectId}:${team}`,policy);publishChange(projectId);}
+      return readQuotaPolicy(scope);
+    },
+    async deferredContinuation({projectId,team,role:roleName,action,expectedThreadId,sendAt}) {
+      const {t}=await loadLang();const scope=await scopeFor(projectId,team,t);const key=deferredKey(projectId,team,roleName);
+      if(action==="status")return {record:await readDeferred(bb,key)};
+      return withScopeLock(scope,async()=>{
+        const {rows}=await teamContext(scope,t);const list=rows.get(roleName)??[];
+        if(list.length!==1||list[0]!.threadId!==expectedThreadId)throw new experimental_PluginRpcRefusal({code:"conflict",message:"Session changed; refresh the employee card"});
+        if(action==="check"){
+          const record=await readDeferred(bb,key);
+          if(!record||record.threadId!==expectedThreadId||!record.queuedMessageId||record.stage==="released")throw new experimental_PluginRpcRefusal({code:"conflict",message:"No confirmed queued continuation; inspect the thread queue"});
+          const row=(await bb.sdk.threads.queuedMessages.list({threadId:record.threadId})).find(r=>r.id===record.queuedMessageId);
+          if(!row||row.sendAt!==record.sendAt||queuedFingerprint(row)!==record.fingerprint)throw new experimental_PluginRpcRefusal({code:"conflict",message:"Queued continuation changed; inspect it before retrying"});
+          await bb.storage.kv.set(key,{...record,stage:"scheduled",reason:null});
+          await bb.experimental_hooks.recheck("message.dispatch");publishChange(projectId);return {record:await readDeferred(bb,key)};
+        }
+        if(action==="cancel"){
+          // Cancelling a timer is not permission to run its original input now.
+          await bb.storage.kv.set(rolePauseKey(scope,roleName),true);
+          await cancelDeferred(bb,key);publishChange(projectId);return {record:null};
+        }
+        if(!sendAt)throw new experimental_PluginRpcRefusal({code:"invalid",message:"Choose a future time"});
+        if(await readPause(scope)||await isRolePaused(scope,roleName))throw new experimental_PluginRpcRefusal({code:"conflict",message:"Resume the explicit team/employee pause first; scheduling never overrides a manual pause"});
+        const intent=await readReplacementIntent(bb,projectId,team,roleName);
+        if(intent&&intent.stage!=="complete")throw new experimental_PluginRpcRefusal({code:"conflict",message:"Resolve the unfinished session replacement first"});
+        if((await resources.inspect(scope)).blocked)throw new experimental_PluginRpcRefusal({code:"conflict",message:"Resolve the task/team budget first; waiting cannot replenish it"});
+        const thread=await bb.sdk.threads.get({threadId:expectedThreadId!});
+        if(!["idle","error"].includes(thread.status))throw new experimental_PluginRpcRefusal({code:"conflict",message:"Wait until the current operation ends"});
+        const owner=await resourceOwner(thread.id);if(!owner)throw new Error("Employee binding unavailable");
+        const summary=await resources.inspect(scope);
+        const failed=[...summary.attempts].reverse().find(a=>a.threadId===thread.id&&a.outcome==="failed");
+        const record=await scheduleDeferred(bb,key,{threadId:thread.id,taskId:owner.taskId,sendAt,failed:thread.status==="error",...(failed?.requestId?{turnRequestId:failed.requestId}:{})});
+        publishChange(projectId);return {record};
+      });
+    },
+    async ollamaUsage({projectId,team,refresh,role}) {
+      const {t}=await loadLang();const scope=await scopeFor(projectId,team,t);
+      if(role){
+        const list=(await teamContext(scope,t)).rows.get(role)??[];
+        const owner=list.length===1?await resourceOwner(list[0]!.threadId):null;
+        if(!owner?.hostId)return {status:"unavailable" as const,checkedAtMs:Date.now(),windows:[],reason:"host_unavailable" as const};
+        return cloudUsage(owner.hostId,refresh);
+      }
       return cloudUsage(scope.hostId,refresh);
     },
     async roleRecovery({projectId,team,role,selection}) {
@@ -3095,6 +3207,23 @@ export default async function plugin(bb: BbPluginApi) {
         const key=rolePauseKey(scope,roleName);
         if(action==="pause")await bb.storage.kv.set(key,true);
         if(action==="resume") {
+          const meta=await bb.sdk.threads.getPluginMetadata({threadId:threadId!}) as {teamExecution?:ExecutionFallbackSelection};
+          const actual=meta.teamExecution??{provider:configured.provider??"",model:configured.model??""};
+          if(isOllamaCloud(actual.provider,actual.model)){
+            const owner=await resourceOwner(threadId!);const summary=await resources.inspect(scope);
+            const hold=owner?summary.holds[owner.taskId===null?`role:${owner.role}`:`task:${owner.taskId}`]:undefined;
+            if(await bb.storage.kv.get(quotaWaitKey(scope,roleName))||hold&&["rate-limit","budget-exceeded"].includes(hold)){
+              const quota=quotaHeadroom(owner?.hostId?await cloudUsage(owner.hostId,true):undefined,await readQuotaPolicy(scope));
+              if(quota.unknown||quota.held)throw new experimental_PluginRpcRefusal({code:"conflict",message:"Ollama quota is unknown or below the safety threshold; schedule later or choose an independent model"});
+              if(owner?.hostId){await resources.confirmOllamaCapacity(owner.hostId);if(hold)await resources.decide(owner,"User resumed after a fresh Ollama account quota check",undefined,owner.taskId??undefined,owner.role);}
+            }
+          }
+          await bb.storage.kv.delete(quotaWaitKey(scope,roleName));
+          const previous=await readAutoContinue(scope,roleName);
+          if(previous?.stage==="failed"&&/host plugin calls.*factory registration/.test(previous.error??"")){
+            const intent=await readReplacementIntent(bb,projectId,team,roleName);
+            if(!intent||intent.stage==="complete")await writeAutoContinue(scope,roleName,{...previous,stage:"awaiting-checkpoint",errorCode:null,error:null,updatedAtMs:Date.now()});
+          }
           await bb.storage.kv.delete(key);await bb.experimental_hooks.recheck("message.dispatch");
           if(await readAutoContinue(scope,roleName))await runAutoContinue(scope,roleName,t);else await dispatchNextPackage(scope,roleName,t);
           const current=(await teamContext(scope,t)).rows.get(roleName)??[];threadId=current.length===1?current[0]!.threadId:null;
@@ -3111,7 +3240,7 @@ export default async function plugin(bb: BbPluginApi) {
           }
           const owner=await resourceOwner(threadId!);
           const usage=isOllamaCloud(selection.provider,selection.model)?owner?.hostId?await cloudUsage(owner.hostId,true):{status:"unavailable" as const,checkedAtMs:Date.now(),windows:[],reason:"host_unavailable" as const}:undefined;
-          if(usage&&(usage.status!=="ready"||exhaustedOllama(usage)))throw new experimental_PluginRpcRefusal({code:"conflict",message:"Backup quota is exhausted or unavailable; choose an independent model or wait"});
+          if(usage&&(usage.status!=="ready"||quotaHeadroom(usage,await readQuotaPolicy(scope)).held))throw new experimental_PluginRpcRefusal({code:"conflict",message:"Backup quota is exhausted or unavailable; choose an independent model or wait"});
           if(await readPause(scope))throw new experimental_PluginRpcRefusal({code:"conflict",message:"The team is paused; resume it first"});
           if((await resources.inspect(scope)).blocked)throw new experimental_PluginRpcRefusal({code:"conflict",message:"Resolve the task/team resource limit first; switching cannot reset it"});
           const pending=await readReplacementIntent(bb,projectId,team,roleName);

@@ -33,6 +33,7 @@ interface ResourceState {
 }
 export interface ResourceSummary {
   ollamaUsage?:OllamaUsage;
+  quotaPolicy?:import("./ollama-usage").QuotaPolicy;
   taskLimits?:Record<string,number>;
   sinceMs:number;policy:ResourcePolicy;starts:number;remainingStarts:number;reportedTokens:number|null;
   usageCoverage:"unavailable"|"partial";blocked:string|null;holds:Record<string,string>;
@@ -232,6 +233,14 @@ export class ResourceControl {
     const owner=await this.resolve(threadId);if(!owner)return;
     await this.serial(async()=>{const s=this.load(owner);this.track(s,threadId,owner);await this.syncThread(s,threadId);const t=s.threads[threadId]!;this.finish(s,t,outcome,outcome==="completed"?null:"Failure requires a concrete next approach",this.now());this.save(owner,s);});
   }
+  // Positive fixed-endpoint balance can retire only this host's known Ollama
+  // exclusions. Unknown Pi pools and independent upstream accounts stay held.
+  async confirmOllamaCapacity(hostId:string){return this.serial(async()=>{
+    for(const row of this.db.prepare("SELECT id,data FROM team_resource_quota").all() as Array<{id:string;data:string}>){
+      const q=JSON.parse(row.data) as Quota;
+      if(q.provider==="pi"&&q.hostId===hostId&&q.accountScope==="ollama-cloud")this.db.prepare("UPDATE team_resource_quota SET data=? WHERE id=?").run(JSON.stringify({...q,until:this.now()}),row.id);
+    }
+  });}
   async quotaExcluded(owner:Pick<ResourceOwner,"hostId">,selection:ExecutionFallbackSelection){
     return this.serial(async()=>this.isBlocked(selection.provider,owner.hostId,selection.model));
   }
@@ -239,7 +248,7 @@ export class ResourceControl {
   async decide(owner:Pick<ResourceOwner,"projectId"|"team">,reason:string,policy?:ResourcePolicy,taskId?:TaskId,role?:string){
     if(!reason.trim())throw new Error("A concrete manual resource decision is required");
     return this.serial(async()=>{const s=this.load(owner);if(policy)s.policy=resourcePolicySchema.parse(policy);
-      if(taskId!==undefined||role){delete s.holds[taskKey(taskId??null,role??"")];for(const f of Object.values(s.fallbacks))if(f.taskId===taskId&&(f.stage==="blocked"||f.stage==="error")){f.stage="error";f.manualReleased=true;}}
+      if(taskId!==undefined||role){delete s.holds[taskKey(taskId??null,role??"")];for(const f of Object.values(s.fallbacks))if((taskId!==undefined?f.taskId===taskId:f.taskId===null&&f.role===role)&&(f.stage==="blocked"||f.stage==="error")){f.stage="error";f.manualReleased=true;}}
       const limit=this.limit(s);s.blocked=limit;s.blockedAtMs=limit?this.now():null;
       s.decisions.push({atMs:this.now(),reason:taskId!==undefined?"Concrete task approach decision is recorded in the selected tracker":safeText(reason),taskId:taskId??null,policy:{...s.policy}});this.save(owner,s);return this.summary(s);
     });
