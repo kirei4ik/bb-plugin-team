@@ -73,4 +73,13 @@ describe('OpenRouter quota belongs to the execution connection, not the agent',(
   }finally{await f.dispose();}
  });
 
+ it('a fresh shared-key zero immediately holds another launcher with an older positive cached receipt',async()=>{
+  const f=await setup();try{
+   f.remaining(40);await f.rpc('openrouterUsage',{role:'junior'});
+   f.remaining(0);await f.rpc('openrouterUsage',{role:'lead',refresh:true});
+   const before=f.calls.length;expect((await f.dispatch('thr_junior')).action).toBe('wait');expect(f.calls.length).toBe(before);
+   expect((await f.rpc('resources') as {starts:number}).starts).toBe(0);
+  }finally{await f.dispose();}
+ });
+
 });

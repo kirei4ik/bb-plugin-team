@@ -935,6 +935,24 @@ export default async function plugin(bb: BbPluginApi) {
     try{return await pending;}finally{quotaPending.delete(hostId);}
   };
   const routerPending=new Map<string,Promise<OpenRouterUsage>>();
+  const routerKeyLocks=new Map<string,Promise<void>>();
+  const sharedRouterReceipt=async(data:OpenRouterUsage,write=false):Promise<OpenRouterUsage>=>{
+    if(!data.keyId)return data;
+    const key=`openrouter-key:${data.keyId}`;
+    const previous=routerKeyLocks.get(key)??Promise.resolve();
+    let release!:()=>void;const gate=new Promise<void>(resolve=>{release=resolve;});
+    const tail=previous.catch(()=>{}).then(()=>gate);routerKeyLocks.set(key,tail);await previous.catch(()=>{});
+    try{
+      const parsed=openRouterUsageSchema.safeParse(await bb.storage.kv.get(key));
+      let latest=parsed.success?parsed.data:null;
+      if(write&&data.status==="ready"&&(!latest||data.checkedAtMs>=latest.checkedAtMs)){await bb.storage.kv.set(key,data);latest=data;}
+      // Account counters are shared across launchers/projects/hosts. Retain the
+      // local credential source and any local failure: a healthy other host
+      // cannot turn a failed current-host check into confirmed recovery.
+      const observed=data.observedAtMs??data.checkedAtMs;
+      return latest&&latest.checkedAtMs>=observed?{...latest,source:data.source,...(data.status==="unavailable"?{status:"unavailable" as const,reason:data.reason,checkedAtMs:data.checkedAtMs,observedAtMs:latest.checkedAtMs}:{})}:data;
+    }finally{release();if(routerKeyLocks.get(key)===tail)routerKeyLocks.delete(key);}
+  };
   const routerUsage=async(threadId:string,selection?:{provider:string;model:string},refresh=false):Promise<OpenRouterUsage>=>{
     const owner=await resourceOwner(threadId);if(!owner?.hostId)return emptyOpenRouter("host_unavailable","unknown");
     const {t}=await loadLang();const scope=await scopeFor(owner.projectId,owner.team,t);
@@ -963,13 +981,13 @@ export default async function plugin(bb: BbPluginApi) {
     const input={provider:actual.provider,model:actual.model,cwd:env.path,...(binding?{binding}:{})};
     const key=`openrouter-usage:${env.hostId}:${createHash("sha256").update(JSON.stringify(input)).digest("hex")}`;
     const prior=openRouterUsageSchema.safeParse(await bb.storage.kv.get(key));
-    if(!refresh&&prior.success&&Date.now()-prior.data.checkedAtMs<180_000)return prior.data;
+    if(!refresh&&prior.success&&Date.now()-prior.data.checkedAtMs<180_000)return sharedRouterReceipt(prior.data);
     if(routerPending.has(key))return routerPending.get(key)!;
     const pending=(async()=>{
       let data:OpenRouterUsage;
-      try{data=await quotaHost.call("openrouterUsage",input,{hostId:env.hostId,timeoutMs:22_000});}catch{data=emptyOpenRouter("host_unavailable");}
+      try{data=await quotaHost.call("openrouterUsage",input,{hostId:env.hostId,timeoutMs:22_000});data={...data,checkedAtMs:Date.now()};}catch{data=emptyOpenRouter("host_unavailable");}
       if(data.status!=="ready"&&prior.success&&openRouterHeadroom(prior.data,actual.model,50).held&&(!data.keyId||data.keyId===prior.data.keyId))data={...prior.data,status:"unavailable",reason:data.reason,checkedAtMs:data.checkedAtMs,observedAtMs:prior.data.observedAtMs??prior.data.checkedAtMs};
-      await bb.storage.kv.set(key,data);return data;
+      await bb.storage.kv.set(key,data);return sharedRouterReceipt(data,true);
     })();routerPending.set(key,pending);try{return await pending;}finally{routerPending.delete(key);}
   };
   const routerWaitKey=(owner:Pick<ResourceOwner,"projectId"|"team"|"role">)=>`openrouter-wait:${owner.projectId}:${owner.team}:${owner.role}`;
@@ -3219,7 +3237,9 @@ export default async function plugin(bb: BbPluginApi) {
       const {t}=await loadLang();const scope=await scopeFor(projectId,team,t);
       const list=(await teamContext(scope,t)).rows.get(role)??[];
       if(list.length!==1)return emptyOpenRouter("route_unknown","unknown");
-      return routerUsage(list[0]!.threadId,undefined,refresh);
+      const usage=await routerUsage(list[0]!.threadId,undefined,refresh);
+      if(refresh)publishChange(projectId);
+      return usage;
     },
     async quotaPolicy({projectId,team,policy}) {
       const {t}=await loadLang();const scope=await scopeFor(projectId,team,t);
