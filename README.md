@@ -6,7 +6,9 @@ back to it. Several teams per project, created from templates.
 
 Русская версия: [README.ru.md](README.ru.md).
 
-Development: [source layout and checks](docs/STRUCTURE.md).
+Development: [source layout and checks](docs/STRUCTURE.md),
+[project decisions](docs/PROJECT-CONTEXT.md),
+[session close and handoff](docs/SESSION-CLOSE.md).
 
 ## Install
 

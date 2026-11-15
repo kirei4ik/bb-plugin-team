@@ -7,7 +7,9 @@
 
 English version: [README.md](README.md).
 
-Разработчикам: [карта исходников и проверок](docs/STRUCTURE.md).
+Разработчикам: [карта исходников и проверок](docs/STRUCTURE.md),
+[контекст проекта](docs/PROJECT-CONTEXT.md),
+[завершение и передача сессии](docs/SESSION-CLOSE.md).
 
 ## Установка
 

@@ -146,6 +146,21 @@ Settings → Team holds the template editor.
 
 ## Context handoff
 
+Before closing or requesting archival/replacement of a work session, persist
+the task's substantive state in its selected tracker and read it back. Include
+goal/criteria, completed and remaining work, decisions with reasons, actual
+checks and their limits, environment/worktree/branch/commit/dirty files, pending
+operation IDs, blockers, continuing permissions/cost constraints, and the next
+action with file/artifact links. Put durable architecture and operating rules in
+project documentation and link them from the task; do not create a parallel
+backlog. Historical quota observations must be dated, not treated as current.
+
+Task acceptance and session closure are separate: close a task only after its
+result is accepted; unfinished work stays open with a precise handoff. Do not
+claim handoff complete until the saved record and referenced environment are
+verified. An ordinary BB thread outside a Team role saves its handoff directly
+in the task tracker; do not fabricate a Team task/session binding. These are agent instructions, not a new runtime archive gate.
+
 - The selected template persists provider/model/reasoning per role. Choose from
   that roster; do not silently switch services or incur unapproved extra costs.
 - Preserve authorization: an instruction to implement is sufficient; discussing
