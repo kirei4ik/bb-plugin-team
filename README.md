@@ -291,18 +291,25 @@ cannot overwrite newer configuration. Saving reformats the config file and remov
 shown before Save. New/replacement sessions read current profiles; the lead
 receives all roles' profiles. Existing sessions are not rewritten on save.
 
-### Finite execution and team budget
+### Finite execution budgets per work package
 
-Team keeps a durable technical execution ledger, including lead, executors,
-helpers, review returns, system retries and old sessions. Defaults are 8 task
-attempt units (start admissions + review returns) and 100 team start admissions.
-The Resources panel edits these limits, optional reported-token/minute caps,
-and records a concrete manual decision. Increasing limits never resets counts.
-A task hold requires a concrete changed approach, recorded in the selected
-tracker. Creating another card/session cannot escape an exhausted unfinished
-task budget. An automated close/drop does not release an exhausted task budget. Explicit
-manual grounded acceptance or a manual resource decision can release that hold;
-the team budget continues. Already active work is not interrupted.
+Each work package has its own finite allowance: by default 8 units for an
+executor package and 40 for a lead coordination package. One start is an agent
+processing a new message until a response or stop, potentially using several
+actions and model requests. Start admissions (including reservations), helper
+starts and review returns count toward the same task ID across models and
+sessions. A distinct package has a separate allowance; exhausting one package
+does not stop other packages. The cumulative team start count is statistics only.
+
+The main panel shows each open package's usage and editable limit. A grounded
+change is saved in the selected tracker, with a stale-form check; it never resets
+spending or clears failure, quota or unfinished-handoff holds. Increasing the
+limit may release an existing queued message. Defaults apply to new packages;
+existing effective allowances are retained. Legacy `teamStarts` is accepted for
+compatibility but ignored. Upgrade retires only obsolete team/task global start
+holds and preserves all accounting. Sessions without a bound package have a
+finite initialization allowance per owner session. Optional shared reported-token
+and elapsed-minute caps remain independent. Active work is not interrupted.
 
 Opening status calls no model. Counts include conservative reservations;
 provider-internal API retries are not separately observable. Reported cumulative
@@ -334,3 +341,11 @@ Unsupported/incomplete history is an explicit stop. Human recovery must inspect
 that state before using the existing manual replace. Compaction/edited re-send
 are additional core operations outside message.dispatch; no hard universal
 LLM spending limit is claimed.
+
+### Execution diagnostics
+
+Employee cards show per-task execution state, confirmed activity, transition
+history and a technical JSON export. Inspect and recover an unfinished replacement
+in the panel with explicit confirmation. A quota reset timestamp alone does not
+confirm capacity. See [execution and recovery](docs/EXECUTION-RECOVERY.md) for
+queue safety, retention and verification limits.

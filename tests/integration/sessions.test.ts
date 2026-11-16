@@ -587,13 +587,27 @@ describe("replaceSession", () => {
       "developer",
     );
     expect(intent?.stage).toBe("complete");
-    expect(intent?.delivery).toBe("sent");
+    expect(intent?.delivery).toBe("uncertain");
+    // A restart/retry observes uncertainty, never reports delivery or respawns.
+    await expect(replaceSession(host.bb, baseInput(host))).rejects.toMatchObject({code:"delivery_uncertain"});
+    expect(host.spawnCount()).toBe(1);
 
     const canonical = await host.bb.storage.kv.get(
       activeSessionKey("proj_1", "team-a", "developer"),
     );
     expect(typeof canonical).toBe("string");
     expect(host.threads.get("thr_old")!.archivedAt).not.toBeNull();
+  });
+
+  it.each(["not-json", {stage:"future"}, {stage:"prompting",delivery:"broken"}])("blocks corrupted intent without spawn, release or KV mutation: %j", async (bad) => {
+    const host=makeHost([{id:"thr_old",metadata:{teamRole:"developer",teamName:"team-a"}} as FakeThread]);
+    const key=replacementKey("proj_1","team-a","developer");
+    const raw=typeof bad==="string"?bad:{oldThreadId:"thr_old",newThreadId:null,environmentId:"env_1",keep:false,startedAt:1,delivery:"pending",...bad};
+    await host.bb.storage.kv.set(key,raw);
+    expect((await readReplacementIntent(host.bb,"proj_1","team-a","developer"))?.stage).toBe("invalid");
+    await expect(replaceSession(host.bb,baseInput(host))).rejects.toMatchObject({code:"replacement_invalid"});
+    expect(host.spawnCount()).toBe(0);expect(host.releaseCount()).toBe(0);
+    expect(await host.bb.storage.kv.get(key)).toEqual(raw);
   });
 
   it("records spawn uncertainty and refuses auto-respawn on retry", async () => {

@@ -21,9 +21,13 @@ export function teamRecoverySummary(snapshot:TeamSnapshot){
  const tasks=snapshot.roles.flatMap(r=>r.tasks);
  const active=snapshot.roles.filter(r=>r.threads.some(t=>["active","starting"].includes(t.status)));
  const lead=snapshot.roles.find(r=>r.lead);
+ const leadTask=lead?.tasks.find(t=>t.status==="in-progress"||t.status==="review");
+ const leadCounts=leadTask?snapshot.resources?.taskCounts.filter(c=>String(c.taskId)===String(leadTask.id)):undefined;
+ const leadCount=leadCounts?.length?leadCounts.reduce((sum,c)=>({starts:sum.starts+c.starts,returns:sum.returns+c.returns}),{starts:0,returns:0}):undefined;
+ const leadAllowance=leadTask&&leadCount&&snapshot.resources?{task:leadTask,starts:leadCount.starts,returns:leadCount.returns,used:leadCount.starts+leadCount.returns,limit:snapshot.resources.taskLimits?.[`task:${leadTask.id}`]??snapshot.resources.policy.coordinationAttempts??snapshot.resources.policy.taskAttempts}:null;
  const current=tasks.find(t=>t.status==="review"&&!snapshot.roles.find(r=>r.name===t.role)?.lead)??tasks.find(t=>t.status==="in-progress"&&t.role!==lead?.name)??tasks.find(t=>t.status==="todo"&&t.role!==lead?.name)??null;
- const match=snapshot.resources?.blocked?.match(/Task attempt limit reached \(task:([^:]+): (\d+)\/(\d+)\)/);
+ const match=(leadTask?snapshot.resources?.taskBlocks?.[`task:${leadTask.id}`]:null)?.match(/Task attempt limit reached \(task:([^:]+): (\d+)\/(\d+)\)/);
  const coordination=lead?.tasks.find(t=>String(t.id)===match?.[1]&&["in-progress","review"].includes(t.status));
- const modelProblem=snapshot.roles.find(r=>r.threads.some(t=>t.status==="error")||r.executionState?.kind==="error"&&!snapshot.resources?.blocked);
- return {active,current,lead,coordination:coordination&&match?{task:coordination,used:Number(match[2]),limit:Number(match[3])}:null,modelProblem};
+ const modelProblem=snapshot.roles.find(r=>r.threads.some(t=>t.status==="error")||r.executionState?.kind==="error"&&r.executionState.errorCode!=="resource_hold"&&!snapshot.resources?.blocked);
+ return {active,current,lead,leadAllowance,coordination:coordination&&match?{task:coordination,used:Number(match[2]),limit:Number(match[3])}:null,modelProblem};
 }

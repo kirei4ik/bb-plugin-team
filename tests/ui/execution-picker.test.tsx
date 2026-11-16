@@ -5,7 +5,7 @@ import { fireEvent } from "@testing-library/react";
 import { definePluginApp } from "@get-bb/plugin-sdk/app";
 import type { PluginBrowserBbSdk } from "@get-bb/plugin-sdk/app";
 import { loadPluginApp, renderSlot } from "@get-bb/plugin-sdk/testing/app";
-import { ExecutionModelPicker, resolveExecutionDraft, useProjectModelRouting } from "../../src/app/execution-picker";
+import { ExecutionModelPicker, resolveExecutionDraft, useProjectModelRouting, pickerSelection } from "../../src/app/execution-picker";
 
 const catalog = (available = true, empty = false) => ({
   providers: [{ id: "pi", available }], modelLoadError: null,
@@ -14,6 +14,14 @@ const catalog = (available = true, empty = false) => ({
 });
 
 describe("picker catalog adapter", () => {
+  it("a new Qwen selection remains usable when the native picker emits a default tier sentinel",async()=>{
+    const sdk={providers:{models:async()=>({providers:[{id:"acp-qwen-code",available:true}],modelLoadError:null,models:[{id:"openrouter/free(openai)",model:"openrouter/free(openai)",supportedReasoningEfforts:[{reasoningEffort:"default"}],defaultReasoningEffort:"default",supportedServiceTiers:[]}]})}} as unknown as PluginBrowserBbSdk;
+    const next=pickerSelection({providerId:"acp-qwen-code",model:"openrouter/free(openai)",reasoningLevel:"default",serviceTier:"default"});
+    expect(next.serviceTier).toBeUndefined();
+    await expect(resolveExecutionDraft(sdk,next,undefined)).resolves.toMatchObject({providerId:"acp-qwen-code",model:"openrouter/free(openai)"});
+    expect(pickerSelection({providerId:"codex",model:"m",reasoningLevel:"medium",serviceTier:"fast"}).serviceTier).toBe("fast");
+    expect(pickerSelection({providerId:"codex",model:"m",reasoningLevel:"medium",serviceTier:"default"},{providerId:"codex",model:"m",serviceTier:"default"}).serviceTier).toBe("default");
+  });
   it("Pi upstream route is not a BB provider ID; defaults stay local until a selection", async () => {
     const models = vi.fn(async (_args?: unknown) => catalog());
     const sdk = { providers: { models } } as unknown as PluginBrowserBbSdk;

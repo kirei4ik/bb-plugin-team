@@ -1,3 +1,4 @@
+import {PackageBudgetControl} from "./package-budget-control";
 import {TeamRecoverySummary} from "./team-recovery-summary";
 import {OllamaQuotaCard} from "./continuation-controls";
 import {isOllamaCloud} from "../shared/ollama-usage";
@@ -18,10 +19,10 @@ function stopLabel(reason:string,ru:boolean):string {
 export function ResourcePanel({snapshot,language,onChanged,onSelectRole}:{snapshot:TeamSnapshot;language:Language;onChanged:()=>Promise<void>;onSelectRole?:(role:string)=>void}){
  const rpc=useRpc<typeof rpcContract>(),navigate=useBbNavigate(),ru=language==="ru";
  const state=snapshot.resources;
- const [limits,setLimits]=useState({taskAttempts:"8",coordinationAttempts:"40",teamStarts:"100",tokens:"",minutes:""});
+ const [limits,setLimits]=useState({taskAttempts:"8",coordinationAttempts:"40",tokens:"",minutes:""});
  const [reason,setReason]=useState("");const [busy,setBusy]=useState(false);const [error,setError]=useState<string|null>(null);
  const policyKey=JSON.stringify(state?.policy);
- useEffect(()=>{if(state)setLimits({taskAttempts:String(state.policy.taskAttempts),coordinationAttempts:String(state.policy.coordinationAttempts??state.policy.taskAttempts),teamStarts:String(state.policy.teamStarts),tokens:state.policy.tokens===null?"":String(state.policy.tokens),minutes:state.policy.minutes===null?"":String(state.policy.minutes)});},[policyKey]);
+ useEffect(()=>{if(state)setLimits({taskAttempts:String(state.policy.taskAttempts),coordinationAttempts:String(state.policy.coordinationAttempts??state.policy.taskAttempts),tokens:state.policy.tokens===null?"":String(state.policy.tokens),minutes:state.policy.minutes===null?"":String(state.policy.minutes)});},[policyKey]);
  if(!state)return null;
  const call=async(policy?:ResourcePolicy,taskId?:TaskId,role?:string)=>{
   if(!reason.trim()){setError(ru?"Укажите конкретное решение/изменение подхода":"State the concrete decision or changed approach");return;}
@@ -31,19 +32,22 @@ export function ResourcePanel({snapshot,language,onChanged,onSelectRole}:{snapsh
  };
  const save=()=>{
   const value=(key:keyof typeof limits)=>limits[key]===""?null:Number(limits[key]);
-  const coordinationAttempts=value("coordinationAttempts"),taskAttempts=value("taskAttempts"),teamStarts=value("teamStarts"),tokens=value("tokens"),minutes=value("minutes");
-  if(coordinationAttempts===null||taskAttempts===null||teamStarts===null||[coordinationAttempts,taskAttempts,teamStarts,tokens,minutes].some(n=>n!==null&&(!Number.isSafeInteger(n)||n<=0))){setError(ru?"Лимиты — положительные целые числа":"Limits must be positive integers");return;}
-  void call({coordinationAttempts,taskAttempts,teamStarts,tokens,minutes});
+  const coordinationAttempts=value("coordinationAttempts"),taskAttempts=value("taskAttempts"),tokens=value("tokens"),minutes=value("minutes");
+  if(coordinationAttempts===null||taskAttempts===null||[coordinationAttempts,taskAttempts,tokens,minutes].some(n=>n!==null&&(!Number.isSafeInteger(n)||n<=0))){setError(ru?"Лимиты — положительные целые числа":"Limits must be positive integers");return;}
+  void call({coordinationAttempts,taskAttempts,teamStarts:null,tokens,minutes});
  };
  const outcome:Record<string,string>=ru?{reserved:"зарезервировано",running:"выполняется",completed:"завершено",failed:"ошибка",interrupted:"прервано",unknown:"исход неизвестен",cancelled:"отменено"}:{};
  const tasks=snapshot.roles.flatMap(r=>r.tasks);
  const accepted=state.results?.accepted??tasks.filter(t=>t.status==="done").length,review=state.results?.review??tasks.filter(t=>t.status==="review").length;
  return <section aria-label={ru?"Контроль ресурсов команды":"Team resource control"} className="flex flex-col gap-2">
   <TeamRecoverySummary snapshot={snapshot} language={language} onChanged={onChanged} onSelectRole={onSelectRole}/>
+  <PackageBudgetControl snapshot={snapshot} language={language} onChanged={onChanged}/>
   <details className="rounded-md border border-border p-2 text-xs">
   <summary>{ru?"Лимиты, квоты и история":"Limits, quotas and history"}</summary>
   <div className="mt-2 flex flex-col gap-2">
-  <p>{ru?"Запуски команды":"Team starts"}: {state.starts}/{state.policy.teamStarts} · {ru?"осталось":"remaining"} {state.remainingStarts}</p>
+  <p>{ru?"Запуски команды":"Team starts"}: {state.starts} · {ru?"статистика без общего лимита запусков":"statistics, no shared start cap"}</p>
+  {state.outcomeCounts&&<p>{ru?"Попытки":"Attempts"}: {ru?"зарезервировано":"reserved"} {state.outcomeCounts.reserved} · {ru?"выполняется":"running"} {state.outcomeCounts.running} · {ru?"завершено":"completed"} {state.outcomeCounts.completed} · {ru?"ошибок":"failed"} {state.outcomeCounts.failed} · {ru?"исход неизвестен":"outcome unknown"} {state.outcomeCounts.unknown}</p>}
+  {state.quotaBlocks.some(q=>q.resetAtMs!==null&&q.resetAtMs<=snapshot.generatedAtMs)&&<p>{ru?"Срок сброса квоты наступил; доступность ещё требует свежего подтверждения. Время сброса само по себе не разрешает запуск.":"A quota reset time has passed; fresh capacity confirmation is still required. The reset time alone does not authorize a start."}</p>}
    {snapshot.roles.some(r=>isOllamaCloud(r.threads[0]?.provider??r.provider??"",r.threads[0]?.model??r.model))&&<OllamaQuotaCard projectId={snapshot.projectId} team={snapshot.team} language={language}/>}
    {state.blocked&&<><p role="alert">{stopLabel(state.blocked,ru)}</p><details><summary>{ru?"Техническая причина":"Technical cause"}</summary>{state.blocked}</details></>}
    <details><summary>{ru?"Что учитывается":"Accounting details"}</summary><p>{ru?"Учёт с":"Accounting since"} {new Date(state.sinceMs).toLocaleString()} · {ru?"Допуски запусков, включая зарезервированные; это не число внутренних запросов провайдера.":"Start admissions include reservations; these are not the provider's internal API calls."}</p>
@@ -56,8 +60,8 @@ export function ResourcePanel({snapshot,language,onChanged,onSelectRole}:{snapsh
    <details><summary>{ru?"Завершённые задачи и основания приёмки":"Completed tasks and acceptance grounds"}</summary>{state.results?.recent.map(task=><div key={task.id} className="rounded border border-border p-2">#{task.id} {task.title}: {task.result??(ru?"результат не указан":"no result recorded")}<br/>{ru?"Основание приёмки":"Acceptance grounds"}: {task.acceptanceReason??"—"}<ul>{task.checks.map((check,i)=><li key={i}>{check.what}: {check.result??`N/A: ${check.notApplicable}`}</li>)}</ul></div>)}
    </details>
 
-   <p>{ru?"Активная работа не прерывается. Замена модели, треда или карточки не сбрасывает счётчики. Send-now в BB — явное ручное исключение, которое плагин не может запретить.":"Active work is not interrupted. Model/thread/card replacement does not reset counters. BB Send-now is an explicit manual override that plugins cannot veto."}</p>
-   <div className="flex flex-wrap gap-2">{(["taskAttempts","coordinationAttempts","teamStarts","tokens","minutes"] as const).map(key=><label key={key} className="flex flex-col gap-1">{({coordinationAttempts:ru?"Ходов координации руководителя":"Lead coordination turns",taskAttempts:ru?"Попыток на задачу (старты + возвраты)":"Task attempts (starts + returns)",teamStarts:ru?"Запусков на команду":"Team starts",tokens:ru?"Сообщённых токенов (пусто — без предела)":"Reported tokens (blank = no cap)",minutes:ru?"Минут с начала (пусто — без предела)":"Minutes since start (blank = no cap)"})[key]}<input type="number" min={1} value={limits[key]} onChange={e=>setLimits(p=>({...p,[key]:e.target.value}))} className="w-32 rounded border border-border bg-background p-1"/></label>)}</div>
+   <p>{ru?"Активная работа не прерывается. Смена модели или сессии сохраняет расход пакета. У каждого нового пакета отдельный лимит. Send-now в BB — явное ручное исключение, которое плагин не может запретить.":"Active work is not interrupted. Model or session changes retain package usage. Each new package has a separate allowance. BB Send-now is an explicit manual override that plugins cannot veto."}</p>
+   <div className="flex flex-wrap gap-2">{(["taskAttempts","coordinationAttempts","tokens","minutes"] as const).map(key=><label key={key} className="flex flex-col gap-1">{({coordinationAttempts:ru?"По умолчанию для новых пакетов руководителя":"Default for new lead packages",taskAttempts:ru?"По умолчанию для новых пакетов исполнителя":"Default for new executor packages",tokens:ru?"Сообщённых токенов (пусто — без предела)":"Reported tokens (blank = no cap)",minutes:ru?"Минут с начала (пусто — без предела)":"Minutes since start (blank = no cap)"})[key]}<input type="number" min={1} value={limits[key]} onChange={e=>setLimits(p=>({...p,[key]:e.target.value}))} className="w-32 rounded border border-border bg-background p-1"/></label>)}</div>
    <label className="flex flex-col gap-1">{ru?"Решение пользователя / конкретное изменение подхода":"Manual decision / concrete changed approach"}<textarea rows={2} maxLength={4000} value={reason} onChange={e=>setReason(e.target.value)} className="rounded border border-border bg-background p-1"/></label>
    {error&&<p role="alert">{error}</p>}
    <button type="button" disabled={busy} onClick={save} className="self-start rounded border border-border px-2 py-1">{ru?"Сохранить лимиты с основанием":"Save limits with grounds"}</button>

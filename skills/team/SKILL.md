@@ -216,18 +216,60 @@ cannot overwrite newer configuration. Saving reformats the config file and remov
 shown before Save. New/replacement sessions read current profiles; the lead
 receives all roles' profiles. Existing sessions are not rewritten on save.
 
-### Finite execution and team budget
+### User decisions in chat
 
-Team keeps a durable technical execution ledger, including lead, executors,
-helpers, review returns, system retries and old sessions. Defaults are 8 task
-attempt units (start admissions + review returns) and 100 team start admissions.
-The Resources panel edits these limits, optional reported-token/minute caps,
-and records a concrete manual decision. Increasing limits never resets counts.
-A task hold requires a concrete changed approach, recorded in the selected
-tracker. Creating another card/session cannot escape an exhausted unfinished
-task budget. An automated close/drop does not release an exhausted task budget. Explicit
-manual grounded acceptance or a manual resource decision can release that hold;
-the team budget continues. Already active work is not interrupted.
+Use work titles in messages to the user, with IDs only as references. Never
+answer with a bare code such as `r20`. Check current `bb team report` before
+claiming a budget stop: the total number of starts is statistics, not a 100 cap.
+
+The user can approve a named package's allowance in the lead chat, including a
+queued message. Direct user messages to the canonical lead can pass its package
+cap for discussion; their starts are still counted. Worker messages, automated
+turns/retries, manual pauses, quotas, shared token/time limits and failure/partial
+handoff holds are not waived. A mixed queue group is eligible only if it contains
+an actual user-authored, non-plugin, non-retry row.
+
+When the user explicitly agrees to a new total for a named package, the lead
+records it without sending the user to Team:
+
+```sh
+bb team budget <id> --json
+bb team budget <id> --limit <approved-total> --expected-limit <displayed-limit> --expected-used <displayed-used> --reason '<user decision and grounds>'
+```
+
+The second command checks that spending and the previous limit have not changed.
+It records the decision in the selected tracker and retains spending and all
+other guards. Only a canonical lead in a current direct user control turn (or a
+manual caller) can change it; helpers/workers and automated lead turns cannot.
+A user chat is evidence of the decision's origin, not proof of semantic consent:
+the lead must still obtain explicit agreement, and ask if the package/number is
+ambiguous. A conversation start also counts, so re-read before saving. Never
+raise limits just to keep working or treat a budget increase as new scope.
+
+Increasing a limit from Team notifies an idle lead with an empty queue. If there
+is queued input, it is rechecked rather than duplicated; a running lead is not
+interrupted. The form reports when a notification could not be delivered. An
+old answer remains historical: new messages/reports contain current state.
+
+### Finite execution budgets per work package
+
+Each work package has its own finite allowance: by default 8 units for an
+executor package and 40 for a lead coordination package. One start is an agent
+processing a new message until a response or stop, potentially using several
+actions and model requests. Start admissions (including reservations), helper
+starts and review returns count toward the same task ID across models and
+sessions. A distinct package has a separate allowance; exhausting one package
+does not stop other packages. The cumulative team start count is statistics only.
+
+The main panel shows each open package's usage and editable limit. A grounded
+change is saved in the selected tracker, with a stale-form check; it never resets
+spending or clears failure, quota or unfinished-handoff holds. Increasing the
+limit may release an existing queued message. Defaults apply to new packages;
+existing effective allowances are retained. Legacy `teamStarts` is accepted for
+compatibility but ignored. Upgrade retires only obsolete team/task global start
+holds and preserves all accounting. Sessions without a bound package have a
+finite initialization allowance per owner session. Optional shared reported-token
+and elapsed-minute caps remain independent. Active work is not interrupted.
 
 Opening status calls no model. Counts include conservative reservations;
 provider-internal API retries are not separately observable. Reported cumulative
@@ -267,9 +309,9 @@ The resource panel keeps prior reports collapsed. A blocked state gives a short
 reason and a separate technical detail. `bb team doctor` includes resource
 holds and known Ollama quota exhaustion.
 
-New teams have 8 task attempt units, 40 lead coordination turns and 100 total
-team starts. Existing saved policies retain their previous effective lead
-limit until an explicit grounded policy edit. Counts never reset on upgrade.
+New packages default to 8 executor units or 40 lead coordination units. Existing
+package allowances and spending survive upgrades; changing defaults affects new
+packages only.
 The lead uses the configured lead flag (including custom role names/helpers).
 A global resource hold is shown without waking the already blocked lead.
 
@@ -438,3 +480,15 @@ quotas and history**, record the decision for that task, then **Allow next start
 with this decision**. A reset does not itself authorize execution. This action
 keeps existing budgets and still checks provider capacity; no replacement is
 required merely to release a grounded current-session hold.
+
+### Execution diagnostics and unfinished replacement
+
+Employee diagnostics separate tracker status from confirmed activity. Pending or
+idle sessions are not active work. The execution history keeps technical events
+for 30 days, up to 2000 per team; its JSON export excludes prompts and raw errors.
+Use the employee's Inspect session recovery flow for an existing partial switch;
+inspect its exact session/queue and confirm the server-checked action. Never
+resend unknown input or spawn another candidate blindly. Reset time alone is not
+fresh quota confirmation. A handoff carries the original task's instructions,
+criteria and decisions as well as its checkpoint. It does not grant acceptance
+permission or erase a requirement to wait for an external reviewer.

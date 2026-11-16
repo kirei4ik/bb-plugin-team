@@ -1,4 +1,6 @@
 import type { ResourceSummary } from "../server/resource-control";
+import type { ExecutionDiagnostic } from "./execution-diagnostic";
+import type { ExecutionEvent } from "./execution-event";
 // Team snapshot: the shared, serializable picture of a project's team.
 // Pure module (no SDK, no node APIs): the server builds it, the CLI report
 // renders it, and the Team panel (app.tsx) draws it.
@@ -56,6 +58,8 @@ export interface SnapshotRole {
   tasks: TeamTask[];
   /** What the role session is doing from Team's point of view; absent when idle. */
   executionState?: RoleExecutionState;
+  /** One computed execution state per open package, separate from tracker status. */
+  diagnostics?: ExecutionDiagnostic[];
 }
 
 export interface BindingIssue {
@@ -66,6 +70,8 @@ export interface BindingIssue {
 }
 
 export interface TeamSnapshot {
+  /** Bounded technical history; full diagnostic export uses executionHistory RPC. */
+  executionEvents?: ExecutionEvent[];
   bindingIssues?: BindingIssue[];
   projectId: string;
   projectName: string;
@@ -105,8 +111,10 @@ export type AutoContinueStage =
   | "failed";
 
 export type ExecutionStateKind =
-  /** The session executes an open package (or the thread is running). */
+  /** Confirmed active session work; tracker status alone is not activity. */
   | "working"
+  | "waiting"
+  | "awaiting-resource"
   /** Package in review: waits for the lead (or a human) decision. */
   | "awaiting-team-decision"
   | "awaiting-acceptance"
@@ -159,9 +167,12 @@ export interface ExecutionStateInput {
   } | null;
   /** Status of the role's canonical session thread, null when it has none. */
   threadStatus: string | null;
+  /** Last confirmed session change, not the snapshot refresh time. */
+  threadUpdatedAtMs?: number;
+  paused?: boolean;
 }
 
-const RUNNING_THREAD_STATUSES = ["active", "starting", "pending"];
+const RUNNING_THREAD_STATUSES = ["active", "starting"];
 
 /**
  * Derive the role execution state from tasks, the existing replacement intent
@@ -173,6 +184,7 @@ export function deriveExecutionState(
 ): RoleExecutionState | undefined {
   const replaceHint = `bb team replace ${input.role} --dry-run`;
   const auto = input.autoContinue;
+  const linkedTaskId = auto?.taskId ?? currentTask(input.tasks)?.id ?? null;
   // An explicit auto-continue failure wins over a stuck intent: "replacing"
   // must not hide an error a human has to resolve.
   if (auto?.stage === "failed") {
@@ -186,10 +198,13 @@ export function deriveExecutionState(
     };
   }
   if (input.replacement && input.replacement.stage !== "complete") {
+    if (input.replacement.stage === "invalid") {
+      return {kind: "error", taskId: linkedTaskId, errorCode: "replacement_invalid", safeAction: "Saved replacement state is invalid; inspect the existing sessions and intent before recovery", atMs: input.replacement.startedAtMs};
+    }
     if (input.replacement.stage === "spawn_uncertain") {
       return {
         kind: "error",
-        taskId: null,
+        taskId: linkedTaskId,
         errorCode: "spawn_uncertain",
         safeAction: `A spawn attempt is unresolved; inspect BB for a possibly-created thread, then retry ${replaceHint} or abort`,
         atMs: input.replacement.startedAtMs,
@@ -197,7 +212,7 @@ export function deriveExecutionState(
     }
     return {
       kind: "replacing",
-      taskId: null,
+      taskId: linkedTaskId,
       errorCode: null,
       safeAction: null,
       atMs: input.replacement.startedAtMs,
@@ -206,7 +221,7 @@ export function deriveExecutionState(
   if (input.replacement && input.replacement.delivery === "uncertain") {
     return {
       kind: "error",
-      taskId: null,
+      taskId: linkedTaskId,
       errorCode: "delivery_uncertain",
       safeAction: `Role switched, but prompt release is uncertain; run bb team resume`,
       atMs: input.replacement.startedAtMs,
@@ -240,15 +255,6 @@ export function deriveExecutionState(
     };
   }
   const inProgress = input.tasks.find((task) => task.status === "in-progress");
-  if (inProgress) {
-    return {
-      kind: "working",
-      taskId: inProgress.id,
-      errorCode: null,
-      safeAction: null,
-      atMs: inProgress.updatedAtMs,
-    };
-  }
   const review = input.tasks.find((task) => task.status === "review");
   if (review) {
     return {
@@ -262,11 +268,22 @@ export function deriveExecutionState(
   if (input.threadStatus && RUNNING_THREAD_STATUSES.includes(input.threadStatus)) {
     return {
       kind: "working",
-      taskId: null,
+      taskId: inProgress?.id ?? null,
       errorCode: null,
       safeAction: null,
-      atMs: 0,
+      atMs: input.threadUpdatedAtMs ?? 0,
     };
+  }
+  const task = inProgress ?? input.tasks.find((task) => task.status === "todo");
+  const atMs = input.threadUpdatedAtMs ?? task?.updatedAtMs ?? 0;
+  if (input.threadStatus === "error") {
+    return {kind: "error", taskId: task?.id ?? null, errorCode: "session_failed",
+      safeAction: "Inspect the session failure and existing queue before continuing; do not resend an input with an unknown outcome", atMs};
+  }
+  if (task || input.threadStatus === "pending") {
+    return {kind: "waiting", taskId: task?.id ?? null,
+      errorCode: input.paused ? "paused" : input.threadStatus === null ? "session_missing" : input.threadStatus === "pending" ? "session_pending" : "activity_unconfirmed",
+      safeAction: null, atMs};
   }
   return undefined;
 }
@@ -302,7 +319,6 @@ export function statusTone(status: string | null): StatusTone {
       return "missing";
     case "active":
     case "starting":
-    case "pending":
       return "running";
     case "idle":
       return "idle";

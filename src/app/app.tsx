@@ -48,10 +48,14 @@ import {
   type TeamTask,
 } from "../shared/snapshot";
 import { builtinPrompt, type TeamTemplate, type TemplateRole } from "../shared/templates";
+import { ExecutionDiagnosticCard } from "./execution-diagnostic-card";
+import {SessionRecoveryCard} from "./session-recovery-card";
 
 const EXECUTION_LABELS: Record<Language, Record<RoleExecutionState["kind"], string>> = {
   en: {
     working: "Working",
+    waiting: "Waiting",
+    "awaiting-resource": "Waiting for a resource decision",
     "awaiting-team-decision": "Waiting for a team decision",
     "awaiting-acceptance": "Awaiting acceptance or decision",
     "awaiting-checkpoint": "Awaiting saved checkpoint",
@@ -62,6 +66,8 @@ const EXECUTION_LABELS: Record<Language, Record<RoleExecutionState["kind"], stri
   },
   ru: {
     working: "Работает",
+    waiting: "Ожидает",
+    "awaiting-resource": "Ожидает решения по ресурсам",
     "awaiting-team-decision": "Ждёт решения по команде",
     "awaiting-acceptance": "Ждёт приёмки или решения",
     "awaiting-checkpoint": "Ждёт сохранения состояния",
@@ -1291,7 +1297,7 @@ function TeamBlock({
         />
         {role.executionState?.kind === "error" && (
           <div role="alert" className="px-3 py-1 text-xs text-destructive">
-            {role.executionState.errorCode==="resource_hold"?(language==="ru"?"Работа ждёт решения по ресурсам.":"Work awaits a resource decision."):(language === "ru" ? "Передача сессии остановлена." : "Session handoff stopped.")}
+            {role.executionState.errorCode==="resource_hold"?(language==="ru"?"Работа ждёт решения по ресурсам.":"Work awaits a resource decision."):role.executionState.errorCode==="session_failed"?(language==="ru"?"Рабочая сессия завершилась ошибкой.":"The work session failed."):(language === "ru" ? "Передача сессии остановлена." : "Session handoff stopped.")}
             <details><summary>{language==="ru"?"Подробности остановки":"Stop details"}</summary>{role.executionState.errorMessage}{role.executionState.safeAction&&<p>{role.executionState.safeAction}</p>}</details>
 
           </div>
@@ -1695,6 +1701,8 @@ function RoleDetails({
           </Button>
         )}
       </div>
+      <ExecutionDiagnosticCard key={`${projectId}:${team}:${role.name}`} role={role} language={language} projectId={projectId} team={team} events={snapshot.executionEvents}/>
+      {(role.executionState?.kind==="replacing"||["spawn_uncertain","delivery_uncertain","replacement_unfinished","release_failed","replacement_invalid"].includes(role.executionState?.errorCode??""))&&<SessionRecoveryCard key={`${projectId}:${team}:${role.name}`} projectId={projectId} team={team} role={role.name} language={language} onChanged={()=>onAction(async()=>language==="ru"?"Состояние восстановления обновлено.":"Recovery state updated.")}/>}
       {role.inConfig && <Button onClick={()=>setEditingPolicy(value=>!value)}>{language==="ru"?"Профиль моделей и квот":"Models and quota profile"}</Button>}
       {editingPolicy && <ExistingRolePolicy key={`${projectId}:${team}:${role.name}`} projectId={projectId} team={team} role={role.name} labels={labels} onAction={onAction}/>}
       {role.inConfig&&<RoleContinuationControls projectId={projectId} team={team} role={role.name} threadId={role.threads[0]?.threadId??null} language={language} onChanged={()=>onAction(async()=>language==="ru"?"Состояние сотрудника обновлено.":"Employee state updated.")}/>}
@@ -1921,7 +1929,11 @@ function ProjectTracker({projectId, language, onChanged}: {projectId:string;lang
   </div>;
 }
 
-function TeamPanel({ subPath }: { subPath: string }) {
+function TeamPanel({subPath}:{subPath:string}){
+  return <TeamProjectPanel key={subPath.split("/")[0]??""} subPath={subPath}/>;
+}
+
+function TeamProjectPanel({ subPath }: { subPath: string }) {
   const context = useBbContext();
   const navigate = useBbNavigate();
   const rpc = useRpc<typeof rpcContract>();

@@ -45,6 +45,8 @@ bb-plugin-team/
 | Квоты Ollama/OpenRouter | `src/shared/*-usage.ts` — схемы; `src/host/*-usage-host.ts` — чтение |
 | Шаблоны, промпты, язык | `src/shared/templates.ts`, `messages.ts`, `strings.ts` |
 | Состояние панели и общие типы | `src/shared/snapshot.ts` |
+| Диагностика исполнения и журнал переходов | `src/shared/execution-diagnostic.ts`, `src/server/execution-journal.ts` |
+| Пользовательское восстановление | `docs/EXECUTION-RECOVERY.md`, `src/app/session-recovery-card.tsx` |
 
 `shared` содержит код, который нужен нескольким частям плагина. Импорты типов
 из серверных модулей допустимы; серверные API и Node.js-код не должны попадать

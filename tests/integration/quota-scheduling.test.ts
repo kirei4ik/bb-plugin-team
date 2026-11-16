@@ -64,11 +64,11 @@ describe("quota stop and native scheduled dispatch",()=>{
    await expect(f.rpc("deferredContinuation",{role:"lead",action:"schedule",expectedThreadId:"thr_old",sendAt:Date.now()+120_000})).rejects.toThrow();expect(f.retry).toHaveBeenCalledTimes(1);
   }finally{await f.dispose();}
  });
- it("a team budget exhausted while waiting cannot be replenished by time or a fresh provider balance",async()=>{
+ it("an initialization budget exhausted while waiting cannot be replenished by time or a fresh provider balance",async()=>{
   const f=await setup();try{
    f.remaining(80);await f.dispatch();await f.harness.behavior.emitThreadEvent("thread.idle",{thread:makeThreadResponse({id:"thr_lead",projectId:"proj_q",providerId:"pi",status:"idle"}),lastAssistantText:null} as never);
    await f.rpc("deferredContinuation",{role:"lead",action:"schedule",expectedThreadId:"thr_lead",sendAt:Date.now()+120_000});
-   await f.rpc("resources",{reason:"Stop after the agreed single start",policy:{taskAttempts:8,teamStarts:1,tokens:null,minutes:null}});f.advance(121_000);
+   await f.rpc("resources",{reason:"Stop after the agreed single start",policy:{taskAttempts:1,coordinationAttempts:1,teamStarts:null,tokens:null,minutes:null}});f.advance(121_000);
    expect((await f.dispatch()).action).toBe("wait");expect(await readDeferred(f.bb,deferredKey("proj_q","main","lead"))).toMatchObject({stage:"needs-decision"});
    expect((await f.rpc("resources") as {starts:number}).starts).toBe(1);
   }finally{await f.dispose();}

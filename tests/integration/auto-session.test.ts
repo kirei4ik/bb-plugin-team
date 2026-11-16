@@ -35,14 +35,17 @@ interface Fixture {
   session: (role?: string) => Promise<SessionView>;
   rotate: (expectedThreadId?: string, role?: string) => Promise<SessionView>;
   cli: (args: string[]) => Promise<Record<string, unknown>>;
+  startUser:(id:string,key:string)=>Promise<{action:string}>;
   rawCli: (args: string[]) => Promise<{ exitCode: number; stdout: string; stderr: string }>;
   kv: (key: string) => Promise<unknown>;
   setKv: (key: string, value: unknown) => Promise<void>;
   snapshotRole: (role: string) => Promise<{ executionState?: unknown } & Record<string, unknown>>;
   sent: { threadId: string; text: string }[];
   spawnCalls: () => number;
+  spawnPrompt: () => string;
   failNextSend: () => void;
   failNextRelease: () => void;
+  failBeforeRelease: () => void;
   setStatus: (id: string, status: "idle" | "active") => void;
   setQueued:(id:string,value:boolean)=>void;
   archived: (id: string) => boolean;
@@ -123,10 +126,13 @@ async function setup(opts: { spawnFailures?: number; fallbacks?:ExecutionFallbac
     const sent: { threadId: string; text: string }[] = [];
     const spawnSelections:Array<{providerId:unknown;model:unknown;environment:unknown}>=[];
     let spawnNo = 0;
+    let spawnPrompt = "";
     let sendFailures = 0;
     let releaseFailures = 0;
+    let releaseBeforeFailures = 0;
     let failures = opts.spawnFailures ?? 0;
     const spawnThread = (args: Record<string, unknown>) => {
+      spawnPrompt=(args.input as Array<{text:string}>)?.[0]?.text??"";
       spawnSelections.push({providerId:args.providerId,model:args.model,environment:args.environment});
       spawnNo += 1;
       if (spawnNo <= failures) throw new Error("HTTP 500: Internal server error");
@@ -237,6 +243,7 @@ async function setup(opts: { spawnFailures?: number; fallbacks?:ExecutionFallbac
     harness = fake.harness;
     const recheck = fake.bb.experimental_hooks.recheck;
     fake.bb.experimental_hooks.recheck = async (hook) => {
+      if(releaseBeforeFailures>0){releaseBeforeFailures--;throw new Error("Queue unavailable before release");}
       await recheck(hook);
       for (const id of queued.keys()) {
         const decision = await harness!.inspection.registrations.hooks["message.dispatch"]!({
@@ -266,6 +273,7 @@ async function setup(opts: { spawnFailures?: number; fallbacks?:ExecutionFallbac
       quota:async(requestId="quota-1",inputAccepted=false,uncovered=false)=>{
         if(!quotaEvents.length){if(uncovered)quotaEvents.push({id:"older-work",threadId:"thr_dev",scope:"thread",seq:1,createdAt:Date.now(),type:"turn/completed",data:{status:"completed"}});quotaEvents.push({id:"refused-request",threadId:"thr_dev",scope:"thread",seq:2,createdAt:Date.now(),type:"client/turn/requested",data:{requestId}});}
         await harness!.behavior.emitThreadEvent("turn.failed",{threadId:"thr_dev",requestId,turnId:null,errorInfo:{category:"budget-exceeded",httpStatusCode:429,providerCode:"quota_exceeded"},inputAccepted,rateLimits:null,attemptNumber:1,originPluginId:"team"});},
+      startUser:async(id,key)=>harness!.inspection.registrations.hooks["message.dispatch"]!({thread:response(id),attempt:"start-turn",initiator:"user",senderThreadId:null,originPluginId:null,queuedMessages:[{id:key,initiator:"user",senderThreadId:null,originPluginId:null}],input:{text:key,blocks:[]},requestedExecution:{providerId:threads.get(id)!.providerId??"pi",model:"approved/free",reasoningLevel:"low",serviceTier:null,permissionMode:"full"}} as never) as never,
       startAttempt:async(id,key)=>harness!.inspection.registrations.hooks["message.dispatch"]!({thread:response(id),attempt:"start-turn",initiator:"system",originPluginId:"team",queuedMessages:[{id:key}],input:{text:key,blocks:[]},requestedExecution:{providerId:threads.get(id)!.providerId??"pi",model:"approved/free",reasoningLevel:"low",serviceTier:null,permissionMode:"full"}} as never),
       writeAfterCheckpoint:()=>writeFile(join(worktree,"profile.ts"),"changed after checkpoint\n"),
       asCli:(args,threadId)=>harness!.behavior.runCli([...args,"--project","flow","--json"],{projectId:"proj_flow",threadId}),
@@ -283,8 +291,10 @@ async function setup(opts: { spawnFailures?: number; fallbacks?:ExecutionFallbac
       },
       sent,
       spawnCalls: () => spawnNo,
+      spawnPrompt: () => spawnPrompt,
       failNextSend: () => { sendFailures += 1; },
       failNextRelease: () => { releaseFailures += 1; },
+      failBeforeRelease: () => { releaseBeforeFailures += 1; },
       spawnCount: () => spawnNo,
       setStatus: (id, status) => {
         threads.get(id)!.status = status;
@@ -400,10 +410,10 @@ describe("авто-продолжение очереди после приёмк
       const list = (await fx.cli(["task", "list"])) as { tasks: Array<{ id: number | string; status: string; role: string }> };
       expect(list.tasks.find((t) => t.id === second.task.id)!.status).toBe("in-progress");
       expect(fx.sent.filter((x) => x.threadId === replacement && x.text.includes("Work package #") && x.text.includes("Second"))).toHaveLength(1);
-      // durable-запрос закрыт, состояние роли — работает.
+      // Запрос закрыт; fixture остаётся idle до подтверждённого active.
       expect(await fx.kv("auto-continue:proj_flow:main:dev")).toBeUndefined();
       const state = (await fx.snapshotRole("dev")).executionState as { kind: string; taskId: unknown };
-      expect(state.kind).toBe("working");
+      expect(state.kind).toBe("waiting");
       expect(state.taskId).toBe(second.task.id);
     } finally {
       await fx.dispose();
@@ -488,7 +498,7 @@ describe("авто-продолжение очереди после приёмк
       await fx.cli(["task", "done", String(wake2.task.id), "--reason", "Manual acceptance of the fixture package"]);
       expect(await fx.kv("auto-continue:proj_flow:main:dev")).toBeUndefined();
       const state2 = (await fx.snapshotRole("dev")).executionState as { kind: string };
-      expect(state2.kind).toBe("working");
+      expect(state2.kind).toBe("waiting");
     } finally {
       await fx.dispose();
     }
@@ -742,7 +752,7 @@ describe("ротация контекста сессии (bbt-er6.8)", () => {
       await fx.cli(["task", "done", String(wake.task.id), "--reason", "Manual acceptance of the fixture package"]);
       expect(await fx.kv("auto-continue:proj_flow:main:dev")).toBeUndefined();
       const state = (await fx.snapshotRole("dev")).executionState as { kind: string; taskId: unknown };
-      expect(state.kind).toBe("working");
+      expect(state.kind).toBe("waiting");
       expect(state.taskId).toBe(first.task.id);
     } finally {
       await fx.dispose();
@@ -775,6 +785,40 @@ describe("ротация контекста сессии (bbt-er6.8)", () => {
       await fx.dispose();
     }
   });
+});
+
+it("handoff carries original task constraints even when the agent checkpoint omitted them",async()=>{
+ const fx=await setup();
+ try{
+  const task=await fx.cli(["task","add","dev","Restricted work","--note","Only the tester may accept this task; do not close it yourself","--send"]) as {task:{id:number|string}};
+  await fx.cli(["checkpoint",String(task.task.id),"--file","checkpoint.json"]);
+  await fx.rotate();
+  expect(fx.spawnPrompt()).toContain("Only the tester may accept this task; do not close it yourself");
+  expect(fx.spawnPrompt()).toContain("A handoff or a saved report is not an acceptance decision");
+  expect(fx.spawnPrompt()).toContain('"status":"in-progress"');
+ }finally{await fx.dispose();}
+});
+
+it("RPC recovery rechecks confirmation and revision, then releases the existing queue once",async()=>{
+ const fx=await setup();
+ try{
+  const task=await fx.cli(["task","add","dev","Work","--send"]) as {task:{id:number|string}};
+  await fx.startAttempt("thr_dev","journal-check");
+  const history=await fx.rpc("executionHistory",{projectId:"proj_flow",team:"main",role:"dev"}) as {events:Array<{eventType:string}>};
+  expect(history.events.some(event=>event.eventType==="attempt")).toBe(true);
+  await fx.cli(["checkpoint",String(task.task.id),"--file","checkpoint.json"]);
+  fx.failBeforeRelease();
+  const failed=await fx.rawCli(["replace","dev"]);expect(failed.exitCode).not.toBe(0);
+  const input={projectId:"proj_flow",team:"main",role:"dev"};
+  const view=await fx.rpc("sessionRecovery",input) as {revision:string;actions:string[];newThreadId:string};
+  expect(view.actions).toContain("release");
+  await expect(fx.rpc("sessionRecovery",{...input,action:"release",expectedRevision:view.revision})).rejects.toThrow();
+  await expect(fx.rpc("sessionRecovery",{...input,action:"release",confirmed:true,expectedRevision:"stale"})).rejects.toThrow();
+  const count=fx.spawnCalls();
+  await fx.rpc("sessionRecovery",{...input,action:"release",confirmed:true,expectedRevision:view.revision});
+  expect(fx.spawnCalls()).toBe(count);
+  await expect(fx.rpc("sessionRecovery",{...input,action:"release",confirmed:true,expectedRevision:view.revision})).rejects.toThrow();
+ }finally{await fx.dispose();}
 });
 
 describe("execution-state роли (bbt-er6.5, чистая функция)", () => {
@@ -849,7 +893,7 @@ describe("execution-state роли (bbt-er6.5, чистая функция)", ()
   });
 
   it("задачи: работает / ждёт приёмки; running-тред без задач — работает; idle — нет состояния", () => {
-    expect(deriveExecutionState({ role: "dev", tasks: [task(1, "in-progress")], replacement: null, autoContinue: null, threadStatus: "idle" })?.kind).toBe("working");
+    expect(deriveExecutionState({ role: "dev", tasks: [task(1, "in-progress")], replacement: null, autoContinue: null, threadStatus: "idle" })?.kind).toBe("waiting");
     expect(deriveExecutionState({ role: "dev", tasks: [task(1, "review")], replacement: null, autoContinue: null, threadStatus: "idle" })?.kind).toBe("awaiting-acceptance");
     expect(deriveExecutionState({ role: "dev", tasks: [], replacement: null, autoContinue: null, threadStatus: "active" })?.kind).toBe("working");
     expect(deriveExecutionState({ role: "dev", tasks: [task(1, "done")], replacement: null, autoContinue: null, threadStatus: "idle" })).toBeUndefined();
@@ -1153,15 +1197,29 @@ it("workspace recovery never bypasses queued messages",async()=>{
   await expect(f.control({action:"switch",expectedThreadId:"thr_dev",selection,approveSelection:true,recoverFromWorkspace:true,expectedRecoveryRevision:view.revision})).rejects.toThrow(/queue/);expect(f.spawnCount()).toBe(0);
  }finally{await f.dispose();}
 });
+it("queue admission explains the Team limit without changing counts or creating work",async()=>{
+ const f=await setup();try{
+  await f.rpc("resources",{projectId:"proj_flow",team:"main",reason:"One allowed start",policy:{taskAttempts:8,coordinationAttempts:1,teamStarts:100,tokens:null,minutes:null}});
+  await f.cli(["task","add","lead","Coordinate","--send"]);
+  await f.startAttempt("thr_lead","first");await f.emitIdle("thr_lead");
+  const before=await f.resources();
+  const result=await f.startAttempt("thr_lead","next") as {action:string;reason:string};
+  expect(result.action).toBe("wait");
+  expect(result.reason).toMatch(/internal plugin limit|внутреннее ограничение/);
+  expect(result.reason).toMatch(/not provider quota|не квота провайдера/);
+  expect((await f.resources()).starts).toBe(before.starts);expect(f.spawnCalls()).toBe(0);
+ }finally{await f.dispose();}
+});
+
 it("coordination continuation records the reason in the task without changing overall policy",async()=>{
  const f=await setup();try{
-  await f.cli(["task","add","lead","Coordinate","--send"]);
   await f.rpc("resources",{projectId:"proj_flow",team:"main",reason:"One coordination turn",policy:{taskAttempts:8,coordinationAttempts:1,teamStarts:100,tokens:null,minutes:null}});
+  await f.cli(["task","add","lead","Coordinate","--send"]);
   await f.startAttempt("thr_lead","coord-one");await f.emitIdle("thr_lead");
-  const before=await f.resources();expect(before.blocked).toContain("task:1");
+  const before=await f.resources();expect(before.blocked).toBeNull();expect(before.taskBlocks?.["task:1"]).toContain("task:1");
   const result=await f.rpc("continueCoordination",{projectId:"proj_flow",team:"main",taskId:1,expectedStarts:before.starts,expectedUsed:1}) as ResourceSummary;
   expect(result.policy).toEqual(before.policy);expect(result.taskLimits?.["task:1"]).toBe(5);expect(result.starts).toBe(before.starts);
-  const lead=await f.snapshotRole("lead");expect((lead.tasks as Array<{decisions:string}>)[0]?.decisions).toContain("four more coordination turns");
+  const lead=await f.snapshotRole("lead");expect((lead.tasks as Array<{decisions:string}>)[0]?.decisions).toContain("up to four additional lead starts");
   await expect(f.rpc("continueCoordination",{projectId:"proj_flow",team:"main",taskId:1,expectedStarts:before.starts,expectedUsed:1})).rejects.toThrow(/changed/);
  }finally{await f.dispose();}
 });
@@ -1204,8 +1262,8 @@ it("future-only profile editing refuses when unfinished work appeared",async()=>
 
 it("budget-held auto continuation does not ask a model for a checkpoint or create a cold session",async()=>{
  const f=await setup();try{
+  await f.rpc("resources",{projectId:"proj_flow",team:"main",reason:"One start",policy:{taskAttempts:1,teamStarts:null,tokens:null,minutes:null}});
   await f.cli(["task","add","dev","Profile","--send"]);
-  await f.rpc("resources",{projectId:"proj_flow",team:"main",reason:"One start",policy:{taskAttempts:8,teamStarts:1,tokens:null,minutes:null}});
   await f.startAttempt("thr_dev","one");await f.emitIdle("thr_dev");
   await f.setKv("auto-continue:proj_flow:main:dev",{taskId:1,reason:"context",originThreadId:"thr_dev",stage:"awaiting-safe-boundary",errorCode:null,error:null,notifiedStage:null,requestedAtMs:Date.now(),updatedAtMs:Date.now()});
   const sent=f.sent.length;await f.emitIdle("thr_dev");expect(f.sent).toHaveLength(sent);expect(f.spawnCount()).toBe(0);
@@ -1214,8 +1272,9 @@ it("budget-held auto continuation does not ask a model for a checkpoint or creat
 
 it("a lead coordination hold does not falsely turn a worker's submitted review into an execution error",async()=>{
  const f=await setup();try{
+  await f.rpc("resources",{projectId:"proj_flow",team:"main",reason:"Finite coordination",policy:{taskAttempts:8,coordinationAttempts:1,teamStarts:100,tokens:null,minutes:null}});
   await f.cli(["task","add","lead","Coordinate","--send"]);await f.cli(["task","add","dev","Profile","--send"]);await f.cli(["task","update","2","--status","review"]);
-  await f.rpc("resources",{projectId:"proj_flow",team:"main",reason:"Finite coordination",policy:{taskAttempts:8,coordinationAttempts:1,teamStarts:100,tokens:null,minutes:null}});await f.startAttempt("thr_lead","one");await f.emitIdle("thr_lead");
+  await f.startAttempt("thr_lead","one");await f.emitIdle("thr_lead");
   expect((await f.snapshotRole("lead")).executionState).toMatchObject({kind:"error",errorCode:"resource_hold"});expect((await f.snapshotRole("dev")).executionState).toMatchObject({kind:"awaiting-acceptance"});
  }finally{await f.dispose();}
 });
@@ -1230,4 +1289,42 @@ it("explicit employee resume re-arms only the deterministic old factory error",a
   await fx.setKv(key,{...record,error:"spawn result unknown",errorCode:"spawn_uncertain"});await fx.control({action:"resume",expectedThreadId:"thr_dev"});
   expect((await fx.kv(key) as {stage:string}).stage).toBe("failed");expect(fx.spawnCalls()).toBe(0);
  }finally{await fx.dispose();}
+});
+
+it("package budget edits record grounds without changing review and reject stale forms",async()=>{
+ const f=await setup();try{
+  await f.cli(["task","add","dev","Profile","--send"]);await f.startAttempt("thr_dev","one");await f.emitIdle("thr_dev");
+  const input={projectId:"proj_flow",team:"main",taskId:1,limit:12,expectedLimit:8,expectedUsed:1,reason:"Complete the missing acceptance checks"};
+  const summary=await f.rpc("packageBudget",input) as ResourceSummary;
+  expect(summary.starts).toBe(1);expect(summary.taskLimits?.["task:1"]).toBe(12);
+  const role=await f.snapshotRole("dev"),task=(role.tasks as Array<{decisions:string;status:string}>)[0]!;
+  expect(task.decisions).toContain(input.reason);expect(task.status).toBe("in-progress");
+  await expect(f.rpc("packageBudget",input)).rejects.toThrow(/changed/);
+  await f.cli(["task","done","1","--reason","Manually checked"]);
+  await expect(f.rpc("packageBudget",{...input,expectedLimit:12})).rejects.toThrow(/changed/);
+ }finally{await f.dispose();}
+});
+
+it("records a budget agreement in a direct user lead turn and rejects automatic or worker grants",async()=>{
+ const f=await setup();try{
+  await f.rpc("resources",{projectId:"proj_flow",team:"main",reason:"One lead start",policy:{taskAttempts:8,coordinationAttempts:1,teamStarts:null,tokens:null,minutes:null}});
+  await f.cli(["task","add","lead","Coordinate profile","--send"]);await f.startAttempt("thr_lead","first");await f.emitIdle("thr_lead");
+  const args=["budget","1","--limit","6","--expected-limit","1","--expected-used","2","--reason","User approved six total starts for Coordinate profile"];
+  expect((await f.asCli(args,"thr_dev")).exitCode).not.toBe(0);
+  expect((await f.asCli(args,"thr_lead")).exitCode).not.toBe(0);
+  expect(await f.startUser("thr_lead","I approve six total starts for Coordinate profile")).toMatchObject({action:"proceed"});f.setStatus("thr_lead","active");
+  const sent=f.sent.length;const changed=await f.asCli(args,"thr_lead");expect(changed.exitCode,changed.stderr).toBe(0);
+  expect(JSON.parse(changed.stdout)).toMatchObject({title:"Coordinate profile",used:2,limit:6,sharedStartCap:null});expect(f.sent).toHaveLength(sent);
+  const task=(await f.snapshotRole("lead")).tasks as Array<{decisions:string}>;expect(task[0]?.decisions).toContain("user chat, start");
+  expect((await f.asCli(args,"thr_lead")).exitCode).not.toBe(0);
+  await f.emitIdle("thr_lead");expect((await f.asCli(["budget","1","--limit","7","--expected-limit","6","--expected-used","2","--reason","reuse old approval"],"thr_lead")).exitCode).not.toBe(0);
+ }finally{await f.dispose();}
+});
+it("an increase with an empty lead queue notifies the lead using the package title",async()=>{
+ const f=await setup();try{
+  await f.cli(["task","add","lead","Coordinate profile"]);const before=f.sent.length;
+  await f.rpc("packageBudget",{projectId:"proj_flow",team:"main",taskId:1,limit:44,expectedLimit:40,expectedUsed:0,reason:"Check the current review"});
+  expect(f.sent).toHaveLength(before+1);expect(f.sent.at(-1)).toMatchObject({threadId:"thr_lead",text:expect.stringContaining('"Coordinate profile"')});
+  expect(f.sent.at(-1)?.text).toContain("no team-wide start cap");
+ }finally{await f.dispose();}
 });

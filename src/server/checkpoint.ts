@@ -120,13 +120,14 @@ export async function verifyQuotaBoundary(
   failure:import("@get-bb/plugin-sdk").PluginTurnFailedEvent,
   checkpoint:WorkCheckpoint,
 ):Promise<void>{
+  if(checkpoint.threadId && checkpoint.threadId!==failure.threadId)throw new PluginCliError("Checkpoint belongs to another session",{code:"checkpoint_session_mismatch"});
   if(failure.inputAccepted)throw new PluginCliError("The failed turn accepted input; checkpoint coverage of its actions is uncertain. Inspect and checkpoint the work before manual recovery",{code:"quota_input_accepted"});
-  const rows:Array<{seq:number;createdAt:number;type:string;data:Record<string,unknown>}>=[];
+  const rows:Array<{seq:number;createdAt:number;type:string;turnId:string|null;data:Record<string,unknown>}>=[];
   let beforeSeq:string|undefined,complete=false;
   try{
     for(let page=0;page<20;page++){
       const batch=await bb.sdk.threads.events.list({threadId:failure.threadId,order:"desc",limit:"100",...(beforeSeq?{beforeSeq}:{}),types:["client/turn/requested","turn/started","turn/completed","turn/input/accepted"]});
-      rows.push(...batch.map(row=>({seq:row.seq,createdAt:row.createdAt,type:row.type,data:row.data as unknown as Record<string,unknown>})));
+      rows.push(...batch.map(row=>({seq:row.seq,createdAt:row.createdAt,type:row.type,turnId:row.scope.kind==="turn"?row.scope.turnId:null,data:row.data as unknown as Record<string,unknown>})));
       if(batch.length<100||batch.some(row=>row.createdAt<checkpoint.atMs)){complete=true;break;}
       beforeSeq=String(Math.min(...batch.map(row=>row.seq)));
     }
@@ -135,6 +136,7 @@ export async function verifyQuotaBoundary(
   if(!complete||!current)throw new PluginCliError("The refused request's history is unavailable or incomplete; inspect the task before manual recovery",{code:"checkpoint_history_unavailable"});
   const after=rows.filter(row=>row.createdAt>=checkpoint.atMs);
   const uncovered=after.some(row=>row.type==="client/turn/requested"?row.data.requestId!==failure.requestId:
-    row.seq<current.seq||row.type==="turn/input/accepted"||row.type==="turn/completed"&&row.data.status==="completed");
+    row.seq<current.seq||row.type==="turn/input/accepted"||row.type==="turn/completed"&&row.data.status==="completed"||
+    (row.type==="turn/started"||row.type==="turn/completed")&&(!failure.turnId||row.turnId!==failure.turnId));
   if(uncovered)throw new PluginCliError("There was work after the saved checkpoint; a matching Git tree alone does not cover its side effects",{code:"checkpoint_history_stale"});
 }

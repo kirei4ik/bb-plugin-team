@@ -29,18 +29,18 @@ describe("durable Team resource admission",()=>{
   await f.control.settle("dev","completed");f.restart();await f.control.settle("dev","completed");
   const s=await f.control.inspect(f.scope);expect(s.starts).toBe(1);expect(s.reportedTokens).toBe(120);expect(s.attempts[0]).toMatchObject({requestId:"req-1",outcome:"completed",provider:"pi",model:"ollama/model"});
  });
- it("includes helpers and replacement threads and stops a new card bypass",async()=>{
+ it("shares one package allowance across helpers and sessions, isolating new packages",async()=>{
   const f=fixture();await f.control.decide(f.scope,"Two calls agreed",{...DEFAULT_RESOURCE_POLICY,taskAttempts:2});
   await f.control.admit(f.ctx("dev","one"));await f.control.settle("dev","completed");f.tick();
   await f.control.admit(f.ctx("helper","two"));await f.control.settle("helper","completed");f.tick();
   expect((await f.control.admit(f.ctx("fresh","three","system"))).action).toBe("wait");
-  expect((await f.control.admit(f.ctx("other","new-card"))).action).toBe("wait");
-  expect((await f.control.inspect(f.scope)).starts).toBe(2);
+  expect((await f.control.admit(f.ctx("other","new-card"))).action).toBe("proceed");
+  expect((await f.control.inspect(f.scope)).starts).toBe(3);
  });
  it("all initiators share the same limit; joins do not create a new start",async()=>{
-  const f=fixture();await f.control.decide(f.scope,"One start",{...DEFAULT_RESOURCE_POLICY,teamStarts:1});
+  const f=fixture();await f.control.decide(f.scope,"One start",{...DEFAULT_RESOURCE_POLICY,taskAttempts:1});
   await f.control.admit(f.ctx());await f.control.settle("dev","completed");
-  for(const initiator of ["system","agent","user"]){expect((await f.control.admit(f.ctx("other",initiator,initiator))).action).toBe("wait");}
+  for(const initiator of ["system","agent","user"]){expect((await f.control.admit(f.ctx("fresh",initiator,initiator))).action).toBe("wait");}
   expect(await f.control.admit({...f.ctx(),attempt:"join-turn"})).toEqual({action:"proceed"});
  });
  it("stops a failed turn's automatic retry until a concrete decision, retaining counters",async()=>{
@@ -80,7 +80,7 @@ describe("durable Team resource admission",()=>{
  });
 });
 
-it("known shared quota windows apply across providers and scopes, reset without model probes",async()=>{
+it("known reset time requires fresh structured confirmation across providers and restart",async()=>{
  const f=fixture();await f.control.admit({...f.ctx("other","other-provider"),requestedExecution:{...f.ctx().requestedExecution,providerId:"opencode2"}});
  const rate={providerId:"opencode2",status:"warning",kind:"subscription-window",windows:[{providerKey:"private-account-window",status:"warning",resetsAtMs:2000}]};
  f.event("other","provider/rateLimits/updated",{rateLimits:rate});await f.control.inspect(f.scope);
@@ -93,7 +93,11 @@ it("known shared quota windows apply across providers and scopes, reset without 
  f.owners.set("fresh",{...f.scope,team:"second",ownerThreadId:"fresh"});
  expect((await f.control.admit({...f.ctx("fresh","quota-other-team"),requestedExecution:{...f.ctx().requestedExecution,providerId:"opencode2"}})).action).toBe("wait");
  f.tick();f.tick();
- expect((await f.control.admit(f.ctx("fresh","after-reset"))).action).toBe("proceed");
+ f.restart();
+ expect((await f.control.admit(f.ctx("fresh","after-reset"))).action).toBe("wait");
+ f.event("dev","provider/rateLimits/updated",{rateLimits:{...quotaRate,status:"allowed",windows:[{...quotaRate.windows[0],status:"allowed"}]}});
+ await f.control.inspect(f.scope);
+ expect((await f.control.admit(f.ctx("fresh","after-confirmation"))).action).toBe("proceed");
  expect(JSON.stringify(await f.control.inspect(f.scope))).not.toContain("private-account-window");
 });
 it("failure replay after a deliberate repair does not re-block the task",async()=>{
@@ -107,8 +111,8 @@ it("observes explicit BB overrides and preserves the cumulative baseline from be
  await f.control.watch("dev");const s=await f.control.inspect(f.scope);expect(s.starts).toBe(1);expect(s.attempts[0]?.initiator).toBe("override/observed");expect(s.reportedTokens).toBe(12);
 });
 it("keeps an already reserved last slot through read/re-evaluation without admitting another",async()=>{
- const f=fixture();await f.control.decide(f.scope,"One slot",{...DEFAULT_RESOURCE_POLICY,teamStarts:1});await f.control.admit(f.ctx());
- await f.control.inspect(f.scope);f.restart();expect((await f.control.admit(f.ctx())).action).toBe("proceed");expect((await f.control.admit(f.ctx("other","another"))).action).toBe("wait");
+ const f=fixture();await f.control.decide(f.scope,"One slot",{...DEFAULT_RESOURCE_POLICY,taskAttempts:1});await f.control.admit(f.ctx());
+ await f.control.inspect(f.scope);f.restart();expect((await f.control.admit(f.ctx())).action).toBe("proceed");expect((await f.control.admit(f.ctx("fresh","another"))).action).toBe("wait");
 });
 
 it("review returns use the same finite task budget and cannot be replayed to inflate it",async()=>{
@@ -119,9 +123,9 @@ it("review returns use the same finite task budget and cannot be replayed to inf
  expect((await f.control.admit(f.ctx("fresh","rework"))).action).toBe("wait");
 });
 
-it("an automated close/drop cannot launder an exhausted task into a new card",async()=>{
+it("closing a package retains its spend while a distinct package has its own allowance",async()=>{
  const f=fixture();await f.control.decide(f.scope,"One task attempt",{...DEFAULT_RESOURCE_POLICY,taskAttempts:1});await f.control.admit(f.ctx());await f.control.settle("dev","completed");
- await f.control.finished(f.scope,"task-1");f.tick();expect((await f.control.admit(f.ctx("other","new-card"))).action).toBe("wait");
+ await f.control.finished(f.scope,"task-1");expect((await f.control.inspect(f.scope)).taskBlocks?.["task:task-1"]).toBeUndefined();f.tick();expect((await f.control.admit(f.ctx("fresh","same-package"))).action).toBe("wait");
  await f.control.decide(f.scope,"I inspected the exhausted work and explicitly authorize different work");expect((await f.control.admit(f.ctx("other","new-work"))).action).toBe("proceed");
  expect((await f.control.inspect(f.scope)).starts).toBe(2);
 });
@@ -143,7 +147,7 @@ it("separates approved lead coordination budget from execution without resetting
  await f.control.decide(f.scope,"Separate finite lead allowance",{...DEFAULT_RESOURCE_POLICY,taskAttempts:1,coordinationAttempts:3});
  for(let i=0;i<3;i++){expect((await f.control.admit(f.ctx("lead",`coord-${i}`))).action).toBe("proceed");await f.control.settle("lead","completed");f.tick();}
  expect((await f.control.admit(f.ctx("lead","over"))).action).toBe("wait");
- const s=await f.control.inspect(f.scope);expect(s.starts).toBe(3);expect(s.blocked).toContain("3/3");
+ const s=await f.control.inspect(f.scope);expect(s.starts).toBe(3);expect(s.blocked).toBeNull();expect(s.taskBlocks?.["task:coordination"]).toContain("3/3");
 });
 it("deduplicates resource notices across changed count text",async()=>{
  const f=fixture();expect(await f.control.notice(f.scope,"dev:Task attempt limit reached (task:x: 8/8)")).toBe(true);
@@ -165,14 +169,14 @@ it("grants only four extra lead turns for one task, preserving policy, history a
  f.restart();for(let i=0;i<4;i++){expect((await f.control.admit(f.ctx("lead",`more-${i}`))).action).toBe("proceed");await f.control.settle("lead","completed");f.tick();}
  expect((await f.control.admit(f.ctx("lead","sixth"))).action).toBe("wait");
 });
-it("cannot grant around the team cap or a failed tracker write",async()=>{
+it("cannot grant around shared token limits or a failed tracker write",async()=>{
  const f=fixture();const owner={...f.scope,role:"lead",taskId:"coord",isLead:true};f.owners.set("lead",owner);
- await f.control.decide(f.scope,"Finite coordination",{...DEFAULT_RESOURCE_POLICY,coordinationAttempts:1,teamStarts:1});
- await f.control.admit(f.ctx("lead","one"));await f.control.settle("lead","completed");
+ await f.control.decide(f.scope,"Finite coordination",{...DEFAULT_RESOURCE_POLICY,coordinationAttempts:1,tokens:1});
+ await f.control.admit(f.ctx("lead","one"));f.event("lead","thread/tokenUsage/updated",{tokenUsage:{total:{totalTokens:1}}});await f.control.settle("lead","completed");
  await expect(f.control.extendCoordination(owner,1,1,async()=>{})).rejects.toThrow(/changed/);
  await f.control.decide(f.scope,"Keep overall room",{...DEFAULT_RESOURCE_POLICY,coordinationAttempts:1});
  await expect(f.control.extendCoordination(owner,1,1,async()=>{throw new Error("tracker offline");})).rejects.toThrow("tracker offline");
- expect((await f.control.inspect(f.scope)).taskLimits).toEqual({});
+ expect((await f.control.inspect(f.scope)).taskLimits).toEqual({"task:coord":1});
 });
 
 it("fresh Ollama evidence clears only that upstream account, keeping OpenRouter and counters",async()=>{
@@ -198,8 +202,81 @@ it("quota reset requires a decision on the current session, not a replacement", 
  expect(held.action).toBe("reject");expect((held as {message:string}).message).toContain("Allow next start");
  expect((held as {message:string}).message).not.toContain("retired");
  const before=await f.control.inspect(f.scope);
- expect(before.quotaBlocks).toEqual([]);
+ expect(before.quotaBlocks).toHaveLength(1);
  await f.control.decide(f.scope,"User continues the same approved model after quota reset, within existing budget",undefined,"task-1");
  const released=await f.control.inspect(f.scope);expect(released.starts).toBe(before.starts);expect(released.policy).toEqual(before.policy);
+ expect((await f.control.admit(f.ctx("dev","before-capacity","human"))).action).toBe("wait");
+ f.event("dev","provider/rateLimits/updated",{rateLimits:{...rate,status:"allowed",windows:[{...rate.windows[0],status:"allowed"}]}});
+ await f.control.inspect(f.scope);
  expect(await f.control.admit(f.ctx("dev","human-resume","human"))).toEqual({action:"proceed"});
+});
+
+it("changing a package limit retains spending, failure holds and rejects stale saves",async()=>{
+ const f=fixture();await f.control.admit(f.ctx());await f.control.settle("dev","failed");
+ const owner=f.owners.get("dev")!;let records=0;
+ const summary=await f.control.setPackageLimit(owner,1,8,1,async()=>{records++;});
+ expect(summary.starts).toBe(1);expect(summary.taskLimits?.["task:task-1"]).toBe(1);expect(summary.holds["task:task-1"]).toBeTruthy();
+ await expect(f.control.setPackageLimit(owner,9,8,1,async()=>{records++;})).rejects.toThrow(/changed/);expect(records).toBe(1);
+ await f.control.setPackageLimit(owner,9,1,1,async()=>{records++;});f.restart();
+ expect((await f.control.admit(f.ctx("fresh","retry"))).action).toBe("wait");
+ expect((await f.control.admit(f.ctx("other","independent"))).action).toBe("proceed");
+});
+it("migrates legacy team caps without erasing history, task ceilings or error holds",async()=>{
+ const f=fixture();await f.control.admit(f.ctx());await f.control.settle("dev","failed");
+ const db=f.bb.storage.database(),row=db.prepare("SELECT scope,data FROM team_resource_state").get() as {scope:string;data:string};
+ const state=JSON.parse(row.data);delete state.startBudgetScope;delete state.taskCeilings;state.policy.teamStarts=1;state.blocked="Team start limit reached (1)";
+ db.prepare("UPDATE team_resource_state SET data=? WHERE scope=?").run(JSON.stringify(state),row.scope);f.restart();
+ const summary=await f.control.inspect(f.scope);expect(summary.blocked).toBeNull();expect(summary.policy.teamStarts).toBeNull();expect(summary.remainingStarts).toBeNull();
+ expect(summary.starts).toBe(1);expect(summary.holds["task:task-1"]).toBeTruthy();expect(summary.taskLimits?.["task:task-1"]).toBe(8);
+ expect((await f.control.admit(f.ctx("other","new-package"))).action).toBe("proceed");
+ expect((await f.control.admit(f.ctx("fresh","same-package"))).action).toBe("wait");
+});
+it("initialization without a package is finite per owner session, not cumulative per project",async()=>{
+ const f=fixture();await f.control.decide(f.scope,"One initialization",{...DEFAULT_RESOURCE_POLICY,taskAttempts:1});
+ for(const id of ["dev","helper","fresh"])f.owners.set(id,{...f.owners.get(id)!,taskId:null});
+ await f.control.admit(f.ctx());await f.control.settle("dev","completed");
+ expect((await f.control.admit(f.ctx("helper","same-root"))).action).toBe("wait");
+ expect((await f.control.admit(f.ctx("fresh","new-session"))).action).toBe("proceed");
+});
+it("new-package defaults do not silently alter existing package ceilings",async()=>{
+ const f=fixture();await f.control.admit(f.ctx());await f.control.settle("dev","completed");
+ await f.control.decide(f.scope,"New packages get two starts",{...DEFAULT_RESOURCE_POLICY,taskAttempts:2});
+ await f.control.admit(f.ctx("other","new"));const s=await f.control.inspect(f.scope);
+ expect(s.taskLimits?.["task:task-1"]).toBe(8);expect(s.taskLimits?.["task:task-2"]).toBe(2);
+});
+
+it("pins an unstarted package allowance when assigned, before future default changes",async()=>{
+ const f=fixture();await f.control.pinPackages(f.scope,[{id:"task-1",role:"dev",status:"todo"} as never],"lead");
+ await f.control.decide(f.scope,"Two for future packages",{...DEFAULT_RESOURCE_POLICY,taskAttempts:2});
+ const s=await f.control.inspect(f.scope);expect(s.taskLimits?.["task:task-1"]).toBe(8);expect(s.starts).toBe(0);
+});
+
+it("lets direct human messages reach a capped lead without granting automatic work",async()=>{
+ const f=fixture();f.owners.set("lead",{...f.scope,role:"lead",taskId:"coord",ownerThreadId:"lead",isLead:true});
+ await f.control.decide(f.scope,"One start",{...DEFAULT_RESOURCE_POLICY,coordinationAttempts:1});
+ await f.control.admit(f.ctx("lead","one"));await f.control.settle("lead","completed");f.tick();
+ const user={...f.ctx("lead","approve","user"),senderThreadId:null,originPluginId:null};
+ expect((await f.control.admit(user)).action).toBe("proceed");expect(await f.control.userControlTurn("lead")).toBeTruthy();
+ expect((await f.control.admit(user)).action).toBe("proceed");expect((await f.control.inspect(f.scope)).starts).toBe(2);
+ await f.control.settle("lead","completed");expect(await f.control.userControlTurn("lead")).toBeNull();
+ expect((await f.control.admit(f.ctx("lead","automatic","system"))).action).toBe("wait");
+ const s=await f.control.inspect(f.scope);expect(s.taskLimits?.["task:coord"]).toBe(1);expect(s.taskBlocks?.["task:coord"]).toContain("2/1");
+});
+it("human discussion never waives worker caps, shared limits, failure holds or plugin-origin checks",async()=>{
+ const f=fixture();await f.control.decide(f.scope,"One start",{...DEFAULT_RESOURCE_POLICY,taskAttempts:1,coordinationAttempts:1});
+ await f.control.admit(f.ctx());await f.control.settle("dev","completed");
+ expect((await f.control.admit({...f.ctx("fresh","human","user"),senderThreadId:null,originPluginId:null})).action).toBe("wait");
+ f.owners.set("lead",{...f.scope,role:"lead",taskId:"coord",ownerThreadId:"lead",isLead:true});await f.control.admit(f.ctx("lead","one"));await f.control.settle("lead","completed");
+ expect((await f.control.admit({...f.ctx("lead","spoof","user"),senderThreadId:null,originPluginId:"team"})).action).toBe("wait");
+ await f.control.decide(f.scope,"Time cap",{...DEFAULT_RESOURCE_POLICY,minutes:1});for(let i=0;i<61;i++)f.tick();
+ expect((await f.control.admit({...f.ctx("lead","time","user"),senderThreadId:null,originPluginId:null})).action).toBe("wait");
+ const g=fixture();g.owners.set("lead",{...g.scope,role:"lead",taskId:"coord",ownerThreadId:"lead",isLead:true});await g.control.admit(g.ctx("lead","one"));await g.control.settle("lead","failed");
+ expect((await g.control.admit({...g.ctx("lead","failure","user"),senderThreadId:null,originPluginId:null})).action).toBe("wait");
+});
+it("recognizes a real queued user message in a mixed group but not a core retry",async()=>{
+ const f=fixture();f.owners.set("lead",{...f.scope,role:"lead",taskId:"coord",ownerThreadId:"lead",isLead:true});
+ await f.control.decide(f.scope,"One start",{...DEFAULT_RESOURCE_POLICY,coordinationAttempts:1});await f.control.admit(f.ctx("lead","one"));await f.control.settle("lead","completed");
+ const queued={...f.ctx("lead","user-queue","mixed"),senderThreadId:"mixed",originPluginId:"mixed",queuedMessages:[{id:"user-queue",initiator:"user",senderThreadId:null,originPluginId:null,payload:{kind:"input"}}]} as unknown as MessageDispatchHookContext;
+ expect((await f.control.admit(queued)).action).toBe("proceed");await f.control.settle("lead","completed");
+ queued.queuedMessages[0]!.payload={kind:"retry"} as never;expect((await f.control.admit({...queued,input:{text:"retry",blocks:[]}})).action).toBe("wait");
 });

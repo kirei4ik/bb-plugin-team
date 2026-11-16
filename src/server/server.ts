@@ -1,4 +1,9 @@
 import { inspectBindings, repairBinding } from "./bindings";
+import { executionDiagnostic } from "../shared/execution-diagnostic";
+import {executionEventSchema} from "../shared/execution-event";
+import {resourceQueueExplanation,packageResourceBlock} from "../shared/resource-explanation";
+import {sessionRecoverySchema,sessionRecoveryActionSchema,type SessionRecovery} from "../shared/session-recovery";
+import {executionJournal, JOURNAL_RETENTION_DAYS, JOURNAL_MAX_EVENTS} from "./execution-journal";
 import {openRouterUsageSchema,emptyOpenRouter,openRouterHeadroom,isOpenRouterModel,quotaSourceSchema,type OpenRouterUsage,type QuotaSource} from "../shared/openrouter-usage";
 import { queuedFingerprint, deferredKey, deferredContinuationSchema, readDeferred, scheduleDeferred, cancelDeferred } from "./deferred-continuation";
 import { recoveryViewSchema, manualExecutionApprovalSchema, type RecoveryView, type RecoveryBlocker } from "../shared/recovery-view";
@@ -333,6 +338,14 @@ export const rpcContract = defineRpcContract({
     input: z.object({ projectId: projectIdSchema, team: teamSchema, role: z.string().min(1).max(100) }).strict(),
     output: sessionViewSchema,
   },
+  executionHistory: {
+    input: z.object({projectId:projectIdSchema,team:teamSchema,role:z.string().min(1).max(100).optional()}).strict(),
+    output: z.object({events:z.array(executionEventSchema).max(2000),retentionDays:z.number(),maxEvents:z.number()}),
+  },
+  sessionRecovery: {
+    input:z.object({projectId:projectIdSchema,team:teamSchema,role:z.string().min(1).max(100),action:sessionRecoveryActionSchema.optional(),expectedRevision:z.string().optional(),confirmed:z.boolean().optional(),candidateThreadId:z.string().optional()}).strict(),
+    output:sessionRecoverySchema,
+  },
   sessionRotate: {
     input: z.object({ projectId: projectIdSchema, team: teamSchema, role: z.string().min(1).max(100), expectedThreadId: z.string().min(1).max(200) }).strict(),
     output: sessionViewSchema,
@@ -463,6 +476,10 @@ export const rpcContract = defineRpcContract({
   roleControl: {
     input:z.object({projectId:projectIdSchema,team:teamSchema,role:z.string(),action:z.enum(["status","pause","resume","switch"]),expectedThreadId:z.string().optional(),selection:executionPolicySchema.shape.fallbacks.element.optional(),approveSelection:z.boolean().optional(),recoverFromWorkspace:z.boolean().optional(),expectedRecoveryRevision:z.string().optional()}).strict(),
     output:z.object({paused:z.boolean(),threadId:z.string().nullable(),fallbacks:z.array(executionPolicySchema.shape.fallbacks.element),actual:executionPolicySchema.shape.fallbacks.element.nullable().optional()}),
+  },
+  packageBudget: {
+    input:z.object({projectId:projectIdSchema,team:teamSchema,taskId:z.union([z.string().min(1).max(200),z.number().int().positive()]),limit:z.number().int().min(1).max(1000),expectedLimit:z.number().int().min(1).max(1000),expectedUsed:z.number().int().nonnegative(),reason:z.string().trim().min(1).max(4000)}).strict(),
+    output:z.custom<ResourceSummary>(),
   },
   resources: {
     input:z.object({projectId:projectIdSchema,team:teamSchema,reason:z.string().trim().min(1).max(4000).optional(),role:z.string().optional(),policy:resourcePolicySchema.optional(),taskId:z.union([z.number().int().positive(),z.string().min(1).max(200)]).optional()}).strict(),
@@ -1076,10 +1093,10 @@ export default async function plugin(bb: BbPluginApi) {
     }
     const admission=await resources.admit(ctx);
     if(scheduled&&key){
-      if(admission.action!=="proceed")return wait("Team/task budget or another execution guard still holds this continuation");
+      if(admission.action!=="proceed")return wait(admission.action==="wait"?resourceQueueExplanation(admission.reason,currentLang):"Team/task budget or another execution guard still holds this continuation");
       await bb.storage.kv.set(key,{...scheduled,stage:"released",reason:null});publishChange(ctx.thread.projectId);
     }
-    return admission;
+    return admission.action==="wait"?{...admission,reason:resourceQueueExplanation(admission.reason,currentLang)}:admission;
   });
 
   /** Team context: config (if any), lead, role threads and helpers. */
@@ -1282,6 +1299,7 @@ export default async function plugin(bb: BbPluginApi) {
       const consumed = target ? await bb.storage.kv.get(sessionTaskKey(scope,target.threadId)) : undefined;
       const send = input.send && target && consumed === undefined && busy.length === 0 && !RUNNING.includes(target.status) && !(await readPause(scope));
       const task = await tracker.add(scope, {...input, status: send ? "in-progress" : "todo"});
+      await resources.pinPackages(scope,[task],lead);
       let sentTo: string | null = null, sendError: string | null = null;
       if (send && target) {
         try { await deliverPackage(scope, task, target, lead, senderThreadId); sentTo = target.threadId; }
@@ -1343,6 +1361,40 @@ export default async function plugin(bb: BbPluginApi) {
     if (lead !== null && mark.role === lead) return { caller: "lead", callerRole: mark.role };
     return { caller: "executor", callerRole: mark.role };
   };
+
+  const notifyBudgetIncrease=async(scope:Scope,task:TeamTask,oldLimit:number,limit:number,used:number,reason:string,t:Strings)=>{
+    try{
+      const {rows,lead}=await teamContext(scope,t);const targets=lead?rows.get(lead)??[]:[];
+      if(targets.length!==1)return "unavailable" as const;
+      if(targets[0]!.status!=="idle")return "busy" as const;
+      const threadId=targets[0]!.threadId;
+      if((await bb.sdk.threads.queuedMessages.list({threadId})).length)return "queued" as const;
+      const text=currentLang==="ru"?`Пользователь изменил лимит пакета «${task.title}» (${task.id}): ${oldLimit} → ${limit}, учтено ${used}. Основание: ${reason}. Общего лимита запусков команды нет; прежнее 100/100 больше не ограничивает работу. Сначала проверь актуальный bb team report, затем продолжи только разрешённую работу в пределах пакетов и квот. В ответе называй работы по названию, а не только ID.`:`The user changed "${task.title}" (${task.id}) allowance: ${oldLimit} → ${limit}, ${used} used. Grounds: ${reason}. There is no team-wide start cap. Check current bb team report, then continue authorized work within package budgets and quotas. Use work titles in replies, not bare IDs.`;
+      await bb.sdk.threads.send({threadId,originPluginId:bb.pluginId,mode:"auto",input:[{type:"text",text,mentions:[]}]});return "sent" as const;
+    }catch{bb.log.warn("Budget saved; lead notification could not be delivered");return "unavailable" as const;}
+  };
+
+  const changePackageBudget=async(scope:Scope,input:{taskId:TaskId;limit:number;expectedLimit:number;expectedUsed:number;reason:string},t:Strings,callerThreadId?:string)=>withScopeLock(scope,async()=>{
+    const {taskId,limit,expectedLimit,expectedUsed}=input;
+    const reason=input.reason.trim();if(!reason||reason.length>4000)throw new PluginCliError("State the user's concrete budget decision",{code:"invalid_value"});
+    const task=(await readTasks(scope)).tasks.find(task=>task.id===taskId&&["todo","in-progress","review"].includes(task.status));
+    const {loaded,lead}=await teamContext(scope,t);
+    if(!task||!loaded?.config.roles.some(r=>r.name===task.role))throw new PluginCliError("Open package or assigned role changed; refresh",{code:"conflict"});
+    const {caller}=await classifyCaller(scope,callerThreadId,t);
+    if(caller==="executor")throw new PluginCliError("Only the user or lead can change a package budget",{code:"task_forbidden"});
+    let approval="manual";
+    if(caller==="lead"){
+      const thread=await bb.sdk.threads.get({threadId:callerThreadId!});const attempt=await resources.userControlTurn(callerThreadId!);
+      if(thread.status!=="active"||!attempt)throw new PluginCliError("Budget changes by the lead require a current direct user message; ask the user in chat",{code:"user_approval_required"});
+      approval=`user chat, start ${attempt}`;
+    }
+    const decisions=[task.decisions,`Package start budget: ${expectedLimit} → ${limit}; already used ${expectedUsed}; ${approval}. ${reason}`].filter(Boolean).join("\n\n");
+    if(decisions.length>24000)throw new PluginCliError("Decision history is full",{code:"conflict"});
+    const result=await resources.setPackageLimit({projectId:scope.projectId,team:scope.team,role:task.role,taskId,ownerThreadId:"",hostId:scope.hostId,isLead:task.role===lead},limit,expectedLimit,expectedUsed,async()=>{await tracker.update(scope,taskId,{decisions});});
+    publishChange(scope.projectId);await bb.experimental_hooks.recheck("message.dispatch");
+    if(limit>expectedLimit&&caller!=="lead")result.budgetNotice=await notifyBudgetIncrease(scope,task,expectedLimit,limit,expectedUsed,reason,t);
+    return result;
+  });
 
   const updatePackage = async (
     scope: Scope, id: TaskId,
@@ -1579,12 +1631,13 @@ export default async function plugin(bb: BbPluginApi) {
     const prompt = core.applyPlaceholders(rawPrompt, {workspace:scope,leadThreadId,roleThreads,teamVars:config.vars,teamName:scope.team}, t)
       + (execution?`\nActual execution uses the explicitly approved backup: ${JSON.stringify(execution)}. Configured primary remains unchanged.`:"")
       + m.replaceHandoff(`@thread:${old.id}`,JSON.stringify(checkpoint,null,2),taskLines)
-      + (continuing ? `\nThis is a task handoff, not initial setup. Resume checkpoint nextAction for task ${checkpoint.taskId} now. If it is in review, wait for lead acceptance. Do not pick another package; other packages remain queued.` : "\nThe checkpoint task is already accepted or cancelled. Do not execute it again. Confirm readiness and wait for the next queued assignment.")
+      + `\nCurrent task instructions from the selected tracker (preserve its constraints and authorization):\n${JSON.stringify({id:priorTask.id,role:priorTask.role,title:priorTask.title,status:priorTask.status,note:priorTask.note,criteria:priorTask.criteria??null,decisions:priorTask.decisions??null,dependencies:priorTask.dependencies??[],result:priorTask.result??null})}`
+      + (continuing ? `\nThis is a task handoff, not initial setup. Resume checkpoint nextAction for task ${checkpoint.taskId} within the task instructions above. If it is in review, wait for the acceptance required by those instructions. A handoff or a saved report is not an acceptance decision. Do not pick another package; other packages remain queued.` : "\nThe checkpoint task is already accepted or cancelled. Do not execute it again. Confirm readiness and wait for the next queued assignment.")
       + `\nRoute messages by role: bb team tell <role> --message-file -. The lead role is ${lead.name}. Earlier direct thread addresses are superseded.`;
     const defaults = config.defaults ?? {};
     const sectionId = settingsValues.teamSection ? await ensureSection(bb,teamSectionName(t,scope.team),[strings("en"),strings("ru")].map(x=>teamSectionName(x,scope.team))) : null;
     const result = await replaceSession(bb, {
-      projectId:scope.projectId, team:scope.team, role:roleName,
+      projectId:scope.projectId, team:scope.team, role:roleName, taskId:checkpoint.taskId,
       oldThreadId:old.id, environmentId:checkpoint.environmentId,
       keep: pending?.keep ?? options.keep ?? false,
       prompt,
@@ -1828,7 +1881,7 @@ export default async function plugin(bb: BbPluginApi) {
           return;
         }
       }
-      if (await readPause(scope) || await isRolePaused(scope,role) || (await resources.inspect(scope)).blocked) return; // an explicit decision/resume retries
+      if (await readPause(scope) || await isRolePaused(scope,role) || packageResourceBlock(await resources.inspect(scope),contextFlow?record.taskId:null)) return; // an explicit decision/resume retries
       const deferred=await readDeferred(bb,deferredKey(scope.projectId,scope.team,role));
       if(deferred&&deferred.stage!=="released")return; // core's scheduled message owns this continuation
       const router=await routerUsage(thread.threadId);
@@ -1961,9 +2014,10 @@ export default async function plugin(bb: BbPluginApi) {
       view.errorCode = request.errorCode;
     }
     if (intent && intent.stage !== "complete") {
-      view.phase = intent.stage === "spawn_uncertain" ? "error" : "replacing";
+      view.phase = intent.stage === "spawn_uncertain" || intent.stage === "invalid" ? "error" : "replacing";
       view.blockedReason = "replacement_pending";
     }
+    if (intent?.stage === "complete" && intent.delivery === "uncertain") {view.phase="error";view.blockedReason="failed";view.errorCode="delivery_uncertain";}
     if (request?.stage === "failed") view.blockedReason = "failed";
     const linked = await bb.storage.kv.get<TaskId>(sessionTaskKey(scope, thread.threadId));
     view.taskId = linked ?? null;
@@ -2417,7 +2471,53 @@ export default async function plugin(bb: BbPluginApi) {
     return { written, result };
   };
 
+  const abortRoleReplacement = async (scope:Scope, roleName:string, pending:ReplacementIntent|null) => {
+    if (!pending || pending.stage === "invalid") throw new PluginCliError("No unfinished replacement to abort",{code:"replacement_missing"});
+    const canonical=await bb.storage.kv.get<string>(`active-session:${scope.projectId}:${scope.team}:${roleName}`);
+    if (canonical && canonical!==pending.oldThreadId) throw new PluginCliError("The role already switched; repeat replace to finish recovery",{code:"replacement_switched"});
+    const candidates=await core.listProjectThreads(bb,scope.projectId);
+    for (const candidate of candidates) {
+      const meta=await bb.sdk.threads.getPluginMetadata({threadId:candidate.id}) as Record<string,unknown>;
+      if (candidate.id!==pending.newThreadId && !(meta.teamReplacement===true && meta.teamReplacementRole===roleName && meta.teamReplacementTeam===scope.team)) continue;
+      if (!(await isPreparedReplacement(bb,await bb.sdk.threads.get({threadId:candidate.id}))) || candidate.environmentId!==pending.environmentId) throw new PluginCliError("A replacement candidate is active or changed environment; inspect it before aborting",{code:"replacement_candidate_invalid"});
+      const descendants=await bb.sdk.threads.experimental_listDescendants({threadIds:[candidate.id]});
+      for (const id of descendants.threads.find(x=>x.threadId===candidate.id)?.descendantIds ?? []) {
+        const child=await bb.sdk.threads.get({threadId:id});
+        if (child.parentThreadId===candidate.id) await bb.sdk.threads.update({threadId:id,parentThreadId:pending.oldThreadId});
+      }
+      await bb.sdk.threads.updatePluginMetadata({threadId:candidate.id,set:{teamRetired:true},remove:["teamRole","teamName","teamNotifyOn"]});
+      await bb.sdk.threads.archive({threadId:candidate.id});
+    }
+    await bb.storage.kv.delete(`replacement:${scope.projectId}:${scope.team}:${roleName}`);
+  };
+
   /* ── Snapshot (status, report, panel) ── */
+
+  const readSessionRecovery = async (scope:Scope,role:string,t:Strings):Promise<SessionRecovery> => {
+    const {config}=await readTeamConfig(bb,scope,scope.team,t);
+    if(!config.roles.some(r=>r.name===role))throw new experimental_PluginRpcRefusal({code:"not_found",message:"Role not found"});
+    const intent=await readReplacementIntent(bb,scope.projectId,scope.team,role);
+    const canonical=await bb.storage.kv.get<string>(activeSessionKey(scope.projectId,scope.team,role));
+    const view:SessionRecovery={revision:"",stage:intent?.stage??null,delivery:intent?.delivery??null,oldThreadId:intent?.oldThreadId??null,newThreadId:intent?.newThreadId??null,actions:[],candidates:[],reasonCode:null};
+    if(intent?.stage==="invalid")view.reasonCode="replacement_invalid";
+    else if(intent&&intent.stage!=="complete"){
+      if(!canonical||canonical===intent.oldThreadId)view.actions.push("abort");
+      if(intent.stage==="spawn_uncertain"){
+        view.reasonCode="spawn_uncertain";
+        for(const candidate of await core.listProjectThreads(bb,scope.projectId)){
+          const meta=await bb.sdk.threads.getPluginMetadata({threadId:candidate.id}) as Record<string,unknown>;
+          if(candidate.archivedAt===null&&candidate.environmentId===intent.environmentId&&meta.teamReplacement===true&&meta.teamReplacementRole===role&&meta.teamReplacementTeam===scope.team&&await isPreparedReplacement(bb,await bb.sdk.threads.get({threadId:candidate.id})))view.candidates.push(candidate.id);
+        }
+        if(view.candidates.length)view.actions.push("confirm");
+      }else view.actions.push("continue");
+    }else if(intent?.delivery==="uncertain"&&intent.newThreadId===canonical){
+      view.reasonCode="delivery_uncertain";
+      const thread=await bb.sdk.threads.get({threadId:canonical});
+      if(await isPreparedReplacement(bb,thread))view.actions.push("release");
+    }
+    view.revision=createHash("sha256").update(JSON.stringify([intent,canonical,view.actions,view.candidates])).digest("hex");
+    return view;
+  };
 
   const buildSnapshot = async (scope: Scope, t: Strings): Promise<TeamSnapshot> => {
     const { loaded, configError, lead, scan, rows, helpers } = await teamContext(scope, t);
@@ -2479,6 +2579,7 @@ export default async function plugin(bb: BbPluginApi) {
       });
     }
     roles.sort((a, b) => Number(b.lead) - Number(a.lead));
+    await resources.pinPackages(scope,store.tasks,roles.find(r=>r.lead)?.name??null);
     const resourceSummary=withResourceResults(await resources.inspect(scope),store.tasks);
     resourceSummary.quotaPolicy=await readQuotaPolicy(scope);
     if(roles.some(r=>isOllamaCloud(r.threads[0]?.provider??r.provider??"",r.threads[0]?.model??r.model))){resourceSummary.ollamaUsage=await cloudUsage(scope.hostId);resourceSummary.quotaPolicy=await readQuotaPolicy(scope);}
@@ -2494,6 +2595,8 @@ export default async function plugin(bb: BbPluginApi) {
           ? {taskId: autoRaw.taskId, stage: autoRaw.stage, errorCode: autoRaw.errorCode ?? null, error: typeof autoRaw.error === "string" ? autoRaw.error : null, reason: autoRaw.reason === "context" ? "context" : "accepted", updatedAtMs: typeof autoRaw.updatedAtMs === "number" ? autoRaw.updatedAtMs : 0}
           : null,
         threadStatus: role.threads[0]?.status ?? null,
+        threadUpdatedAtMs: role.threads[0]?.updatedAtMs,
+        paused: paused || await isRolePaused(scope, role.name),
       });
       const active=role.threads.some(thread=>thread.status==="active"||thread.status==="starting");
       const task=role.tasks.find(task=>task.status==="in-progress"||task.status==="review");
@@ -2513,10 +2616,10 @@ export default async function plugin(bb: BbPluginApi) {
       const routerWait=routerData?.service==="openrouter"?await bb.storage.kv.get<string>(routerWaitKey({...scope,role:role.name})):null;
       const routerLow=routerData?.service==="openrouter"&&openRouterHeadroom(routerData,actual?.model??role.model,resourceSummary.quotaPolicy?.pauseBelowPercent??10).held?"OpenRouter quota at/below the safety threshold; schedule later or choose an independent service":null;
       const quotaWait=await bb.storage.kv.get<string>(quotaWaitKey(scope,role.name));
-      const resourceReason=routerWait??routerLow??(isOllamaCloud(role.threads[0]?.provider??role.provider??"",role.threads[0]?.model??role.model)?quotaWait:null)??resourceSummary.holds[task?`task:${task.id}`:`role:${role.name}`]??(ownsSharedHold?sharedHold:null)??(quotaOwner?.hostId===scope.hostId&&quotaHeadroom(resourceSummary.ollamaUsage,resourceSummary.quotaPolicy).held?"Ollama Cloud account quota at/below the safety threshold; schedule continuation after reset or choose an independent model":null);
-      if(!active&&resourceReason&&executionState?.kind!=="error")executionState={kind:"error",taskId:task?.id??null,errorCode:"resource_hold",errorMessage:resourceReason,safeAction:"Inspect Team resources and record a concrete decision; replacing the session cannot reset the budget",atMs:Date.now()};
-      if(!active&&sharedHold&&!ownsSharedHold&&!resourceReason&&executionState?.kind!=="error"&&executionState?.kind!=="awaiting-acceptance")executionState={kind:"awaiting-team-decision",taskId:task?.id??null,errorCode:null,safeAction:null,atMs:Date.now()};
-      const presented={...role,threads:role.threads.map(thread=>({...thread,...(actual&&actual.provider===thread.provider?{model:actual.model}:{} )}))};
+      const resourceReason=routerWait??routerLow??(isOllamaCloud(role.threads[0]?.provider??role.provider??"",role.threads[0]?.model??role.model)?quotaWait:null)??resourceSummary.holds[task?`task:${task.id}`:`role:${role.name}`]??(task?resourceSummary.taskBlocks?.[`task:${task.id}`]:null)??(ownsSharedHold?sharedHold:null)??(quotaOwner?.hostId===scope.hostId&&quotaHeadroom(resourceSummary.ollamaUsage,resourceSummary.quotaPolicy).held?"Ollama Cloud account quota at/below the safety threshold; schedule continuation after reset or choose an independent model":null);
+      if(!active&&resourceReason&&executionState?.kind!=="error"&&executionState?.kind!=="awaiting-acceptance")executionState={kind:"error",taskId:task?.id??null,errorCode:"resource_hold",errorMessage:resourceReason,safeAction:"Inspect Team resources and record a concrete decision; replacing the session cannot reset the budget",atMs:resourceSummary.blockedAtMs??resourceSummary.attempts.filter(a=>a.role===role.name).at(-1)?.endedAtMs??role.threads[0]?.updatedAtMs??0};
+      if(!active&&sharedHold&&!ownsSharedHold&&!resourceReason&&executionState?.kind!=="error"&&executionState?.kind!=="awaiting-acceptance")executionState={kind:"awaiting-team-decision",taskId:task?.id??null,errorCode:null,safeAction:null,atMs:resourceSummary.blockedAtMs??0};
+      const presented={...role,diagnostics:role.tasks.map(task=>executionDiagnostic(task,executionState)),threads:role.threads.map(thread=>({...thread,...(actual&&actual.provider===thread.provider?{model:actual.model}:{} )}))};
       withExecutionState.push(executionState ? {...presented, executionState} : presented);
     }
     return {
@@ -2533,6 +2636,7 @@ export default async function plugin(bb: BbPluginApi) {
       leadRole: lead,
       paused,
       roles: withExecutionState,
+      executionEvents: executionJournal(bb).list(scope.projectId,scope.team).slice(0,100),
       generatedAtMs: Date.now(),
       tracker: (await tracker.getConfig(scope)).kind,
       trackerError,
@@ -2683,7 +2787,9 @@ export default async function plugin(bb: BbPluginApi) {
     }
     const budget=await resources.inspect(scope);
     if(budget.blocked)add(currentLang==="ru"?"ресурсы":"resources","fail",budget.blocked);
+    for(const [key,reason]of Object.entries(budget.taskBlocks??{}))add("resources","fail",`${key}: ${reason}`);
     for(const [key,reason]of Object.entries(budget.holds))add("resources","warn",`${key}: ${reason}`);
+    for(const quota of budget.quotaBlocks)add("provider quota","warn",`${quota.provider}: capacity needs fresh confirmation; reset ${quota.resetAtMs===null?"unknown":new Date(quota.resetAtMs).toISOString()}`);
     for(const key of await bb.storage.kv.list(`role-paused:${scope.projectId}:${scope.team}:`))if(await bb.storage.kv.get(key)===true)add("pause","warn",key.split(":").at(-1)!);
     if ((await readPause(scope)) !== null) add(m.check.threads, "warn", m.doctorPaused);
     return checks;
@@ -2756,7 +2862,7 @@ export default async function plugin(bb: BbPluginApi) {
         }
       }
       if(await readPause(scope))add("team_paused");
-      if((await resources.inspect(scope)).blocked)add("resource_limit");
+      if(packageResourceBlock(await resources.inspect(scope),view.taskId))add("resource_limit");
     }catch{add("state_unavailable");}
     // No timestamps or token estimates: only state relevant to this task/choice.
     view.revision=createHash("sha256").update(JSON.stringify([view.threadId,view.taskId,view.taskTitle,view.environmentId,view.actual,view.blockers,checkpoint,queueIds,selection,configRevision,workspaceFingerprint])).digest("hex");
@@ -3066,6 +3172,44 @@ export default async function plugin(bb: BbPluginApi) {
       const { t } = await loadLang();
       return readSessionView(await scopeFor(projectId, team, t), role, t);
     },
+    async executionHistory({projectId,team,role}) {
+      const {t}=await loadLang();
+      await scopeFor(projectId,team,t);
+      return {events:executionJournal(bb).list(projectId,team,role),retentionDays:JOURNAL_RETENTION_DAYS,maxEvents:JOURNAL_MAX_EVENTS};
+    },
+    async sessionRecovery({projectId,team,role,action,expectedRevision,confirmed,candidateThreadId}) {
+      const {t}=await loadLang();const scope=await scopeFor(projectId,team,t);
+      return withScopeLock(scope,async()=>{
+        const view=await readSessionRecovery(scope,role,t);
+        if(!action)return view;
+        if(!confirmed||view.revision!==expectedRevision||!view.actions.includes(action))throw new experimental_PluginRpcRefusal({code:"conflict",message:"Recovery state changed or confirmation is missing; inspect again"});
+        const intent=await readReplacementIntent(bb,projectId,team,role);
+        if(!intent)throw new experimental_PluginRpcRefusal({code:"conflict",message:"No replacement to recover"});
+        if(action==="abort")await abortRoleReplacement(scope,role,intent);
+        else if(action==="release"){
+          // Recheck the original core queue. Never create/send another input.
+          await bb.experimental_hooks.recheck("message.dispatch");
+          await bb.storage.kv.set(`replacement:${projectId}:${team}:${role}`,{...intent,delivery:"sent"});
+          executionJournal(bb).record({projectId,team,role,taskId:null,threadId:intent.newThreadId,operationId:`replace:${intent.oldThreadId}:${intent.startedAt}`,eventType:"handoff",nextState:"complete:sent",reasonCode:"handoff_complete",provider:null,model:null});
+        }else{
+          const owner=await resourceOwner(intent.oldThreadId);
+          if(await readPause(scope)||packageResourceBlock(await resources.inspect(scope),owner?.taskId))throw new experimental_PluginRpcRefusal({code:"conflict",message:"Team is paused or package resource limited"});
+          if(action==="confirm"){
+            if(!candidateThreadId||!view.candidates.includes(candidateThreadId))throw new experimental_PluginRpcRefusal({code:"conflict",message:"Inspect and select an existing prepared candidate"});
+            intent.newThreadId=candidateThreadId;intent.stage="spawning";
+            await bb.storage.kv.set(`replacement:${projectId}:${team}:${role}`,intent);
+          }
+          await continueRoleSession(scope,role,intent.oldThreadId,{pending:intent});
+        }
+        publishChange(projectId);
+        return readSessionRecovery(scope,role,t);
+      }).catch(error=>{
+        if(error instanceof experimental_PluginRpcRefusal)throw error;
+        const known=new Set(["checkpoint_stale","checkpoint_missing","spawn_uncertain","release_failed","delivery_uncertain","replacement_invalid","old_not_idle_or_error","old_active_before_archive","replacement_switched","replacement_candidate_invalid"]);
+        const code=known.has((error as {code?:string}).code??"")?(error as {code:string}).code:"recovery_failed";
+        throw new experimental_PluginRpcRefusal({code:"conflict",message:`Recovery stopped (${code}). Refresh and inspect the preserved session and queue before continuing.`});
+      });
+    },
     async sessionRotate({ projectId, team, role, expectedThreadId }) {
       const { t, lang } = await loadLang();
       const scope = await scopeFor(projectId, team, t);
@@ -3306,6 +3450,7 @@ export default async function plugin(bb: BbPluginApi) {
         if(!["idle","error"].includes(thread.status))throw new experimental_PluginRpcRefusal({code:"conflict",message:"Wait until the current operation ends"});
         const owner=await resourceOwner(thread.id);if(!owner)throw new Error("Employee binding unavailable");
         const summary=await resources.inspect(scope);
+        if(packageResourceBlock(summary,owner.taskId))throw new experimental_PluginRpcRefusal({code:"conflict",message:"Resolve the package budget first; waiting cannot replenish it"});
         const failed=[...summary.attempts].reverse().find(a=>a.threadId===thread.id&&a.outcome==="failed");
         const record=await scheduleDeferred(bb,key,{threadId:thread.id,taskId:owner.taskId,sendAt,failed:thread.status==="error",...(failed?.requestId?{turnRequestId:failed.requestId}:{})});
         // Future sendAt + the durable deferred guard hold all new turns. A
@@ -3335,10 +3480,11 @@ export default async function plugin(bb: BbPluginApi) {
         if(!task||list.length!==1)throw new experimental_PluginRpcRefusal({code:"conflict",message:"Coordination task or session changed; refresh the team"});
         const owner=await resourceOwner(list[0]!.threadId);
         if(!owner||owner.taskId!==taskId)throw new experimental_PluginRpcRefusal({code:"conflict",message:"Coordination task is no longer bound"});
-        const reason=currentLang==="ru"?`Пользователь разрешил ещё 4 хода координации задачи «${task.title}»: проверить текущий результат, принять или вернуть конкретные замечания. Общие лимиты и квоты провайдеров не изменяются.`:`User allowed four more coordination turns for "${task.title}": inspect the current result, accept it or return concrete feedback. Other budgets and provider quotas are unchanged.`;
+        const reason=currentLang==="ru"?`Пользователь разрешил до 4 дополнительных запусков руководителя по задаче «${task.title}»: проверить текущий результат, принять или вернуть конкретные замечания. Общие лимиты и квоты провайдеров не изменяются.`:`User allowed up to four additional lead starts for "${task.title}": inspect the current result, accept it or return concrete feedback. Other budgets and provider quotas are unchanged.`;
         const decisions=[task.decisions,reason].filter(Boolean).join("\n\n");if(decisions.length>24000)throw new experimental_PluginRpcRefusal({code:"conflict",message:"Decision history is full; inspect the task manually"});
         const result=await resources.extendCoordination(owner,expectedStarts,expectedUsed,async()=>{await tracker.update(scope,taskId,{decisions});});
-        publishChange(projectId);await bb.experimental_hooks.recheck("message.dispatch");return result;
+        publishChange(projectId);await bb.experimental_hooks.recheck("message.dispatch");
+        result.budgetNotice=await notifyBudgetIncrease(scope,task,expectedUsed,expectedUsed+4,expectedUsed,reason,t);return result;
       });
     },
     async roleControl({projectId,team,role:roleName,action,expectedThreadId,selection:requestedSelection,approveSelection,recoverFromWorkspace,expectedRecoveryRevision}) {
@@ -3400,7 +3546,7 @@ export default async function plugin(bb: BbPluginApi) {
           const usage=isOllamaCloud(selection.provider,selection.model)?owner?.hostId?await cloudUsage(owner.hostId,true):{status:"unavailable" as const,checkedAtMs:Date.now(),windows:[],reason:"host_unavailable" as const}:undefined;
           if(usage&&(usage.status!=="ready"||quotaHeadroom(usage,await readQuotaPolicy(scope)).held))throw new experimental_PluginRpcRefusal({code:"conflict",message:"Backup quota is exhausted or unavailable; choose an independent model or wait"});
           if(await readPause(scope))throw new experimental_PluginRpcRefusal({code:"conflict",message:"The team is paused; resume it first"});
-          if((await resources.inspect(scope)).blocked)throw new experimental_PluginRpcRefusal({code:"conflict",message:"Resolve the task/team resource limit first; switching cannot reset it"});
+          if(packageResourceBlock(await resources.inspect(scope),owner?.taskId))throw new experimental_PluginRpcRefusal({code:"conflict",message:"Resolve the package resource limit first; switching cannot reset it"});
           const pending=await readReplacementIntent(bb,projectId,team,roleName);
           if(pending&&pending.stage!=="complete")throw new experimental_PluginRpcRefusal({code:"conflict",message:"Resolve the unfinished replacement before starting another switch"});
           await bb.storage.kv.set(key,true);
@@ -3451,6 +3597,10 @@ export default async function plugin(bb: BbPluginApi) {
         return {paused:await isRolePaused(scope,roleName),threadId,fallbacks:configured.executionPolicy?.fallbacks??[],actual:actual.success?actual.data:null};
       });
     },
+    async packageBudget({projectId,team,taskId,limit,expectedLimit,expectedUsed,reason}) {
+      const {t}=await loadLang();const scope=await scopeFor(projectId,team,t);
+      return changePackageBudget(scope,{taskId,limit,expectedLimit,expectedUsed,reason},t);
+    },
     async resources({projectId,team,reason,role,policy,taskId}) {
       const {t}=await loadLang();const scope=await scopeFor(projectId,team,t);
       if(!reason){if(policy||taskId!==undefined||role)throw new experimental_PluginRpcRefusal({code:"invalid",message:"State the concrete resource decision"});return withResourceResults(await resources.inspect(scope),(await readTasks(scope)).tasks);}
@@ -3460,6 +3610,7 @@ export default async function plugin(bb: BbPluginApi) {
         if(intent&&intent.stage!=="complete")throw new experimental_PluginRpcRefusal({code:"conflict",message:"Resolve the unfinished replacement before releasing attempts"});
         await tracker.review(scope,taskId,{decision:{decision:"changes-requested",reason,decidedBy:"manual",basis:"manual",atMs:Date.now()}});
       }
+      if(policy){const {lead}=await teamContext(scope,t);await resources.pinPackages(scope,(await readTasks(scope)).tasks,lead);}
       const result=await resources.decide(scope,reason,policy,taskId,role);publishChange(projectId);
       await bb.experimental_hooks.recheck("message.dispatch");return withResourceResults(result,(await readTasks(scope)).tasks);
     },
@@ -3929,6 +4080,27 @@ export default async function plugin(bb: BbPluginApi) {
           },
         }),
 
+        budget: cliCommand({
+          summary:"Inspect a work package budget or record the user's approved limit from chat",
+          positionals:[{name:"id",required:true,description:"Work package ID"}],
+          options:{project:PROJECT_OPTION,team:TEAM_OPTION,json:JSON_OPTION,limit:{type:"string",description:"Approved total allowance (1..1000), including already used starts"},"expected-limit":{type:"string",description:"Current limit shown by budget"},"expected-used":{type:"string",description:"Current usage shown by budget"},reason:{type:"string",description:"User's explicit decision and grounds"}},
+          async run(input,ctx){
+            const {t}=await loadLang();const scope=await resolveScope(input.options,ctx,t);const taskId=parseTaskId(input.positionals.id!);
+            const task=(await readTasks(scope)).tasks.find(task=>task.id===taskId);if(!task)throw new PluginCliError("Package not found",{code:"task_not_found"});
+            const {lead}=await teamContext(scope,t);await resources.pinPackages(scope,[task],lead);
+            const before=await resources.inspect(scope),used=before.taskCounts.filter(c=>c.taskId===taskId).reduce((n,c)=>n+c.starts+c.returns,0);
+            const current=before.taskLimits?.[`task:${taskId}`]??(task.role===lead?before.policy.coordinationAttempts??before.policy.taskAttempts:before.policy.taskAttempts);
+            let result=before;
+            if(input.options.limit!==undefined){
+              const limit=Number(input.options.limit),expectedLimit=Number(input.options["expected-limit"]),expectedUsed=Number(input.options["expected-used"]);
+              if(!Number.isInteger(limit)||limit<1||limit>1000||!Number.isInteger(expectedLimit)||expectedLimit<1||!Number.isInteger(expectedUsed)||expectedUsed<0)throw new PluginCliError("Use budget first, then provide --limit, --expected-limit, --expected-used and --reason",{code:"invalid_value"});
+              result=await changePackageBudget(scope,{taskId,limit,expectedLimit,expectedUsed,reason:input.options.reason??""},t,ctx.threadId);
+            }
+            const summary={taskId,title:task.title,used,limit:result.taskLimits?.[`task:${taskId}`]??current,sharedStartCap:null,blocked:packageResourceBlock(result,taskId)};
+            return {exitCode:0,stdout:input.options.json?JSON.stringify(summary):`${task.title} (#${taskId}): ${used}/${summary.limit}. ${currentLang==="ru"?"Общего лимита запусков команды нет; расход пакета сохранён.":"No shared start cap; package usage is retained."}`};
+          },
+        }),
+
         tracker: cliCommand({
           summary: "Select one task tracker for every team of the project",
           positionals: [{name: "kind", description: "beads | builtin | default (clear override)"}],
@@ -4321,23 +4493,8 @@ export default async function plugin(bb: BbPluginApi) {
               const intent = await readReplacementIntent(bb, scope.projectId, scope.team, roleName);
               const pending = intent && intent.stage !== "complete" ? intent : null;
               if (input.options.abort && !input.options["dry-run"]) {
-                if (!pending) throw new PluginCliError("No unfinished replacement to abort",{code:"replacement_missing"});
-                const canonical=await bb.storage.kv.get<string>(`active-session:${scope.projectId}:${scope.team}:${roleName}`);
-                if (canonical && canonical!==pending.oldThreadId) throw new PluginCliError("The role already switched; repeat replace to finish recovery",{code:"replacement_switched"});
-                const candidates=await core.listProjectThreads(bb,scope.projectId);
-                for (const candidate of candidates) {
-                  const meta=await bb.sdk.threads.getPluginMetadata({threadId:candidate.id}) as Record<string,unknown>;
-                  if (candidate.id!==pending.newThreadId && !(meta.teamReplacement===true && meta.teamReplacementRole===roleName && meta.teamReplacementTeam===scope.team)) continue;
-                  if (!(await isPreparedReplacement(bb,await bb.sdk.threads.get({threadId:candidate.id}))) || candidate.environmentId!==pending.environmentId) throw new PluginCliError("A replacement candidate is active or changed environment; inspect it before aborting",{code:"replacement_candidate_invalid"});
-                  const descendants=await bb.sdk.threads.experimental_listDescendants({threadIds:[candidate.id]});
-                  for (const id of descendants.threads.find(x=>x.threadId===candidate.id)?.descendantIds ?? []) {
-                    const child=await bb.sdk.threads.get({threadId:id});
-                    if (child.parentThreadId===candidate.id) await bb.sdk.threads.update({threadId:id,parentThreadId:pending.oldThreadId});
-                  }
-                  await bb.sdk.threads.updatePluginMetadata({threadId:candidate.id,set:{teamRetired:true},remove:["teamRole","teamName","teamNotifyOn"]});
-                  await bb.sdk.threads.archive({threadId:candidate.id});
-                }
-                await bb.storage.kv.delete(`replacement:${scope.projectId}:${scope.team}:${roleName}`);
+                if(!pending)throw new PluginCliError("No unfinished replacement to abort",{code:"replacement_missing"});
+                await abortRoleReplacement(scope,roleName,pending);
                 publishChange(scope.projectId);
                 return {exitCode:0,stdout:input.options.json?JSON.stringify({ok:true,aborted:true,oldThreadId:pending.oldThreadId}):`Replacement aborted; original session ${pending.oldThreadId} remains current`};
               }

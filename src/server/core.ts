@@ -7,7 +7,7 @@ import { PluginCliError, type BbPluginApi } from "@get-bb/plugin-sdk";
 import { load as loadYaml } from "js-yaml";
 import { z } from "zod";
 import { executionPolicySchema } from "../shared/execution-policy";
-import { hasLeadPolicy, leadAutonomyPolicy, sessionHandoffPolicy, executorReviewPolicy } from "../shared/messages";
+import { hasLeadPolicy, leadAutonomyPolicy, packageBudgetChatPolicy, sessionHandoffPolicy, executorReviewPolicy } from "../shared/messages";
 import type { Language } from "../shared/snapshot";
 import type { Strings } from "../shared/strings";
 import {
@@ -561,6 +561,7 @@ export async function loadRolePrompt(
   if (!prompt.includes("Team session handoff:") && !prompt.includes("Передача сессии Team:")) {
     prompt = `${prompt}\n\n${sessionHandoffPolicy(lang)}`;
   }
+  if (lead && !prompt.includes("[Team package budgets v2]")) prompt += `\n\n${packageBudgetChatPolicy(lang)}`;
   return prompt;
 }
 

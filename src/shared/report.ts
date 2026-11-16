@@ -199,11 +199,14 @@ function formatWhen(ms: number): string {
 
 function resourceLines(snapshot:TeamSnapshot,lang:Language):string[]{
  const r=snapshot.resources;if(!r)return [];const ru=lang==="ru";
- return [ru?"Ресурсы команды":"Team resources",`${ru?"Допусков запусков (включая резервы)":"Start admissions (including reservations)"}: ${r.starts}/${r.policy.teamStarts}; ${ru?"осталось":"remaining"} ${r.remainingStarts}`,
+ return [ru?"Ресурсы команды":"Team resources",`${ru?"Допусков запусков (включая резервы)":"Start admissions (including reservations)"}: ${r.starts}; ${ru?"без общего лимита запусков":"no shared start cap"}`,
  `${ru?"Сообщённые накопленные токены":"Reported cumulative tokens"}: ${r.reportedTokens===null?(ru?"недоступны":"unavailable"):`${r.reportedTokens} (${ru?"неполный учёт":"partial coverage"})`}`,
  ru?"Контекст не равен расходу. Денежный расход неизвестен. Активный вызов не прерывается; Send-now — ручное исключение BB.":"Context is not cumulative spend. Monetary cost is unknown. Active calls are not interrupted; Send-now is a manual BB override.",
  ...(r.ollamaUsage?[`Ollama Cloud: ${r.ollamaUsage.status} · ${new Date(r.ollamaUsage.checkedAtMs).toISOString()}`,...r.ollamaUsage.windows.map(w=>`${w.name}: ${w.remainingPercent}% ${ru?"осталось":"remaining"}; ${ru?"сброс":"reset"}: ${w.resetsAtMs?new Date(w.resetsAtMs).toISOString():"?"}`)]:[]),
+ (ru?"Лимит пакета можно согласовать с руководителем в чате; актуальные пределы и запись решения доступны через bb team budget <id>. Общий счётчик не является ограничением 100 запусков.":"Approve a package allowance in the lead chat; inspect and record it through bb team budget <id>. The total counter is not a 100-start limit."),
  ...(r.blocked?[`${ru?"Блокировка":"Blocked"}: ${r.blocked}`]:[]),
+ ...Object.entries(r.taskBlocks??{}).map(([key,why])=>`${key}: ${why}`),
+ ...r.taskCounts.filter(c=>c.taskId!==null).map(c=>`#${c.taskId}: ${c.starts+c.returns}/${r.taskLimits?.[`task:${c.taskId}`]??(snapshot.roles.find(role=>role.name===c.role)?.lead?r.policy.coordinationAttempts??r.policy.taskAttempts:r.policy.taskAttempts)} ${ru?"запусков и возвратов":"starts and rework returns"}`),
  ...Object.entries(r.holds).map(([key,why])=>`${key}: ${why}`),
  ...r.fallbacks.map(f=>`#${f.taskId??"—"}: ${f.stage} · ${f.selection?.provider??"—"}/${f.selection?.model??"—"} · ${f.reason}`),
  ...(r.results?[`${ru?"Принято":"Accepted"}: ${r.results.accepted}; review: ${r.results.review}`,...r.results.recent.map(t=>`#${t.id} ${t.title}: ${t.result??"—"}; ${ru?"основание":"grounds"}: ${t.acceptanceReason??"—"}`)]:[])];

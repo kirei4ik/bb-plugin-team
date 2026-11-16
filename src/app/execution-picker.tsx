@@ -4,6 +4,13 @@ import { experimental_ProviderModelPicker as ProviderModelPicker, useSdk } from 
 import type { ExperimentalProviderModelPickerRouting, ExperimentalProviderModelPickerValue, PluginBrowserBbSdk } from "@get-bb/plugin-sdk/app";
 
 export interface ExecutionModel { providerId?: string; model?: string; reasoningLevel?: string; serviceTier?: string }
+/** Native "default" can be a UI sentinel even when the target has no tiers.
+ * Omit a newly produced sentinel; retain a saved default only after catalog
+ * validation allowed mounting it. Never rewrite a saved selection on read. */
+export function pickerSelection(next:ExperimentalProviderModelPickerValue, previous?:ExecutionModel):ExecutionModel {
+  return {providerId:next.providerId,model:next.model,reasoningLevel:next.reasoningLevel,
+    ...(next.serviceTier && (next.serviceTier!=="default" || previous?.serviceTier==="default" && previous.providerId===next.providerId && previous.model===next.model) ? {serviceTier:next.serviceTier} : {})};
+}
 export interface ProjectModelRoutingState {
   routing: ExperimentalProviderModelPickerRouting | undefined;
   status: "idle" | "loading" | "ready" | "error";
@@ -81,8 +88,7 @@ export function ExecutionModelPicker({ value, onChange, routing, disabled, defau
   const clear = () => { setOpen(false); setDraft(null); onChange(undefined); };
   return <div className="flex flex-col gap-1">
     {open && selected && !blocked ? <ProviderModelPicker value={selected} routing={route} disabled={disabled}
-      onChange={next => onChange({ providerId: next.providerId, model: next.model, reasoningLevel: next.reasoningLevel,
-        ...(next.serviceTier ? { serviceTier: next.serviceTier } : {}) })} /> : <>
+      onChange={next => onChange(pickerSelection(next,selected))} /> : <>
       <span className="text-xs text-muted-foreground">{stored || defaultLabel}</span>
       {open && !disabled && !error && <span className="text-xs text-muted-foreground">{ru ? "Загрузка каталога…" : "Loading catalog…"}</span>}
       {!open && !disabled && <button type="button" disabled={blocked} onClick={() => setOpen(true)} className="text-xs text-foreground">{selectLabel}</button>}

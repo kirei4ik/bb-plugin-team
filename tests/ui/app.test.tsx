@@ -1,3 +1,4 @@
+import {createElement} from "react";
 import {emptyOpenRouter,type OpenRouterUsage} from "../../src/shared/openrouter-usage";
 // @vitest-environment jsdom
 // UI: панель Team (вкладки команд, мастер создания, исполнители, пакеты) и редактор шаблонов.
@@ -206,7 +207,7 @@ const QA: TeamSnapshot = {
 };
 
 async function mount(
-  options: { snapshots?: TeamSnapshot[]; providers?: { enabled: string[]; disabled: string[] }; templates?: TeamTemplate[]; defaultTemplate?: string; session?: Partial<SessionView>; language?: "en" | "ru"; rotate?: () => Promise<SessionView>; recovery?:Partial<RecoveryView>;openrouter?:OpenRouterUsage } = {},
+  options: { snapshots?: TeamSnapshot[]; providers?: { enabled: string[]; disabled: string[] }; templates?: TeamTemplate[]; defaultTemplate?: string; session?: Partial<SessionView>; language?: "en" | "ru"; rotate?: () => Promise<SessionView>; recovery?:Partial<RecoveryView>;openrouter?:OpenRouterUsage; sessionRecovery?:(input:Record<string,unknown>)=>Promise<unknown> } = {},
 ) {
   const app = await loadPluginApp(() => import("../../src/app/app"));
   const calls: Array<{ method: string; input: unknown }> = [];
@@ -230,6 +231,8 @@ async function mount(
           log("tree")(input);
           return { projectName: "demo", snapshots, language: options.language ?? "en" };
         },
+        sessionRecovery: async(input:Record<string,unknown>)=>{log("sessionRecovery")(input);if(options.sessionRecovery)return options.sessionRecovery(input);throw new Error("Unavailable");},
+        executionHistory: ()=>({events:[],retentionDays:30,maxEvents:2000}),
         sessionView: (input: {role: string}) => { log("sessionView")(input); return session(input.role); },
         sessionRotate: async (input: {role: string}) => { log("sessionRotate")(input); if (options.rotate) return options.rotate(); requested = true; return session(input.role); },
         providers: () => options.providers ?? { enabled: ["codex", "pi"], disabled: ["claude-code"] },
@@ -274,6 +277,7 @@ async function mount(
         roleRecovery: (input:{role:string;selection?:unknown})=>{
           log("roleRecovery")(input);return {threadId:roleThreads.get(input.role)??"thr_d",taskId:7,taskTitle:"Implement profile",environmentId:"env_1",actual:actualModels.get(input.role)??{provider:"codex",model:"gpt-4",reasoningLevel:"none"},revision:"preview-1",blockers:[],quota:"unknown",...options.recovery};
         },
+        packageBudget:(input:unknown)=>{log("packageBudget")(input);return snapshots[0]!.resources!;},
         continueCoordination:(input:{taskId:string|number;expectedStarts:number;expectedUsed:number})=>{
           log("continueCoordination")(input);const current=snapshots[0]!.resources!;snapshots=snapshots.map(s=>({...s,resources:{...current,blocked:null}}));return {...current,blocked:null};
         },
@@ -377,6 +381,31 @@ describe("панель Team: дерево команд", () => {
     expect(slot.getByText("Needs attention")).toBeTruthy();
     expect(slot.getByRole("alert").textContent).toContain("Inspect the prepared candidate before retrying.");
     expect(slot.getByRole("alert").textContent).toContain("The host disconnected during creation.");
+    slot.lifecycle.unmount();
+  });
+
+  it("восстановление сессии требует подтверждения и сохраняет исходное состояние при ошибке",async()=>{
+    const {slot,calls}=await mount({snapshots:[{...SNAPSHOT,roles:[SNAPSHOT.roles[0]!,{...SNAPSHOT.roles[1]!,executionState:{kind:"error",taskId:7,errorCode:"delivery_uncertain",safeAction:null,atMs:1}}]}],sessionRecovery:async(input)=>{
+      if(input.action)throw new Error("Queue response lost; inspect before retry");
+      return {revision:"rev-1",stage:"complete",delivery:"uncertain",oldThreadId:"old",newThreadId:"thr_d",actions:["release"],candidates:[],reasonCode:"delivery_uncertain"};
+    }});
+    fireEvent.click(await slot.findByText("Developer"));
+    fireEvent.click(await slot.findByText("Inspect session recovery"));
+    const button=await slot.findByText("Recheck the original queue");expect((button as HTMLButtonElement).disabled).toBe(true);
+    fireEvent.click(slot.getByLabelText("I inspected the state and confirm the action"));
+    fireEvent.click(button);await slot.findByText("Queue response lost; inspect before retry");
+    expect(calls.filter(c=>c.method==="sessionRecovery"&&(c.input as {action?:string}).action)).toHaveLength(1);
+    expect(slot.getByText("complete · uncertain · delivery_uncertain")).toBeTruthy();
+    expect((button as HTMLButtonElement).disabled).toBe(true);
+    slot.lifecycle.unmount();
+  });
+
+  it("история и экспорт остаются доступны после завершения всех задач роли",async()=>{
+    const {slot}=await mount({snapshots:[{...SNAPSHOT,roles:[SNAPSHOT.roles[0]!,{...SNAPSHOT.roles[1]!,tasks:[],diagnostics:[]}],executionEvents:[{timestamp:1,projectId:"proj_1",team:"main",taskId:7,role:"developer",threadId:"thr_d",operationId:"op",eventType:"attempt",previousState:"running",nextState:"completed",reasonCode:"attempt_completed",message:"attempt: completed",provider:"pi",model:null}]}]});
+    fireEvent.click(await slot.findByText("Developer"));
+    expect(await slot.findByText("Execution diagnostics")).toBeTruthy();
+    fireEvent.click(slot.getByText("Prepare diagnostic report"));
+    expect(await slot.findByText("Download diagnostic report")).toBeTruthy();
     slot.lifecycle.unmount();
   });
 
@@ -1015,11 +1044,25 @@ it("recovery explains missing work state and never offers a blind transfer",asyn
 });
 it("team summary grants a finite allowance without exposing the manual budget form",async()=>{
  const leadTask={id:"coord",role:"lead",title:"Coordinate MVP",status:"in-progress" as const,note:null,createdAtMs:0,updatedAtMs:0};
- const resources:ResourceSummary={sinceMs:1000,policy:{taskAttempts:8,teamStarts:100,tokens:null,minutes:null},starts:63,remainingStarts:37,reportedTokens:null,usageCoverage:"unavailable",blocked:"Task attempt limit reached (task:coord: 12/8); a new card or session cannot reset it",holds:{},attempts:[],taskCounts:[{taskId:"coord",role:"lead",starts:12,returns:0}],quotaBlocks:[],fallbacks:[]};
- const {slot,calls}=await mount({snapshots:[{...SNAPSHOT,roles:[{...SNAPSHOT.roles[0]!,tasks:[leadTask]},SNAPSHOT.roles[1]!],resources}]});
+ const resources:ResourceSummary={sinceMs:1000,policy:{taskAttempts:8,teamStarts:100,tokens:null,minutes:null},starts:63,remainingStarts:37,reportedTokens:null,usageCoverage:"unavailable",blocked:null,taskBlocks:{"task:coord":"Task attempt limit reached (task:coord: 12/8); changing session cannot reset this package"},holds:{},attempts:[],taskCounts:[{taskId:"coord",role:"lead",starts:12,returns:0}],quotaBlocks:[],fallbacks:[]};
+ const {slot,calls}=await mount({snapshots:[{...SNAPSHOT,roles:[{...SNAPSHOT.roles[0]!,tasks:[leadTask],executionState:{kind:"error",errorCode:"resource_hold",taskId:"coord",safeAction:null,atMs:1000}},SNAPSHOT.roles[1]!],resources}]});
  const summary=within(await slot.findByRole("region",{name:"Team work status"}));expect(summary.getByText("Lead needs permission to continue")).toBeTruthy();
  expect((slot.getByText("Limits, quotas and history").parentElement as HTMLDetailsElement).open).toBe(false);
- fireEvent.click(summary.getByText("Allow 4 more lead turns"));await waitFor(()=>expect(calls.filter(c=>c.method==="continueCoordination")).toHaveLength(1));expect(calls.find(c=>c.method==="continueCoordination")?.input).toMatchObject({taskId:"coord",expectedStarts:63,expectedUsed:12});expect(calls.some(c=>c.method==="resources")).toBe(false);slot.lifecycle.unmount();
+ expect(summary.queryByText(/choose another provider or model/)).toBeNull();expect(summary.getByText(/12 of 8 used/)).toBeTruthy();expect(summary.getByText(/One start processes a new message/)).toBeTruthy();expect(summary.getByText(/new limit: 16 instead of 8/)).toBeTruthy();
+ fireEvent.click(summary.getByText("Allow up to 4 more lead starts"));await waitFor(()=>expect(calls.filter(c=>c.method==="continueCoordination")).toHaveLength(1));expect(calls.find(c=>c.method==="continueCoordination")?.input).toMatchObject({taskId:"coord",expectedStarts:63,expectedUsed:12});expect(calls.some(c=>c.method==="resources")).toBe(false);slot.lifecycle.unmount();
+});
+
+it("показывает отдельные лимиты пакетов без общего предела запусков",async()=>{
+ const leadTask={id:"coord",role:"lead",title:"Coordinate MVP",status:"in-progress" as const,note:null,createdAtMs:0,updatedAtMs:0};
+ const resources:ResourceSummary={sinceMs:1000,policy:{coordinationAttempts:16,taskAttempts:8,teamStarts:100,tokens:null,minutes:null},starts:97,remainingStarts:3,reportedTokens:null,usageCoverage:"unavailable",blocked:null,holds:{},attempts:[],taskLimits:{"task:coord":29},taskCounts:[{taskId:"coord",role:"lead",starts:26,returns:0}],quotaBlocks:[],fallbacks:[]};
+ const {slot,calls}=await mount({language:"ru",snapshots:[{...SNAPSHOT,roles:[{...SNAPSHOT.roles[0]!,tasks:[leadTask]},SNAPSHOT.roles[1]!],resources}]});
+ const summary=within(await slot.findByRole("region",{name:"Что происходит в команде"}));
+ expect(slot.queryByText(/использовано 97 из 100 запусков/)).toBeNull();
+ expect(slot.getByText(/Общего лимита запусков на проект нет/)).toBeTruthy();
+ expect(summary.getByText(/использовано 26 из 29/)).toBeTruthy();
+ expect(summary.queryByText(/После ещё 3 новых запусков/)).toBeNull();
+ expect(calls.some(call=>call.method==="continueCoordination")).toBe(false);
+ slot.lifecycle.unmount();
 });
 
 it("offers explicit task-and-files recovery without claiming prior progress is verified",async()=>{
@@ -1090,4 +1133,32 @@ it("groups employees using the same OpenRouter key in the team summary",async()=
  const resources:ResourceSummary={sinceMs:0,policy:{taskAttempts:8,teamStarts:100,tokens:null,minutes:null},starts:0,remainingStarts:100,reportedTokens:null,usageCoverage:"unavailable",blocked:null,holds:{},attempts:[],fallbacks:[],quotaBlocks:[],taskCounts:[],openrouterUsage:{lead:usage,developer:usage}};
  const snapshot={...SNAPSHOT,resources,roles:SNAPSHOT.roles.map(r=>({...r,model:"openrouter/free",threads:r.threads.map(t=>({...t,model:"openrouter/free"}))}))};
  const {slot}=await mount({snapshots:[snapshot]});const summary=within(await slot.findByRole("region",{name:"Team work status"}));expect(summary.getByText("OpenRouter quota needs a decision")).toBeTruthy();expect(summary.getAllByText(/free requests remaining 0\/50/)).toHaveLength(1);slot.lifecycle.unmount();
+});
+
+it("edits the selected package allowance with displayed spend and grounds",async()=>{
+ const resources:ResourceSummary={sinceMs:0,policy:{taskAttempts:8,teamStarts:null,tokens:null,minutes:null},starts:100,remainingStarts:null,reportedTokens:null,usageCoverage:"unavailable",blocked:null,holds:{},attempts:[],taskCounts:[{taskId:7,role:"developer",starts:3,returns:1}],quotaBlocks:[],fallbacks:[]};
+ const {slot,calls}=await mount({snapshots:[{...SNAPSHOT,resources}]});
+ const panel=within(await slot.findByRole("region",{name:"Work package starts"}));
+ fireEvent.click(panel.getByText("Change package limit: #7"));
+ fireEvent.change(panel.getByLabelText("Package limit"),{target:{value:"12"}});
+ fireEvent.change(panel.getByLabelText("Grounds for budget change"),{target:{value:"Finish acceptance checks"}});
+ fireEvent.click(panel.getByText("Save package limit"));
+ await waitFor(()=>expect(calls.filter(c=>c.method==="packageBudget")).toHaveLength(1));
+ expect(calls.find(c=>c.method==="packageBudget")?.input).toMatchObject({taskId:7,limit:12,expectedLimit:8,expectedUsed:4,reason:"Finish acceptance checks"});
+ expect(calls.some(c=>c.method==="resources")).toBe(false);slot.lifecycle.unmount();
+});
+
+it("a delayed response cannot show another project's packages after navigation",async()=>{
+ const app=await loadPluginApp(()=>import("../../src/app/app"));const registration=app.navPanels[0]!;
+ let finishOld!:(value:unknown)=>void;
+ const slot=renderSlot(registration,{subPath:"old"},{rpc:{
+  tree:({projectId}:{projectId:string})=>projectId==="old"?new Promise(resolve=>{finishOld=resolve;}):{projectName:"New project",snapshots:[{...SNAPSHOT,projectId:"new",roles:[]}],language:"en"},
+  trackerConfig:()=>({kind:"builtin",override:null}),
+ }});
+ await waitFor(()=>expect(finishOld).toBeTypeOf("function"));
+ slot.lifecycle.rerender(createElement(registration.component,{subPath:"new"}));
+ await slot.findByRole("heading",{name:"New project"});
+ await act(async()=>{finishOld({projectName:"Old project",snapshots:[{...SNAPSHOT,projectId:"old"}],language:"en"});});
+ expect(slot.queryByText("Old project")).toBeNull();expect(slot.queryByText("Login form")).toBeNull();
+ expect(slot.getByRole("heading",{name:"New project"})).toBeTruthy();slot.lifecycle.unmount();
 });

@@ -127,3 +127,12 @@ describe("loadRolePrompt lead policy (bbt-er6.2)", () => {
     expect(result).not.toContain(policyMarker("en"));
   });
 });
+
+it("upgrades an older custom lead policy with current chat budget and human naming rules",async()=>{
+ const old="Правила автономного руководителя: старый текст и ограничения пользователя.";
+ const role={name:"lead",prompt:old} as unknown as Role;
+ const result=await loadRolePrompt(mockBb(),workspace,role,true,"ru",mockT);
+ expect(result).toContain(old);expect(result).toContain("[Team package budgets v2]");expect(result).toContain("Не отправляй пользователя обязательно в Team");
+ expect(result).toContain("названиями работ");
+ expect(await loadRolePrompt(mockBb(),workspace,{...role,prompt:result},true,"ru",mockT)).toBe(result);
+});

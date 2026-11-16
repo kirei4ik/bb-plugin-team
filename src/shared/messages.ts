@@ -504,9 +504,16 @@ const RU_LEAD_POLICY = `Правила автономного руководит
 - При руководстве работой свяжи сессию с задачей координации через checkpoint. Используй подходящую существующую задачу или эпик руководителя, не создавай дублирующую карточку координации.
 - Перед передачей дела или сменой сессии сохраняй содержательный checkpoint: bb team checkpoint <id> --file <абсолютный-путь.json>.`;
 
+/** Versioned addendum also upgrades custom prompts containing the older lead policy. */
+export function packageBudgetChatPolicy(lang:Language):string{
+ return "[Team package budgets v2]\n"+(lang==="ru"?`- Общайся с пользователем названиями работ и результатами. Один ID (например r20) ничего ему не объясняет; добавляй ID только для ссылки после названия.
+- Лимит запусков относится к отдельному пакету. Общий счётчик команды — статистика, а не предел 100 запусков. Перед утверждением об ограничении читай актуальный bb team report или bb team budget <id>, не используй старый счётчик из переписки. Явное согласование пользователя в чате записывай сам: прочитай bb team budget <id> --json, затем bb team budget <id> --limit <согласованный общий предел> --expected-limit <текущий предел> --expected-used <текущий расход> --reason <решение пользователя>. Не отправляй пользователя обязательно в Team. Повышай только явно согласованный предел конкретного названного пакета; если число или пакет неясны — уточни. Повышение лимита не разрешает новый scope или другого провайдера. Сообщение пользователя руководителю проходит его лимит пакета для обсуждения; автоматическая работа и квоты сохраняют ограничения.`:`- Speak to the user with work titles and outcomes. An ID alone (for example r20) is not a meaningful explanation; add it only as a reference after the title.
+- Start budgets belong to individual packages. The team-wide start count is statistics, never a 100-start cap. Before claiming a limit, read current bb team report or bb team budget <id>; never rely on an old conversation count. Accept an explicit user budget decision in chat: read bb team budget <id> --json, then use bb team budget <id> --limit <approved total> --expected-limit <current limit> --expected-used <current used> --reason <user decision>. Do not demand that the user visit Team. Increases require the user’s explicit agreement for that named package; ask if the number or package is ambiguous. A budget increase alone never approves new scope or a different provider. A user message to the lead can pass its package cap to discuss this; automated work and quotas remain guarded.`);
+}
+
 /** Persistent autonomous-lead policy text, localized. */
 export function leadAutonomyPolicy(lang: Language): string {
-  return lang === "ru" ? RU_LEAD_POLICY : EN_LEAD_POLICY;
+  return (lang === "ru" ? RU_LEAD_POLICY : EN_LEAD_POLICY)+"\n\n"+packageBudgetChatPolicy(lang);
 }
 
 /** True when the text already carries the lead policy for the language. */

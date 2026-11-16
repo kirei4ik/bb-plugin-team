@@ -1,9 +1,11 @@
 import type { BbPluginApi } from "@get-bb/plugin-sdk";
+import {executionJournal} from "./execution-journal";
 
 export type ReplacementInput = {
   projectId: string;
   team: string;
   role: string;
+  taskId?: string | number;
   oldThreadId: string;
   environmentId: string;
   /**
@@ -41,7 +43,8 @@ export type ReplacementStage =
   | "switching"
   | "prompting"
   | "complete"
-  | "spawn_uncertain";
+  | "spawn_uncertain"
+  | "invalid";
 
 export type ReplacementDelivery = "pending" | "sent" | "uncertain";
 
@@ -112,10 +115,20 @@ export async function replaceSession(
     input.role,
   );
   const intentKey = replacementKey(input.projectId, input.team, input.role);
+  const persistIntent = async (value: ReplacementIntent) => {
+    await bb.storage.kv.set(intentKey, value);
+    executionJournal(bb).record({projectId:input.projectId, team:input.team, role:input.role, taskId:input.taskId ?? null,
+      threadId:value.newThreadId ?? value.oldThreadId, operationId:`replace:${value.oldThreadId}:${value.startedAt}`,
+      eventType:"handoff", nextState:`${value.stage}:${value.delivery}`, reasonCode:value.stage === "spawn_uncertain" ? "spawn_uncertain" : value.delivery === "uncertain" ? "delivery_uncertain" : `handoff_${value.stage}`,
+      provider:input.spawnArgs.providerId ?? null, model:input.spawnArgs.model ?? null});
+  };
 
   const canonicalThreadId = await kvGetString(bb.storage.kv, canonicalKey);
   const storedIntent = await bb.storage.kv.get(intentKey);
   const parsedIntent = parseIntent(storedIntent);
+  if (parsedIntent?.stage === "invalid") {
+    throw new ReplacementError("Saved replacement state is invalid; inspect it before recovery. No spawn or release was attempted", "replacement_invalid");
+  }
 
   const { oldThreadId, intent, isRetry } = resolveState(
     input.oldThreadId,
@@ -263,7 +276,7 @@ export async function replaceSession(
     startedAt: now,
   };
   if (!intent) {
-    await bb.storage.kv.set(intentKey, currentIntent);
+    await persistIntent(currentIntent);
   } else if (isRetry) {
     currentIntent.resumed = true;
   }
@@ -294,16 +307,16 @@ export async function replaceSession(
 
     // Write ahead: a process exit during spawn must not create a second session.
     currentIntent.stage = "spawn_uncertain";
-    await bb.storage.kv.set(intentKey, currentIntent);
+    await persistIntent(currentIntent);
     try {
       const fresh = await bb.sdk.threads.spawn(spawnArgs);
       newThreadId = fresh.id;
       currentIntent.newThreadId = newThreadId;
       currentIntent.stage = "spawning";
-      await bb.storage.kv.set(intentKey, currentIntent);
+      await persistIntent(currentIntent);
     } catch (error) {
       currentIntent.stage = "spawn_uncertain";
-      await bb.storage.kv.set(intentKey, currentIntent);
+      await persistIntent(currentIntent);
       throw new ReplacementError(
         `Spawn attempt for role ${input.role} is uncertain; a thread may have been created in BB. Cause: ${(error as Error).message}`,
         "spawn_uncertain",
@@ -393,7 +406,7 @@ export async function replaceSession(
     }
 
     currentIntent.stage = "switching";
-    await bb.storage.kv.set(intentKey, currentIntent);
+    await persistIntent(currentIntent);
   }
 
   // ── Archive old ──
@@ -418,7 +431,7 @@ export async function replaceSession(
     }
 
     currentIntent.stage = "prompting";
-    await bb.storage.kv.set(intentKey, currentIntent);
+    await persistIntent(currentIntent);
   }
 
   // ── Release the queued prompt via recheck ──
@@ -426,12 +439,16 @@ export async function replaceSession(
     currentIntent.stage === "prompting" &&
     currentIntent.delivery === "pending"
   ) {
-    currentIntent.delivery = "sent";
+    // Complete releases the dispatch hook, but is not proof of delivery.
+    // A crash or lost recheck response must remain explicitly uncertain.
+    currentIntent.delivery = "uncertain";
     currentIntent.stage = "complete";
     currentIntent.completedAt = Date.now();
-    await bb.storage.kv.set(intentKey, currentIntent);
+    await persistIntent(currentIntent);
     try {
       await bb.experimental_hooks.recheck("message.dispatch");
+      currentIntent.delivery = "sent";
+      await persistIntent(currentIntent);
     } catch (error) {
       throw new ReplacementError(
         `Role switched, but the queued prompt on ${newThreadId} could not be released; run bb team resume`,
@@ -496,12 +513,14 @@ async function kvGetString(
 }
 
 function parseIntent(raw: unknown): ReplacementIntent | null {
-  if (!raw || typeof raw !== "object") return null;
+  if (raw == null) return null;
+  if (typeof raw !== "object") return invalidIntent({});
   const obj = raw as Partial<ReplacementIntent>;
-  if (typeof obj.oldThreadId !== "string") return null;
-  if (typeof obj.environmentId !== "string") return null;
-  if (typeof obj.keep !== "boolean") return null;
-  if (typeof obj.startedAt !== "number") return null;
+  if (typeof obj.oldThreadId !== "string" || !obj.oldThreadId || typeof obj.environmentId !== "string" || !obj.environmentId ||
+      typeof obj.keep !== "boolean" || typeof obj.startedAt !== "number" || !Number.isFinite(obj.startedAt) ||
+      !isReplacementStage(obj.stage) || !isReplacementDelivery(obj.delivery) ||
+      obj.newThreadId !== null && (typeof obj.newThreadId !== "string" || !obj.newThreadId) ||
+      ["switching", "prompting", "complete"].includes(obj.stage) && !obj.newThreadId) return invalidIntent(obj);
   return {
     oldThreadId: obj.oldThreadId,
     newThreadId: typeof obj.newThreadId === "string" ? obj.newThreadId : null,
@@ -515,6 +534,13 @@ function parseIntent(raw: unknown): ReplacementIntent | null {
     completedAt:
       typeof obj.completedAt === "number" ? obj.completedAt : undefined,
   };
+}
+
+/** Keep invalid state visible without guessing a safe stage or mutating KV. */
+function invalidIntent(obj: Partial<ReplacementIntent>): ReplacementIntent {
+  return {oldThreadId: typeof obj.oldThreadId === "string" ? obj.oldThreadId : "", newThreadId: typeof obj.newThreadId === "string" ? obj.newThreadId : null,
+    environmentId: typeof obj.environmentId === "string" ? obj.environmentId : "", keep: true, stage: "invalid", delivery: "uncertain",
+    reparented: 0, resumed: false, startedAt: typeof obj.startedAt === "number" && Number.isFinite(obj.startedAt) ? obj.startedAt : 0};
 }
 
 function isReplacementStage(v: unknown): v is ReplacementStage {

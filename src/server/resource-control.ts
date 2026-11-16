@@ -1,5 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { z } from "zod";
+import {STORAGE_MIGRATIONS} from "./storage-migrations";
+import {executionJournal} from "./execution-journal";
 import type { BbPluginApi, MessageDispatchHookContext, MessageDispatchHookDecision, PluginTurnFailedEvent } from "@get-bb/plugin-sdk";
 import type { TaskId, TeamTask } from "../shared/snapshot";
 import type { OllamaUsage } from "../shared/ollama-usage";
@@ -8,35 +10,42 @@ import type { ExecutionFallbackSelection } from "../shared/execution-policy";
 export const resourcePolicySchema = z.object({
   coordinationAttempts: z.number().int().min(1).max(1000).optional(),
   taskAttempts: z.number().int().min(1).max(1000),
-  teamStarts: z.number().int().min(1).max(10000),
+  /** Deprecated input retained for old clients; no team-wide start gate. */
+  teamStarts: z.number().int().min(1).max(10000).nullable(),
   tokens: z.number().int().positive().max(Number.MAX_SAFE_INTEGER).nullable(),
   minutes: z.number().int().positive().max(525600).nullable(),
 }).strict();
 export type ResourcePolicy = z.infer<typeof resourcePolicySchema>;
-export const DEFAULT_RESOURCE_POLICY: ResourcePolicy = {coordinationAttempts:40,taskAttempts:8,teamStarts:100,tokens:null,minutes:null};
+export const DEFAULT_RESOURCE_POLICY: ResourcePolicy = {coordinationAttempts:40,taskAttempts:8,teamStarts:null,tokens:null,minutes:null};
 export interface ResourceOwner {projectId:string;team:string;role:string;taskId:TaskId|null;ownerThreadId:string;hostId:string|null;isLead?:boolean}
 export interface ResourceAttempt {
+  userControl?:boolean;
   id:string;key:string;threadId:string;taskId:TaskId|null;role:string;provider:string;model:string|null;
   initiator:string;requestId:string|null;atMs:number;endedAtMs:number|null;
   outcome:"reserved"|"running"|"completed"|"failed"|"interrupted"|"cancelled"|"unknown";
   reason:string|null; tokens:number|null; queuedIds:string[];
 }
 interface TrackedThread {owner:ResourceOwner;cursor:number;lastUsage:number|null;reported:number;usageKnown:boolean;usagePartial:boolean;activeId:string|null;requestId:string|null;eventsAvailable:boolean}
-interface Quota {accountScope?:string;provider:string;hostId:string|null;pool:string|null;until:number|null;requestId:string}
+interface Quota {cleared?:boolean;accountScope?:string;provider:string;hostId:string|null;pool:string|null;until:number|null;requestId:string}
 export interface ResourceFallback {requestId:string;threadId:string;role:string;taskId:TaskId|null;stage:"blocked"|"selected"|"switching"|"complete"|"error";selection:ExecutionFallbackSelection|null;newThreadId:string|null;reason:string;atMs:number;manualReleased?:boolean}
 interface ResourceState {
-  version:1;sinceMs:number;policy:ResourcePolicy;attempts:ResourceAttempt[];threads:Record<string,TrackedThread>;
+  version:1;startBudgetScope?:"package";sinceMs:number;policy:ResourcePolicy;attempts:ResourceAttempt[];threads:Record<string,TrackedThread>;
   holds:Record<string,string>;finished:string[];quotas:Quota[];pools:Record<string,string[]>;fallbacks:Record<string,ResourceFallback>;
   seenFailures:string[];notices:string[];returns:Array<{taskId:TaskId;role:string;ref:string;atMs:number}>;
   decisions:Array<{atMs:number;reason:string;taskId:TaskId|null;policy:ResourcePolicy}>;
   blocked:string|null;blockedAtMs:number|null;taskCeilings?:Record<string,number>;
 }
 export interface ResourceSummary {
+  budgetNotice?:"sent"|"queued"|"busy"|"unavailable";
+  startBudgetScope?:"package";
+  taskBlocks?:Record<string,string>;
+  blockedAtMs?:number|null;
+  outcomeCounts?:Record<ResourceAttempt["outcome"],number>;
   ollamaUsage?:OllamaUsage;
   openrouterUsage?:Record<string,import("../shared/openrouter-usage").OpenRouterUsage>;
   quotaPolicy?:import("../shared/ollama-usage").QuotaPolicy;
   taskLimits?:Record<string,number>;
-  sinceMs:number;policy:ResourcePolicy;starts:number;remainingStarts:number;reportedTokens:number|null;
+  sinceMs:number;policy:ResourcePolicy;starts:number;remainingStarts:number|null;reportedTokens:number|null;
   usageCoverage:"unavailable"|"partial";blocked:string|null;holds:Record<string,string>;
   attempts:ResourceAttempt[];fallbacks:ResourceFallback[];quotaBlocks:Array<{provider:string;hostId:string|null;resetAtMs:number|null}>;
   taskCounts:Array<{taskId:TaskId|null;role:string;starts:number;returns:number}>;
@@ -67,15 +76,34 @@ export class ResourceControl {
   constructor(private bb:BbPluginApi,private resolve:(threadId:string)=>Promise<ResourceOwner|null>,private changed:(projectId:string)=>void,private now=Date.now) {
     this.enabledAt=this.now();
     this.db=bb.storage.database();
-    bb.storage.migrate(this.db,["CREATE TABLE IF NOT EXISTS team_resource_state (scope TEXT PRIMARY KEY, data TEXT NOT NULL)","CREATE TABLE IF NOT EXISTS team_resource_quota (id TEXT PRIMARY KEY, data TEXT NOT NULL)","CREATE TABLE IF NOT EXISTS team_resource_provider_pools (provider TEXT PRIMARY KEY, pools TEXT NOT NULL)"]);
+    bb.storage.migrate(this.db, STORAGE_MIGRATIONS);
+    executionJournal(bb);
   }
   private scope(owner:Pick<ResourceOwner,"projectId"|"team">){return JSON.stringify([owner.projectId,owner.team]);}
   private load(owner:Pick<ResourceOwner,"projectId"|"team">):ResourceState {
     const row=this.db.prepare("SELECT data FROM team_resource_state WHERE scope=?").get(this.scope(owner)) as {data:string}|undefined;
-    return row?JSON.parse(row.data):{version:1,sinceMs:this.enabledAt,policy:{...DEFAULT_RESOURCE_POLICY},attempts:[],threads:{},holds:{},finished:[],quotas:[],pools:{},fallbacks:{},seenFailures:[],notices:[],returns:[],decisions:[],blocked:null,blockedAtMs:null};
+    const state:ResourceState=row?JSON.parse(row.data):{version:1,startBudgetScope:"package",sinceMs:this.enabledAt,policy:{...DEFAULT_RESOURCE_POLICY},attempts:[],threads:{},holds:{},finished:[],quotas:[],pools:{},fallbacks:{},seenFailures:[],notices:[],returns:[],decisions:[],blocked:null,blockedAtMs:null};
+    if(state.startBudgetScope!=="package"){
+      // Preserve every existing package's effective allowance and all spending.
+      state.taskCeilings??={};
+      for(const a of state.attempts)if(a.taskId!==null){const key=taskKey(a.taskId,a.role);state.taskCeilings[key]??=this.defaultTaskLimit(state,a.taskId);}
+      if(state.blocked?.startsWith("Team start limit reached")||state.blocked?.startsWith("Task attempt limit reached")){state.blocked=null;state.blockedAtMs=null;}
+      state.startBudgetScope="package";
+      state.decisions.push({atMs:this.now(),reason:"Start budgets moved to work packages; legacy team start cap retired, usage retained",taskId:null,policy:{...state.policy,teamStarts:null}});
+    }
+    state.policy.teamStarts=null;
+    return state;
   }
   private save(owner:Pick<ResourceOwner,"projectId"|"team">,state:ResourceState){
-    this.db.prepare("INSERT INTO team_resource_state(scope,data) VALUES(?,?) ON CONFLICT(scope) DO UPDATE SET data=excluded.data").run(this.scope(owner),JSON.stringify(state));
+    const old = this.load(owner);
+    const attempts = new Map(old.attempts.map(a => [a.id, a.outcome]));
+    this.db.transaction(() => {
+      this.db.prepare("INSERT INTO team_resource_state(scope,data) VALUES(?,?) ON CONFLICT(scope) DO UPDATE SET data=excluded.data").run(this.scope(owner),JSON.stringify(state));
+      const journal = executionJournal(this.bb);
+      for (const a of state.attempts) if (attempts.get(a.id) !== a.outcome) journal.record({...owner, taskId:a.taskId, role:a.role, threadId:a.threadId, operationId:a.id, eventType:"attempt", nextState:a.outcome, reasonCode:`attempt_${a.outcome}`, provider:a.provider, model:a.model, timestamp:a.endedAtMs ?? a.atMs});
+      for (const f of Object.values(state.fallbacks)) if (old.fallbacks[f.requestId]?.stage !== f.stage) journal.record({...owner, taskId:f.taskId, role:f.role, threadId:f.threadId, operationId:f.requestId, eventType:"fallback", nextState:f.stage, reasonCode:`fallback_${f.stage}`, provider:f.selection?.provider ?? null, model:f.selection?.model ?? null});
+      for (let i=old.decisions.length; i<state.decisions.length; i++) {const d=state.decisions[i]!; journal.record({...owner, taskId:d.taskId, role:"", threadId:null, operationId:`decision:${i}:${d.atMs}`, eventType:"decision", nextState:"recorded", reasonCode:"resource_decision", provider:null, model:null, timestamp:d.atMs});}
+    })();
   }
   private serial<T>(fn:()=>Promise<T>):Promise<T>{const work=this.tail.catch(()=>{}).then(fn);this.tail=work;return work;}
   private track(state:ResourceState,id:string,owner:ResourceOwner):TrackedThread {
@@ -86,6 +114,7 @@ export class ResourceControl {
   private attempt(state:ResourceState,thread:TrackedThread){return state.attempts.find(a=>a.id===thread.activeId);}
   private append(state:ResourceState,owner:ResourceOwner,id:string,key:string,provider:string,model:string|null,initiator:string):ResourceAttempt {
     const attempt:ResourceAttempt={id:randomUUID(),key,threadId:id,taskId:owner.taskId,role:owner.role,provider,model,initiator,requestId:null,atMs:this.now(),endedAtMs:null,outcome:"reserved",reason:null,tokens:null,queuedIds:[]};
+    if(owner.taskId!==null){state.taskCeilings??={};state.taskCeilings[taskKey(owner.taskId,owner.role)]??=owner.isLead?state.policy.coordinationAttempts??state.policy.taskAttempts:state.policy.taskAttempts;}
     state.attempts.push(attempt);state.threads[id]!.activeId=attempt.id;return attempt;
   }
   private finish(state:ResourceState,thread:TrackedThread,outcome:ResourceAttempt["outcome"],reason:string|null,atMs:number){
@@ -102,7 +131,7 @@ export class ResourceControl {
     this.db.prepare("INSERT INTO team_resource_provider_pools(provider,pools) VALUES(?,?) ON CONFLICT(provider) DO UPDATE SET pools=excluded.pools").run(JSON.stringify([owner.hostId,raw.providerId,...(accountScope?[accountScope]:[])]),JSON.stringify(keys));
     if(raw.status==="allowed"&&raw.windows.every(w=>w.status!=="blocked")){
       const rows=this.db.prepare("SELECT id,data FROM team_resource_quota").all() as Array<{id:string;data:string}>;
-      for(const row of rows){const q=JSON.parse(row.data) as Quota;if(q.hostId===owner.hostId&&q.provider===raw.providerId&&q.accountScope===accountScope&&(q.pool===null||keys.includes(q.pool))){q.until=this.now();this.db.prepare("UPDATE team_resource_quota SET data=? WHERE id=?").run(JSON.stringify(q),row.id);}}
+      for(const row of rows){const q=JSON.parse(row.data) as Quota;if(q.hostId===owner.hostId&&q.provider===raw.providerId&&q.accountScope===accountScope&&(q.pool===null||keys.includes(q.pool))){q.cleared=true;this.db.prepare("UPDATE team_resource_quota SET data=? WHERE id=?").run(JSON.stringify(q),row.id);}}
     }
     return keys;
   }
@@ -112,7 +141,7 @@ export class ResourceControl {
     const entry=this.db.prepare("SELECT pools FROM team_resource_provider_pools WHERE provider=?").get(JSON.stringify([hostId,provider,...(accountScope?[accountScope]:[])])) as {pools:string}|undefined;
     const legacy=accountScope?this.db.prepare("SELECT pools FROM team_resource_provider_pools WHERE provider=?").get(JSON.stringify([hostId,provider])) as {pools:string}|undefined:undefined;
     const known:string[]=[...(entry?JSON.parse(entry.pools):[]),...(legacy?JSON.parse(legacy.pools):[])];
-    return this.quotas().some(q=>(q.provider===provider&&q.hostId===hostId&&(!q.accountScope||!accountScope||q.accountScope===accountScope)||q.pool!==null&&known.includes(q.pool))&&(q.until===null||q.until>this.now()));
+    return this.quotas().some(q=>(q.provider===provider&&q.hostId===hostId&&(!q.accountScope||!accountScope||q.accountScope===accountScope)||q.pool!==null&&known.includes(q.pool))&&!q.cleared);
   }
   private async syncThread(state:ResourceState,id:string){
     const thread=state.threads[id];if(!thread)return;
@@ -169,30 +198,42 @@ export class ResourceControl {
     }catch{thread.eventsAvailable=false;}
   }
   private async syncAll(state:ResourceState){for(const id of Object.keys(state.threads))await this.syncThread(state,id);}
-  private limit(state:ResourceState,excluding?:string):string|null {
-    const attempts=state.attempts.filter(a=>a.id!==excluding);
+  private defaultTaskLimit(state:ResourceState,taskId:TaskId):number {
+    const lead=state.attempts.some(a=>a.taskId===taskId&&state.threads[a.threadId]?.owner.isLead);
+    return lead?state.policy.coordinationAttempts??state.policy.taskAttempts:state.policy.taskAttempts;
+  }
+  private taskUsed(state:ResourceState,taskId:TaskId,excluding?:string):number {
+    return state.attempts.filter(a=>a.id!==excluding&&a.taskId===taskId).length+(state.returns??[]).filter(r=>r.taskId===taskId).length;
+  }
+  private packageLimit(state:ResourceState,owner:ResourceOwner,excluding?:string):string|null {
+    if(owner.taskId===null){
+      const count=state.attempts.filter(a=>a.id!==excluding&&a.taskId===null&&state.threads[a.threadId]?.owner.ownerThreadId===owner.ownerThreadId).length;
+      const ceiling=owner.isLead?state.policy.coordinationAttempts??state.policy.taskAttempts:state.policy.taskAttempts;
+      return count>=ceiling?"Assign a work package before more starts; this session's initialization allowance is exhausted":null;
+    }
+    const key=taskKey(owner.taskId,owner.role),count=this.taskUsed(state,owner.taskId,excluding);
+    const ceiling=state.taskCeilings?.[key]??(owner.isLead?state.policy.coordinationAttempts??state.policy.taskAttempts:state.policy.taskAttempts);
+    return count>=ceiling?`Task attempt limit reached (${key}: ${count}/${ceiling}); changing session or model cannot reset this package`:null;
+  }
+  private limit(state:ResourceState,owner?:ResourceOwner,excluding?:string):string|null {
     if(state.attempts.length>=10000)return "Accounting history reached its safety limit; manual resource decision required";
-    if(attempts.length>=state.policy.teamStarts)return `Team start limit reached (${state.policy.teamStarts})`;
     if(state.attempts.length&&state.policy.minutes!==null&&this.now()-state.attempts[0]!.atMs>=state.policy.minutes*60000)return `Team time limit reached (${state.policy.minutes} minutes)`;
     const usage=Object.values(state.threads).reduce((n,t)=>n+t.reported,0);
     if(state.policy.tokens!==null&&usage>=state.policy.tokens)return `Reported cumulative token limit reached (${state.policy.tokens}); unsupported usage remains unknown`;
-    const counts=new Map<string,number>();
-    for(const a of attempts){if(a.taskId===null)continue;const key=taskKey(a.taskId,a.role);counts.set(key,(counts.get(key)??0)+1);}
-    for(const returned of state.returns??[]){const key=taskKey(returned.taskId,returned.role);counts.set(key,(counts.get(key)??0)+1);}
-    for(const [key,count]of counts) {
-      const lead = attempts.some(a=>taskKey(a.taskId,a.role)===key && state.threads[a.threadId]?.owner.isLead);
-      const ceiling = state.taskCeilings?.[key] ?? (lead ? state.policy.coordinationAttempts ?? state.policy.taskAttempts : state.policy.taskAttempts);
-      if(count>=ceiling&&!state.finished.includes(key))return `Task attempt limit reached (${key}: ${count}/${ceiling}); a new card or session cannot reset it`;
-    }
-    return null;
+    return owner?this.packageLimit(state,owner,excluding):null;
   }
   private block(state:ResourceState,reason:string){if(state.blocked!==reason){state.blocked=reason;state.blockedAtMs=this.now();}}
   private summary(state:ResourceState):ResourceSummary {
+    const outcomeCounts:Record<ResourceAttempt["outcome"],number>={reserved:0,running:0,completed:0,failed:0,interrupted:0,cancelled:0,unknown:0};
+    for(const attempt of state.attempts)outcomeCounts[attempt.outcome]++;
     const threads=Object.values(state.threads);
     const grouped=new Map<string,{taskId:TaskId|null;role:string;starts:number;returns:number}>();
     for(const a of state.attempts){const key=taskKey(a.taskId,a.role),row=grouped.get(key)??{taskId:a.taskId,role:a.role,starts:0,returns:0};row.starts++;grouped.set(key,row);}
     for(const returned of state.returns??[]){const key=taskKey(returned.taskId,returned.role),row=grouped.get(key)??{taskId:returned.taskId,role:returned.role,starts:0,returns:0};row.returns++;grouped.set(key,row);}
-    return {taskLimits:{...state.taskCeilings},quotaBlocks:this.quotas().filter(q=>q.until===null||q.until>this.now()).map(q=>({provider:q.provider,hostId:q.hostId,resetAtMs:q.until})),taskCounts:[...grouped.values()],sinceMs:state.sinceMs,policy:state.policy,starts:state.attempts.length,remainingStarts:Math.max(0,state.policy.teamStarts-state.attempts.length),reportedTokens:threads.some(t=>t.usageKnown)?threads.reduce((n,t)=>n+t.reported,0):null,usageCoverage:threads.some(t=>t.usageKnown)?"partial":"unavailable",blocked:state.blocked,holds:state.holds,attempts:state.attempts.slice(-100),fallbacks:Object.values(state.fallbacks).slice(-50)};
+    const taskBlocks:Record<string,string>={};
+    const visited=new Set<string>();
+    for(const a of state.attempts){const key=taskKey(a.taskId,a.role);if(a.taskId===null||visited.has(key)||state.finished.includes(key))continue;visited.add(key);const owner=state.threads[a.threadId]?.owner;if(!owner)continue;const reason=this.packageLimit(state,{...owner,taskId:a.taskId});if(reason)taskBlocks[taskKey(a.taskId,a.role)]=reason;}
+    return {startBudgetScope:"package",taskBlocks,outcomeCounts,blockedAtMs:state.blockedAtMs,taskLimits:{...state.taskCeilings},quotaBlocks:this.quotas().filter(q=>!q.cleared).map(q=>({provider:q.provider,hostId:q.hostId,resetAtMs:q.until})),taskCounts:[...grouped.values()],sinceMs:state.sinceMs,policy:state.policy,starts:state.attempts.length,remainingStarts:null,reportedTokens:threads.some(t=>t.usageKnown)?threads.reduce((n,t)=>n+t.reported,0):null,usageCoverage:threads.some(t=>t.usageKnown)?"partial":"unavailable",blocked:state.blocked,holds:state.holds,attempts:state.attempts.slice(-100),fallbacks:Object.values(state.fallbacks).slice(-50)};
   }
   async admit(ctx:MessageDispatchHookContext):Promise<MessageDispatchHookDecision>{
     if(ctx.attempt!=="start-turn")return {action:"proceed"};
@@ -218,10 +259,15 @@ export class ResourceControl {
       }
       const pending=Object.values(state.fallbacks).find(f=>f.taskId!==null&&f.taskId===owner.taskId&&f.stage!=="complete"&&!f.manualReleased&&f.newThreadId!==ctx.thread.id);
       if(pending)return {action:"wait",reason:`Team is preserving task ${owner.taskId} during quota recovery: ${pending.reason}`};
-      const limit=this.limit(state,reentry?active!.id:undefined);
+      // A real user must be able to discuss and approve a package budget with
+      // the lead. This waives only its package gate, never quota/error/shared guards.
+      const directUser=ctx.initiator==="user"&&ctx.senderThreadId===null&&ctx.originPluginId===null;
+      const groupedUser=ctx.initiator==="mixed"&&ctx.queuedMessages.some(m=>m.initiator==="user"&&m.senderThreadId===null&&m.originPluginId===null&&m.payload?.kind!=="retry");
+      const userControl=!!owner.isLead&&owner.ownerThreadId===ctx.thread.id&&(directUser||groupedUser);
+      const limit=this.limit(state,userControl?undefined:owner,reentry?active!.id:undefined);
       const quota=this.isBlocked(ctx.requestedExecution.providerId,owner.hostId,ctx.requestedExecution.model);
       const reason=limit??state.blocked??state.holds[taskKey(owner.taskId,owner.role)]??(quota?"Provider quota is blocked for this host/account scope; wait for reset or choose an approved independent provider":null);
-      if(reason){const changed=limit&&state.blocked!==limit;if(limit)this.block(state,limit);this.save(owner,state);if(changed)this.changed(owner.projectId);return {action:"wait",reason:`Team resources: ${reason}. Review the resource panel; active work is not interrupted.`};}
+      if(reason){const changed=limit&&state.blocked!==limit;const shared=this.limit(state);if(shared)this.block(state,shared);this.save(owner,state);if(changed)this.changed(owner.projectId);return {action:"wait",reason:`Team resources: ${reason}. Review the resource panel; active work is not interrupted.`};}
       if(reentry){this.save(owner,state);return {action:"proceed"};}
       if(active&&!terminal(active)){
         if(ctx.thread.status==="idle"||ctx.thread.status==="error"){this.finish(state,thread,"unknown","Previous admission has no complete event; reserved cost is retained",this.now());state.holds[taskKey(owner.taskId,owner.role)]="Previous attempt outcome is unknown; inspect it before a concrete manual decision";this.save(owner,state);return {action:"wait",reason:state.holds[taskKey(owner.taskId,owner.role)]!};}
@@ -230,7 +276,7 @@ export class ResourceControl {
       const previous=state.attempts.find(a=>a.key===key);
       if(previous)return {action:"wait",reason:"This admission already completed; inspect its result before explicitly requesting another attempt"};
       const attempt=this.append(state,owner,ctx.thread.id,key,ctx.requestedExecution.providerId,ctx.requestedExecution.model,ctx.initiator);
-      attempt.queuedIds=queued;this.save(owner,state);this.changed(owner.projectId);return {action:"proceed"};
+      attempt.userControl=userControl;attempt.queuedIds=queued;this.save(owner,state);this.changed(owner.projectId);return {action:"proceed"};
     });
   }
   async watch(threadId:string){const owner=await this.resolve(threadId);if(!owner)return;await this.serial(async()=>{const s=this.load(owner);this.track(s,threadId,owner);await this.syncThread(s,threadId);this.save(owner,s);});}
@@ -248,13 +294,13 @@ export class ResourceControl {
       const q=JSON.parse(row.data) as Quota;
       // No provider-wide reset: other keys/accounts and other owners keep their
       // exclusions until independently verified. Budgets/counters are untouched.
-      if(q.hostId===owner.hostId&&q.provider===provider&&requests.has(q.requestId))this.db.prepare("UPDATE team_resource_quota SET data=? WHERE id=?").run(JSON.stringify({...q,until:this.now()}),row.id);
+      if(q.hostId===owner.hostId&&q.provider===provider&&requests.has(q.requestId))this.db.prepare("UPDATE team_resource_quota SET data=? WHERE id=?").run(JSON.stringify({...q,cleared:true}),row.id);
     }
   });}
   async confirmOllamaCapacity(hostId:string){return this.serial(async()=>{
     for(const row of this.db.prepare("SELECT id,data FROM team_resource_quota").all() as Array<{id:string;data:string}>){
       const q=JSON.parse(row.data) as Quota;
-      if(q.provider==="pi"&&q.hostId===hostId&&q.accountScope==="ollama-cloud")this.db.prepare("UPDATE team_resource_quota SET data=? WHERE id=?").run(JSON.stringify({...q,until:this.now()}),row.id);
+      if(q.provider==="pi"&&q.hostId===hostId&&q.accountScope==="ollama-cloud")this.db.prepare("UPDATE team_resource_quota SET data=? WHERE id=?").run(JSON.stringify({...q,cleared:true}),row.id);
     }
   });}
   async quotaExcluded(owner:Pick<ResourceOwner,"hostId">,selection:ExecutionFallbackSelection){
@@ -263,10 +309,37 @@ export class ResourceControl {
   async inspect(owner:Pick<ResourceOwner,"projectId"|"team">){return this.serial(async()=>{const s=this.load(owner);await this.syncAll(s);this.save(owner,s);const summary=this.summary(s);summary.blocked??=this.limit(s);return summary;});}
   async decide(owner:Pick<ResourceOwner,"projectId"|"team">,reason:string,policy?:ResourcePolicy,taskId?:TaskId,role?:string,decisionSource:"tracker"|"capacity"="tracker"){
     if(!reason.trim())throw new Error("A concrete manual resource decision is required");
-    return this.serial(async()=>{const s=this.load(owner);if(policy)s.policy=resourcePolicySchema.parse(policy);
+    return this.serial(async()=>{const s=this.load(owner);if(policy)s.policy={...resourcePolicySchema.parse(policy),teamStarts:null};
       if(taskId!==undefined||role){delete s.holds[taskKey(taskId??null,role??"")];for(const f of Object.values(s.fallbacks))if((taskId!==undefined?f.taskId===taskId:f.taskId===null&&f.role===role)&&(f.stage==="blocked"||f.stage==="error")){f.stage="error";f.manualReleased=true;}}
       const limit=this.limit(s);s.blocked=limit;s.blockedAtMs=limit?this.now():null;
       s.decisions.push({atMs:this.now(),reason:taskId!==undefined&&decisionSource==="tracker"?"Concrete task approach decision is recorded in the selected tracker":safeText(reason),taskId:taskId??null,policy:{...s.policy}});this.save(owner,s);return this.summary(s);
+    });
+  }
+  async userControlTurn(threadId:string):Promise<string|null>{
+    const owner=await this.resolve(threadId);if(!owner?.isLead)return null;
+    return this.serial(async()=>{const s=this.load(owner);await this.syncThread(s,threadId);this.save(owner,s);
+      const thread=s.threads[threadId],attempt=thread&&this.attempt(s,thread);
+      return attempt?.userControl&&!terminal(attempt)?attempt.id:null;
+    });
+  }
+  async pinPackages(owner:Pick<ResourceOwner,"projectId"|"team">,tasks:TeamTask[],leadRole:string|null){
+    return this.serial(async()=>{const s=this.load(owner);s.taskCeilings??={};
+      for(const task of tasks)if(["todo","in-progress","review"].includes(task.status))s.taskCeilings[taskKey(task.id,task.role)]??=task.role===leadRole?s.policy.coordinationAttempts??s.policy.taskAttempts:s.policy.taskAttempts;
+      this.save(owner,s);
+    });
+  }
+  async setPackageLimit(owner:ResourceOwner,limit:number,expectedLimit:number,expectedUsed:number,record:()=>Promise<void>){
+    return this.serial(async()=>{
+      const s=this.load(owner);await this.syncAll(s);
+      if(owner.taskId===null||!Number.isInteger(limit)||limit<1||limit>1000)throw new Error("Invalid package budget");
+      const key=taskKey(owner.taskId,owner.role),used=this.taskUsed(s,owner.taskId);
+      const current=s.taskCeilings?.[key]??(owner.isLead?s.policy.coordinationAttempts??s.policy.taskAttempts:s.policy.taskAttempts);
+      if(used!==expectedUsed||current!==expectedLimit)throw new Error("Package budget changed; refresh before saving");
+      await record();
+      s.taskCeilings??={};s.taskCeilings[key]=limit;
+      s.blocked=this.limit(s);s.blockedAtMs=s.blocked?this.now():null;
+      s.decisions.push({atMs:this.now(),reason:`Package budget changed from ${current} to ${limit}; ${used} already used; grounds recorded in tracker`,taskId:owner.taskId,policy:{...s.policy}});
+      this.save(owner,s);return this.summary(s);
     });
   }
   async extendCoordination(owner:ResourceOwner,expectedStarts:number,expectedUsed:number,record:()=>Promise<void>){
@@ -275,7 +348,7 @@ export class ResourceControl {
       if(!owner.isLead||owner.taskId===null)throw new Error("Only an unfinished coordination task can receive this allowance");
       const key=taskKey(owner.taskId,owner.role);
       const count=s.attempts.filter(a=>taskKey(a.taskId,a.role)===key).length+(s.returns??[]).filter(r=>taskKey(r.taskId,r.role)===key).length;
-      const reason=this.limit(s);
+      const reason=this.limit(s,owner);
       if(s.attempts.length!==expectedStarts||count!==expectedUsed||!reason?.startsWith(`Task attempt limit reached (${key}:`))throw new Error("Resource state changed; refresh before allowing more work");
       const ceiling=count+4;if(ceiling>1000)throw new Error("Coordination safety limit reached");
       // Record the exact decision in the chosen task source before any release.
@@ -318,7 +391,7 @@ export class ResourceControl {
       // Unknown account scopes are conservatively pooled by host+BB provider.
       // Known providerKey hashes also exclude shared pools across providers.
       const selection=candidates.find(c=>!this.isBlocked(c.provider,owner.hostId,c.model));
-      const reason=this.limit(s)??s.blocked??(owner.taskId===null?"No task is bound to this session":!selection?"No independent approved backup provider remains (shared quota, empty pool or unavailable catalog)":null);
+      const reason=this.limit(s,owner)??s.blocked??(owner.taskId===null?"No task is bound to this session":!selection?"No independent approved backup provider remains (shared quota, empty pool or unavailable catalog)":null);
       const result:ResourceFallback={requestId:f.requestId,threadId:f.threadId,role:owner.role,taskId:owner.taskId,stage:reason?"blocked":"selected",selection:selection??null,newThreadId:null,reason:reason??`Quota exhausted on ${a.provider}; use explicitly approved ${selection!.provider}/${selection!.model}`,atMs:this.now()};
       s.fallbacks[f.requestId]=result;this.save(owner,s);this.changed(owner.projectId);return result;
     });
@@ -340,7 +413,7 @@ export class ResourceControl {
   }
   async authorizeFallback(owner:Pick<ResourceOwner,"projectId"|"team">,requestId:string){
     await this.serial(async()=>{const s=this.load(owner),f=s.fallbacks[requestId];if(!f||f.stage!=="selected")throw new Error("Fallback is not selected or needs manual recovery");
-      const reason=this.limit(s)??s.blocked;if(reason)throw new Error(reason);
+      const bound=s.threads[f.threadId]?.owner;const reason=this.limit(s,bound)??s.blocked;if(reason)throw new Error(reason);
       f.stage="switching";delete s.holds[taskKey(f.taskId,f.role)];this.save(owner,s);
     });
   }
