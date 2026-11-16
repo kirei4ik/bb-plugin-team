@@ -467,7 +467,9 @@ describe("task tracker", () => {
       const scope = scopeOf(workspaceOf("epic-contract", repo), "epic-contract");
       const epic = await bd(repo, ["create", "Epic scope", "--type", "epic", "-l", "bb-team:epic-contract"]) as {id:string};
       const other = await bd(repo, ["create", "Another Team epic", "--type", "epic", "-l", "bb-team:other-team"]) as {id:string};
+      const ambiguous = await bd(repo, ["create", "Ambiguous epic", "--type", "epic", "-l", "bb-team:epic-contract,bb-team:other-team"]) as {id:string};
       const plain = await tracker.add(scope, {role:"dev",title:"Not an epic",note:null,status:"todo"});
+      await expect(tracker.add(scope, {role:"dev",title:"Ambiguous team",note:null,status:"todo",parentId:ambiguous.id})).rejects.toThrow(/another Team/);
       await expect(tracker.add(scope, {role:"dev",title:"Outside team",note:null,status:"todo",parentId:other.id})).rejects.toThrow(/another Team/);
       await expect(tracker.add(scope, {role:"dev",title:"Invalid parent",note:null,status:"todo",parentId:plain.id})).rejects.toThrow(/not a Beads epic/);
       const child = await tracker.add(scope, {role:"dev",title:"Epic child",note:null,status:"todo",parentId:epic.id});
@@ -475,8 +477,13 @@ describe("task tracker", () => {
       expect(actual.map(row=>row.id)).toContain(String(child.id));
       const projected = (await tracker.read(scope)).tasks.find(task=>task.id===child.id);
       expect(projected?.issueType).toBe("task");
-      // Some bd versions omit parent in list JSON; we don't infer it from id spelling.
-      if (projected?.parentId !== undefined) expect(projected.parentId).toBe(epic.id);
+      expect(projected?.parentId).toBe(epic.id);
+      expect(child.parentId).toBe(epic.id);
+      const labels = (await bd(repo, ["show", String(child.id)]) as Array<{labels:string[]}>)[0]!.labels;
+      expect(labels.filter(label => label.startsWith("bb-team:"))).toEqual(["bb-team:epic-contract"]);
+      await bd(repo, ["update", String(child.id), "--status", "closed"]);
+      await bd(repo, ["update", epic.id, "--status", "closed"]);
+      await expect(tracker.add(scope, {role:"dev",title:"Closed epic child",note:null,status:"todo",parentId:epic.id})).rejects.toThrow(/closed epic/);
     });
 
     it("stores manual recovery and resource decisions in Beads design without changing the description",async()=>{

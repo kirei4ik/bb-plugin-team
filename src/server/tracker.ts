@@ -543,7 +543,8 @@ export function createTaskTracker(
     if (input.parentId !== undefined) {
       const parent = await showIssue(scope, input.parentId);
       if (parent.issue_type !== "epic") throw new Error("The selected parent is not a Beads epic");
-      if (!(parent.labels ?? []).includes(`${TEAM_LABEL_PREFIX}${scope.team}`))
+      if ((parent.labels ?? []).filter(label => label.startsWith(TEAM_LABEL_PREFIX)).length !== 1 ||
+          !(parent.labels ?? []).includes(`${TEAM_LABEL_PREFIX}${scope.team}`))
         throw new Error("The selected epic belongs to another Team or is not assigned to this Team");
       if (parent.status === "closed") throw new Error("Cannot create work under a closed epic");
     }
@@ -560,7 +561,10 @@ export function createTaskTracker(
     if (input.note !== null) args.push("-d", input.note);
     if (input.parentId !== undefined) args.push("--parent", String(input.parentId));
     args.push(...createStatusArgs(input.status));
-    const task = projectIssue(await bdOne(scope, args));
+    const created = await bdOne(scope, args);
+    // bd create may omit parent even when list/show expose it. Read the
+    // authoritative relation rather than copying input or inferring the id.
+    const task = projectIssue(input.parentId === undefined ? created : await showIssue(scope, created.id));
     options.publish(scope.projectId);
     return task;
   };
