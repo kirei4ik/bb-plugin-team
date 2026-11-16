@@ -28,6 +28,10 @@ export interface TeamTask {
   decisions?: string;
   result?: string;
   dependencies?: TaskId[];
+  /** Only projected when the selected tracker exposes an explicit Beads parent. */
+  parentId?: TaskId;
+  /** Beads-native issue type; older built-in work packages leave this absent. */
+  issueType?: string;
   /** bbt-iwi.2: review submission + acceptance decisions, stored only in the selected tracker. */
   review?: TaskReviewRecord;
 }

@@ -64,6 +64,8 @@ export interface TaskTracker {
       title: string;
       note: string | null;
       status: TaskStatus;
+      /** Optional Beads epic parent. Unsupported by the built-in tracker. */
+      parentId?: TaskId;
     },
   ): Promise<TeamTask>;
   update(
@@ -160,6 +162,8 @@ interface BdIssue {
   created_at?: string;
   updated_at?: string;
   priority?: number;
+  issue_type?: string;
+  parent?: string | null;
   acceptance_criteria?: string;
   design?: string;
   notes?: string;
@@ -216,6 +220,8 @@ const projectIssue = (issue: BdIssue): TeamTask => {
     if (review) task.review = review;
   }
   if (typeof issue.priority === "number") task.priority = issue.priority;
+  if (issue.issue_type) task.issueType = issue.issue_type;
+  if (typeof issue.parent === "string" && issue.parent.length > 0) task.parentId = issue.parent;
   if (issue.acceptance_criteria) task.criteria = issue.acceptance_criteria;
   if (issue.design) task.decisions = issue.design;
   if (issue.notes) task.result = issue.notes;
@@ -522,6 +528,7 @@ export function createTaskTracker(
   ): Promise<TeamTask> => {
     const { kind } = await getConfig(scope);
     if (kind === "builtin") {
+      if (input.parentId !== undefined) throw new Error("Epic parent requires Beads; the built-in tracker has no parent-child model");
       return withLock(scope, async () => {
         const store = await builtinRead(scope);
         const result = addTask(store, input, Date.now());
@@ -529,6 +536,15 @@ export function createTaskTracker(
         options.publish(scope.projectId);
         return result.task;
       });
+    }
+    // Validate the parent's identity before creating a child. The task title
+    // or a hierarchical-looking id is not evidence of epic membership.
+    if (input.parentId !== undefined) {
+      const parent = await showIssue(scope, input.parentId);
+      if (parent.issue_type !== "epic") throw new Error("The selected parent is not a Beads epic");
+      if (!(parent.labels ?? []).includes(`${TEAM_LABEL_PREFIX}${scope.team}`))
+        throw new Error("The selected epic belongs to another Team or is not assigned to this Team");
+      if (parent.status === "closed") throw new Error("Cannot create work under a closed epic");
     }
     const args = [
       "create",
@@ -541,6 +557,7 @@ export function createTaskTracker(
       `${TEAM_LABEL_PREFIX}${scope.team}`,
     ];
     if (input.note !== null) args.push("-d", input.note);
+    if (input.parentId !== undefined) args.push("--parent", String(input.parentId));
     args.push(...createStatusArgs(input.status));
     const task = projectIssue(await bdOne(scope, args));
     options.publish(scope.projectId);

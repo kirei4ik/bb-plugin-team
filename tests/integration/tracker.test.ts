@@ -147,6 +147,14 @@ describe("task tracker", () => {
       expect(raw?.tasks.map((task) => task.id)).toEqual([7, 8]);
     });
 
+    it("refuses an epic parent in the built-in tracker instead of silently losing the link", async () => {
+      const scope = scopeOf(workspaceOf("p1", "/ws/demo"), "alpha");
+      await expect(tracker.add(scope, {
+        role: "dev", title: "Child", note: null, status: "todo", parentId: "epic-1",
+      })).rejects.toThrow(/requires Beads/);
+      expect((await tracker.read(scope)).tasks).toHaveLength(0);
+    });
+
     it("update returns previous, remove deletes", async () => {
       const workspace = workspaceOf("p1", "/ws/demo");
       const scope = scopeOf(workspace, "alpha");
@@ -453,6 +461,22 @@ describe("task tracker", () => {
     });
     beforeEach(() => {
       defaultKind = "beads";
+    });
+
+    it("creates a child only under an open epic assigned to this Team", async () => {
+      const scope = scopeOf(workspaceOf("epic-contract", repo), "epic-contract");
+      const epic = await bd(repo, ["create", "Epic scope", "--type", "epic", "-l", "bb-team:epic-contract"]) as {id:string};
+      const other = await bd(repo, ["create", "Another Team epic", "--type", "epic", "-l", "bb-team:other-team"]) as {id:string};
+      const plain = await tracker.add(scope, {role:"dev",title:"Not an epic",note:null,status:"todo"});
+      await expect(tracker.add(scope, {role:"dev",title:"Outside team",note:null,status:"todo",parentId:other.id})).rejects.toThrow(/another Team/);
+      await expect(tracker.add(scope, {role:"dev",title:"Invalid parent",note:null,status:"todo",parentId:plain.id})).rejects.toThrow(/not a Beads epic/);
+      const child = await tracker.add(scope, {role:"dev",title:"Epic child",note:null,status:"todo",parentId:epic.id});
+      const actual = await bd(repo, ["list", "--all", "--parent", epic.id]) as Array<{id:string}>;
+      expect(actual.map(row=>row.id)).toContain(String(child.id));
+      const projected = (await tracker.read(scope)).tasks.find(task=>task.id===child.id);
+      expect(projected?.issueType).toBe("task");
+      // Some bd versions omit parent in list JSON; we don't infer it from id spelling.
+      if (projected?.parentId !== undefined) expect(projected.parentId).toBe(epic.id);
     });
 
     it("stores manual recovery and resource decisions in Beads design without changing the description",async()=>{
