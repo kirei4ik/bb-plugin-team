@@ -69,6 +69,7 @@ const BD_COMMAND_GRAMMAR: Record<
       "--labels": 1,
       "-d": 1,
       "--description": 1,
+      "--parent": 1,
       "-s": 1,
       "--status": 1,
       "--metadata": 1,
