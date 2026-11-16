@@ -57,6 +57,8 @@ export interface TaskTracker {
   ): Promise<{ kind: TrackerKind; override: TrackerKind | null }>;
   setConfig(workspace: Workspace, kind: TrackerKind | null): Promise<void>;
   read(scope: TrackerScope): Promise<TaskStore>;
+  /** Authoritative scope check; never infer hierarchy from ids or titles. */
+  validateEpic(scope: TrackerScope, epicId: string, taskId?: TaskId | null, isLead?: boolean): Promise<TeamTask>;
   add(
     scope: TrackerScope,
     input: {
@@ -164,6 +166,7 @@ interface BdIssue {
   priority?: number;
   issue_type?: string;
   parent?: string | null;
+  dependencies?: Array<{id?:string;depends_on_id?:string;type?:string;dependency_type?:string}>;
   acceptance_criteria?: string;
   design?: string;
   notes?: string;
@@ -811,6 +814,31 @@ export function createTaskTracker(
   };
 
   return {
+    validateEpic: async (scope, epicId, taskId, isLead) => {
+      if ((await getConfig(scope)).kind !== "beads") throw new Error("Epic budgets require Beads; no built-in fallback");
+      const checkTeam = (issue: BdIssue) => {
+        const labels = (issue.labels ?? []).filter(label => label.startsWith(TEAM_LABEL_PREFIX));
+        if (labels.length !== 1 || labels[0] !== `${TEAM_LABEL_PREFIX}${scope.team}`)
+          throw new Error("Epic scope has missing, foreign or ambiguous Team labels");
+      };
+      const epic = await showIssue(scope, epicId);
+      checkTeam(epic);
+      if (epic.id !== epicId || epic.issue_type !== "epic" || epic.parent || !["open","in_progress","blocked","deferred"].includes(epic.status??""))
+        throw new Error("Select an open Beads epic belonging to this Team");
+      if (taskId !== undefined) {
+        if (taskId === null) throw new Error("Epic scope requires an explicitly assigned task");
+        if (taskId === epicId) {
+          if (!isLead) throw new Error("Only the lead may coordinate on the epic itself");
+        } else {
+          const child = await showIssue(scope, taskId);
+          checkTeam(child);
+          const parents=(child.dependencies??[]).filter(dep=>(dep.dependency_type??dep.type)==="parent-child").map(dep=>dep.id??dep.depends_on_id);
+          if (child.id !== taskId || child.parent !== epicId || parents.some(id=>id!==epicId) || child.issue_type === "epic" || !["open","in_progress","blocked","deferred"].includes(child.status??""))
+            throw new Error("Task is not an open direct child of the active epic");
+        }
+      }
+      return projectIssue(epic);
+    },
     getConfig,
     setConfig,
     read,

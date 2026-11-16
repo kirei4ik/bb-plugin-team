@@ -1,3 +1,4 @@
+import {EpicBudgetControl} from "./epic-budget-control";
 import {PackageBudgetControl} from "./package-budget-control";
 import {TeamRecoverySummary} from "./team-recovery-summary";
 import {OllamaQuotaCard} from "./continuation-controls";
@@ -41,11 +42,12 @@ export function ResourcePanel({snapshot,language,onChanged,onSelectRole}:{snapsh
  const accepted=state.results?.accepted??tasks.filter(t=>t.status==="done").length,review=state.results?.review??tasks.filter(t=>t.status==="review").length;
  return <section aria-label={ru?"Контроль ресурсов команды":"Team resource control"} className="flex flex-col gap-2">
   <TeamRecoverySummary snapshot={snapshot} language={language} onChanged={onChanged} onSelectRole={onSelectRole}/>
+  <EpicBudgetControl snapshot={snapshot} language={language} onChanged={onChanged}/>
   <PackageBudgetControl snapshot={snapshot} language={language} onChanged={onChanged}/>
   <details className="rounded-md border border-border p-2 text-xs">
   <summary>{ru?"Лимиты, квоты и история":"Limits, quotas and history"}</summary>
   <div className="mt-2 flex flex-col gap-2">
-  <p>{ru?"Запуски команды":"Team starts"}: {state.starts} · {ru?"статистика без общего лимита запусков":"statistics, no shared start cap"}</p>
+  <p>{ru?"Запуски команды":"Team starts"}: {state.starts} · {state.epic?(ru?"общий лимит — в бюджете эпика":"shared cap in epic budget"):(ru?"статистика без общего лимита запусков":"statistics, no shared start cap")}</p>
   {state.outcomeCounts&&<p>{ru?"Попытки":"Attempts"}: {ru?"зарезервировано":"reserved"} {state.outcomeCounts.reserved} · {ru?"выполняется":"running"} {state.outcomeCounts.running} · {ru?"завершено":"completed"} {state.outcomeCounts.completed} · {ru?"ошибок":"failed"} {state.outcomeCounts.failed} · {ru?"исход неизвестен":"outcome unknown"} {state.outcomeCounts.unknown}</p>}
   {state.quotaBlocks.some(q=>q.resetAtMs!==null&&q.resetAtMs<=snapshot.generatedAtMs)&&<p>{ru?"Срок сброса квоты наступил; доступность ещё требует свежего подтверждения. Время сброса само по себе не разрешает запуск.":"A quota reset time has passed; fresh capacity confirmation is still required. The reset time alone does not authorize a start."}</p>}
    {snapshot.roles.some(r=>isOllamaCloud(r.threads[0]?.provider??r.provider??"",r.threads[0]?.model??r.model))&&<OllamaQuotaCard projectId={snapshot.projectId} team={snapshot.team} language={language}/>}

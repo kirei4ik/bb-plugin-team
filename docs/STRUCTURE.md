@@ -41,7 +41,7 @@ bb-plugin-team/
 | Выбранный трекер и встроенные задачи | `src/server/tracker.ts`, `tasks.ts` |
 | Смена сессии и передача состояния | `src/server/sessions.ts`, `checkpoint.ts` |
 | Отложенное продолжение через очередь BB | `src/server/deferred-continuation.ts` |
-| Учёт запусков и ограничения | `src/server/resource-control.ts` |
+| Учёт запусков и ограничения | `src/server/resource-control.ts`, [бюджет эпика](EPIC-BUDGET.md) |
 | Квоты Ollama/OpenRouter | `src/shared/*-usage.ts` — схемы; `src/host/*-usage-host.ts` — чтение |
 | Шаблоны, промпты, язык | `src/shared/templates.ts`, `messages.ts`, `strings.ts` |
 | Состояние панели и общие типы | `src/shared/snapshot.ts` |

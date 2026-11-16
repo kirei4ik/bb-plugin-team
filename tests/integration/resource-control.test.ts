@@ -3,7 +3,7 @@ import {createFakePluginHost,makeThreadResponse} from "@get-bb/plugin-sdk/testin
 import type {MessageDispatchHookContext,PluginTurnFailedEvent,ThreadEventRow} from "@get-bb/plugin-sdk";
 import {verifyQuotaBoundary,type WorkCheckpoint} from "../../src/server/checkpoint";
 import {ResourceControl,DEFAULT_RESOURCE_POLICY,type ResourceOwner} from "../../src/server/resource-control";
-function fixture(){
+function fixture(validateEpic?:(owner:ResourceOwner,epicId:string)=>Promise<{title:string;criteria?:string}>){
  let now=1000;const events=new Map<string,ThreadEventRow[]>();const owners=new Map<string,ResourceOwner>();
  const base={projectId:"p",team:"main",role:"dev",taskId:"task-1",ownerThreadId:"dev",hostId:"host"};
  for(const id of ["dev","helper","fresh","other","lead"]){owners.set(id,{...base,ownerThreadId:id==="helper"?"dev":id,role:id==="lead"?"lead":"dev",taskId:id==="lead"?null:id==="other"?"task-2":"task-1"});}
@@ -12,7 +12,7 @@ function fixture(){
    events:{list:async({threadId,afterSeq})=>(events.get(threadId)??[]).filter(r=>r.seq>Number(afterSeq??0))},
  }}});
  const owner=async(id:string)=>owners.get(id)??null;
- const create=()=>new ResourceControl(bb,owner,()=>{},()=>now);
+ const create=()=>new ResourceControl(bb,owner,()=>{},()=>now,validateEpic);
  let control=create();let seq=0;
  const event=(id:string,type:string,data:unknown)=>{const row={id:`e${++seq}`,threadId:id,scope:"thread",seq,createdAt:now,type,data} as ThreadEventRow;events.set(id,[...(events.get(id)??[]),row]);};
  const ctx=(id="dev",request="1",initiator="agent")=>({thread:makeThreadResponse({id,projectId:"p",providerId:"pi",status:"idle",updatedAt:now}),attempt:"start-turn",queuedMessages:[{id:request}],input:{text:request,blocks:[]},requestedExecution:{providerId:"pi",model:"ollama/model",reasoningLevel:null,serviceTier:null,permissionMode:null},initiator} as unknown as MessageDispatchHookContext);
@@ -279,4 +279,100 @@ it("recognizes a real queued user message in a mixed group but not a core retry"
  const queued={...f.ctx("lead","user-queue","mixed"),senderThreadId:"mixed",originPluginId:"mixed",queuedMessages:[{id:"user-queue",initiator:"user",senderThreadId:null,originPluginId:null,payload:{kind:"input"}}]} as unknown as MessageDispatchHookContext;
  expect((await f.control.admit(queued)).action).toBe("proceed");await f.control.settle("lead","completed");
  queued.queuedMessages[0]!.payload={kind:"retry"} as never;expect((await f.control.admit({...queued,input:{text:"retry",blocks:[]}})).action).toBe("wait");
+});
+
+
+describe("shared epic admission budget",()=>{
+ const valid=async(owner:ResourceOwner,id:string)=>{
+  if(!owner.taskId||(owner.taskId!==id&&!String(owner.taskId).startsWith("task-")))throw new Error("Task outside epic");
+  return {title:"Release",criteria:"Two accepted children"};
+ };
+ const set=async(f:ReturnType<typeof fixture>,limit=3,epicId="epic-1")=>{
+  const before=await f.control.inspect(f.scope),prior=before.epicBudgets?.[epicId];
+  return f.control.setEpicBudget(f.scope,{epicId,limit,expectedActiveEpicId:before.epic?.id??null,expectedRevision:prior?.revision??0,expectedUsed:prior?.used??0,reason:"User agreed a finite total"},async()=>{},async()=>{});
+ };
+ it("shares a finite total across lead, children, helpers, new tasks and session reload",async()=>{
+  const f=fixture(valid);f.owners.set("lead",{...f.scope,role:"lead",taskId:"epic-1",ownerThreadId:"lead",isLead:true});
+  await set(f);
+  for(const id of ["lead","dev","helper"]){expect((await f.control.admit(f.ctx(id,id))).action).toBe("proceed");f.event(id,"turn/started",{});f.event(id,"turn/completed",{status:"completed"});await f.control.settle(id,"completed");f.tick();}
+  f.owners.set("fresh",{...f.scope,taskId:"task-new",ownerThreadId:"fresh"});f.restart();
+  const leadUser={...f.ctx("lead","approved?","user"),senderThreadId:null,originPluginId:null};
+  const changedModel=f.ctx("fresh","new-model");changedModel.requestedExecution.model="different/model";
+  for(const ctx of [f.ctx("other","another-child"),changedModel,leadUser]){
+   expect(await f.control.admit(ctx)).toMatchObject({action:"wait",reason:expect.stringContaining("Epic budget exhausted")});
+  }
+  const state=await f.control.inspect(f.scope);
+  expect(state.epic).toMatchObject({id:"epic-1",used:3,remaining:0,title:"Release"});
+  expect(state.attempts.map(a=>a.epicId)).toEqual(["epic-1","epic-1","epic-1"]);
+  await set(f,4);expect((await f.control.admit(f.ctx("fresh","explicit-extension"))).action).toBe("proceed");
+ });
+ it("retains reservations across reentry and replay without double charging; cancellation keeps cost",async()=>{
+  const f=fixture(valid);await set(f,1);
+  expect((await f.control.admit(f.ctx())).action).toBe("proceed");
+  expect((await f.control.admit(f.ctx())).action).toBe("proceed");
+  await f.control.cancelled("dev","1");f.restart();
+  expect((await f.control.inspect(f.scope)).epic?.used).toBe(1);
+  expect((await f.control.admit(f.ctx("helper","2"))).action).toBe("wait");
+ });
+ it("serializes concurrent admits and rejects a stale writer from another control instance",async()=>{
+  const f=fixture(valid);await set(f,1);
+  const other=new ResourceControl(f.bb,f.owner,()=>{},()=>1000,valid);
+  const results=await Promise.all([f.control.admit(f.ctx()),other.admit(f.ctx("other","second"))]);
+  expect(results.filter(r=>r.action==="proceed")).toHaveLength(1);
+  expect(results.filter(r=>r.action==="wait")).toHaveLength(1);
+  expect((await f.control.inspect(f.scope)).epic?.used).toBe(1);
+ });
+ it("holds unknown scope or unavailable Beads before spending, independently of package/user exemptions",async()=>{
+  let unavailable=false;
+  const f=fixture(async(o,id)=>{if(unavailable)throw new Error("Beads unavailable");return valid(o,id);});
+  await set(f);f.owners.set("other",{...f.scope,taskId:null});
+  await expect(f.control.assertDispatch(f.owners.get("other")!)).rejects.toThrow("Epic scope held");
+  expect(await f.control.admit(f.ctx("other"))).toMatchObject({action:"wait",reason:expect.stringContaining("Epic scope held")});
+  unavailable=true;
+  expect((await f.control.admit(f.ctx())).action).toBe("wait");
+  expect((await f.control.inspect(f.scope)).epic?.used).toBe(0);
+ });
+ it("requires checked human decisions and preserves spend after switching epics",async()=>{
+  const f=fixture(valid);await set(f,1);await f.control.admit(f.ctx());
+  await expect(set(f,2)).rejects.toThrow("outstanding");
+  await f.control.settle("dev","completed");
+  await set(f,2,"epic-2");await set(f,1,"epic-1");
+  expect((await f.control.inspect(f.scope)).epic).toMatchObject({used:1,remaining:0,revision:2});
+  const input={epicId:"epic-1",limit:3,expectedActiveEpicId:"epic-1",expectedRevision:1,expectedUsed:1,reason:"stale"};
+  await expect(f.control.setEpicBudget(f.scope,input,async()=>{},async()=>{})).rejects.toThrow("changed");
+  const before=await f.control.inspect(f.scope);input.expectedRevision=before.epic!.revision;
+  await expect(f.control.setEpicBudget(f.scope,input,async()=>{},async()=>{throw new Error("tracker write failed");})).rejects.toThrow("tracker write failed");
+  expect((await f.control.inspect(f.scope)).epic?.limit).toBe(1);
+ });
+ it("review returns retain epic spend and the next rework admission consumes another unit",async()=>{
+  const f=fixture(valid);await set(f,2);await f.control.admit(f.ctx());await f.control.settle("dev","completed");
+  await f.control.returned(f.scope,"task-1","dev",{reason:"Fix acceptance check",id:"review-1"});
+  await f.control.returned(f.scope,"task-1","dev",{reason:"Fix acceptance check",id:"review-1"});
+  expect((await f.control.inspect(f.scope)).epic?.used).toBe(1);
+  expect((await f.control.admit(f.ctx("helper","rework"))).action).toBe("proceed");
+  await f.control.settle("helper","completed");
+  expect((await f.control.admit(f.ctx("other","another-child"))).action).toBe("wait");
+  expect((await f.control.inspect(f.scope)).epic?.used).toBe(2);
+ });
+ it("budget increases leave quota and failure holds intact",async()=>{
+  const f=fixture(valid);await set(f,1);await f.control.admit(f.ctx());await f.control.failed(f.fail(),[]);
+  await set(f,3);
+  expect((await f.control.inspect(f.scope)).quotaBlocks).not.toHaveLength(0);
+  expect((await f.control.admit(f.ctx("helper","retry"))).action).toBe("wait");
+ });
+ it("does not attribute newly discovered pre-activation history to an epic",async()=>{
+  const f=fixture(valid);
+  f.event("other","turn/started",{});f.event("other","turn/completed",{status:"completed"});f.tick();
+  await set(f,1);await f.control.watch("other");
+  expect((await f.control.inspect(f.scope)).epic).toMatchObject({used:0,blocked:null});
+  expect((await f.control.admit(f.ctx("dev","new-turn"))).action).toBe("proceed");
+ });
+ it("keeps old unbound packages independent and holds unreserved observed epic turns",async()=>{
+  const f=fixture(valid);await f.control.admit(f.ctx());await f.control.settle("dev","completed");await set(f,2);
+  expect((await f.control.inspect(f.scope)).epic?.used).toBe(0);
+  f.event("dev","turn/started",{});f.event("dev","turn/completed",{status:"completed"});
+  await f.control.watch("dev");
+  expect((await f.control.inspect(f.scope)).epic).toMatchObject({used:1,blocked:expect.stringContaining("unreserved")});
+  expect((await f.control.admit(f.ctx("other","new-child"))).action).toBe("wait");
+ });
 });

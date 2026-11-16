@@ -16,6 +16,7 @@ import { describe, it, expect } from "vitest";
 import {
   createFakePluginHost,
   makeThreadResponse,
+  makeMessageDispatchHookContext,
 } from "@get-bb/plugin-sdk/testing";
 import { experimental_createHostEntryHarness } from "@get-bb/plugin-sdk/testing/host";
 import plugin from "../../src/server/server";
@@ -33,7 +34,7 @@ const content = {
 };
 
 describe("standalone Team workflow (real Git and Beads, no AI)", () => {
-  for (const kind of ["builtin", "beads"] as const)
+  for (const kind of ["builtin", "beads", "epic"] as const)
     it(`${kind}: select, queue, checkpoint, replace executor and lead, accept`, async () => {
       const root = await mkdtemp(join(tmpdir(), "team-acceptance-"));
       const checkout = join(root, "project"),
@@ -116,7 +117,7 @@ describe("standalone Team workflow (real Git and Beads, no AI)", () => {
         const fake = createFakePluginHost({
           pluginId: "team",
           experimental_hostEntry: true,
-          settings: { defaultTracker: kind, teamSection: false, roster: false },
+          settings: { defaultTracker: kind === "epic" ? "beads" : kind, teamSection: false, roster: false },
           experimental_callHostRpc: (call) =>
             host.experimental_call(call.method as never, call.input as never, {
               signal: call.signal,
@@ -339,8 +340,42 @@ describe("standalone Team workflow (real Git and Beads, no AI)", () => {
         expect(created.spawned).toHaveLength(0); // existing role sessions reused
         expect((await git(["rev-parse", "HEAD"])).stdout.trim()).toBe(originalHead);
         await cli(["create"]); // repeated preparation preserves the same database
-        const selection = await cli(["tracker", kind]);
-        expect(selection.kind).toBe(kind);
+        const selection = await cli(["tracker", kind === "epic" ? "beads" : kind]);
+        expect(selection.kind).toBe(kind === "epic" ? "beads" : kind);
+        if(kind==="epic"){
+          const bd=async(args:string[])=>JSON.parse((await run("bd",["--sandbox","--json",...args],{cwd:checkout})).stdout);
+          const epic=await bd(["create","Profile release","--type","epic","-a","lead","-l","bb-team:main","--acceptance","Two accepted children"]);
+          const before=await cli(["budget",epic.id,"--epic"]);
+          expect(before).toMatchObject({used:0,limit:null,revision:0,activeEpicId:null});
+          const sendCount=sent.length;
+          await cli(["budget",epic.id,"--epic","--limit","3","--expected-epic","none","--expected-revision","0","--expected-used","0","--reason","User approved three total turns"]);
+          expect(sent).toHaveLength(sendCount); // deterministic save starts no model
+          const first=await cli(["task","add","dev","First epic child","--parent",epic.id,"--send"]);
+          const second=await cli(["task","add","dev","Second epic child","--parent",epic.id]);
+          expect(first.task.parentId).toBe(epic.id);expect(second.task.parentId).toBe(epic.id);
+          await cli(["task","update",epic.id,"--status","wip"]);
+          const hook=harness.inspection.registrations.hooks["message.dispatch"]!;
+          const context=(id:string,text:string)=>makeMessageDispatchHookContext({thread:response(id),attempt:"start-turn",initiator:"agent",originPluginId:"team",input:{text},requestedExecution:{providerId:"pi",model:null}});
+          for(const id of ["thr_lead","thr_dev","thr_helper"]){
+            expect((await hook(context(id,id))).action).toBe("proceed");
+            await harness.behavior.emitThreadEvent("thread.idle",{thread:response(id),lastAssistantText:"Checked"});
+          }
+          const after=await cli(["budget",epic.id,"--epic"]);expect(after).toMatchObject({used:3,limit:3,revision:1});
+          const third=await cli(["task","add","dev","New child cannot reset spend","--parent",epic.id]);
+          expect(third.task.parentId).toBe(epic.id);
+          for(const id of ["thr_lead","thr_dev","thr_helper"]){expect(await hook(context(id,"another turn"))).toMatchObject({action:"wait",reason:expect.stringContaining("Epic budget exhausted")});}
+          const snap=await harness.behavior.callRpc("snapshot",{projectId:"proj_flow",team:"main"}) as {snapshot:{resources:{epic:{used:number;title:string}}}};
+          expect(snap.snapshot.resources.epic).toMatchObject({used:3,title:"Profile release"});
+          await harness.behavior.callRpc("packageBudget",{projectId:"proj_flow",team:"main",taskId:first.task.id,limit:9,expectedLimit:8,expectedUsed:2,reason:"Package increase must retain epic cap"});
+          expect(sent.at(-1)?.text).toContain("Shared epic budget");
+          expect(await hook(context("thr_lead","package extension cannot bypass epic"))).toMatchObject({action:"wait",reason:expect.stringContaining("Epic budget exhausted")});
+          const forbidden=await harness.behavior.runCli(["budget",epic.id,"--epic","--limit","8","--expected-epic",epic.id,"--expected-revision","1","--expected-used","3","--reason","Let me keep going","--project","flow"],{threadId:"thr_lead",projectId:"proj_flow"});
+          expect(forbidden.exitCode).not.toBe(0);
+          expect((await cli(["budget",epic.id,"--epic"])).limit).toBe(3);
+          await cli(["budget",epic.id,"--epic","--limit","4","--expected-epic",epic.id,"--expected-revision","1","--expected-used","3","--reason","Human approved one more check"]);
+          expect((await hook(context("thr_helper","one approved check"))).action).toBe("proceed");
+          return;
+        }
         const first = await cli(["task", "add", "dev", "Profile", "--send"]);
         const second = await cli([
           "task",
@@ -497,5 +532,5 @@ describe("standalone Team workflow (real Git and Beads, no AI)", () => {
         await host.experimental_dispose();
         await rm(root, { recursive: true, force: true });
       }
-    }, 120000);
+    }, kind === "epic" ? 240000 : 120000);
 });

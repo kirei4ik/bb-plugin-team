@@ -153,6 +153,7 @@ describe("task tracker", () => {
         role: "dev", title: "Child", note: null, status: "todo", parentId: "epic-1",
       })).rejects.toThrow(/requires Beads/);
       expect((await tracker.read(scope)).tasks).toHaveLength(0);
+      await expect(tracker.validateEpic(scope,"epic-1")).rejects.toThrow(/require Beads/);
     });
 
     it("update returns previous, remove deletes", async () => {
@@ -479,6 +480,12 @@ describe("task tracker", () => {
       expect(projected?.issueType).toBe("task");
       expect(projected?.parentId).toBe(epic.id);
       expect(child.parentId).toBe(epic.id);
+      expect((await tracker.validateEpic(scope,epic.id,child.id,false)).id).toBe(epic.id);
+      await expect(tracker.validateEpic(scope,epic.id,null,true)).rejects.toThrow(/explicitly assigned/);
+      await expect(tracker.validateEpic(scope,epic.id,plain.id,false)).rejects.toThrow(/direct child/);
+      await expect(tracker.validateEpic(scope,epic.id,epic.id,false)).rejects.toThrow(/Only the lead/);
+      expect((await tracker.validateEpic(scope,epic.id,epic.id,true)).issueType).toBe("epic");
+      await expect(tracker.validateEpic(scope,ambiguous.id)).rejects.toThrow(/ambiguous/);
       const labels = (await bd(repo, ["show", String(child.id)]) as Array<{labels:string[]}>)[0]!.labels;
       expect(labels.filter(label => label.startsWith("bb-team:"))).toEqual(["bb-team:epic-contract"]);
       await bd(repo, ["update", String(child.id), "--status", "closed"]);

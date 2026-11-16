@@ -277,6 +277,7 @@ async function mount(
         roleRecovery: (input:{role:string;selection?:unknown})=>{
           log("roleRecovery")(input);return {threadId:roleThreads.get(input.role)??"thr_d",taskId:7,taskTitle:"Implement profile",environmentId:"env_1",actual:actualModels.get(input.role)??{provider:"codex",model:"gpt-4",reasoningLevel:"none"},revision:"preview-1",blockers:[],quota:"unknown",...options.recovery};
         },
+        epicBudget:(input:unknown)=>{log("epicBudget")(input);return snapshots[0]!.resources!;},
         packageBudget:(input:unknown)=>{log("packageBudget")(input);return snapshots[0]!.resources!;},
         continueCoordination:(input:{taskId:string|number;expectedStarts:number;expectedUsed:number})=>{
           log("continueCoordination")(input);const current=snapshots[0]!.resources!;snapshots=snapshots.map(s=>({...s,resources:{...current,blocked:null}}));return {...current,blocked:null};
@@ -1161,4 +1162,21 @@ it("a delayed response cannot show another project's packages after navigation",
  await act(async()=>{finishOld({projectName:"Old project",snapshots:[{...SNAPSHOT,projectId:"old"}],language:"en"});});
  expect(slot.queryByText("Old project")).toBeNull();expect(slot.queryByText("Login form")).toBeNull();
  expect(slot.getByRole("heading",{name:"New project"})).toBeTruthy();slot.lifecycle.unmount();
+});
+
+
+it("shows the shared epic allowance and saves a checked human decision without model actions",async()=>{
+ const resources:ResourceSummary={sinceMs:0,policy:{taskAttempts:8,teamStarts:null,tokens:null,minutes:null},starts:2,remainingStarts:null,reportedTokens:null,usageCoverage:"unavailable",blocked:null,holds:{},attempts:[],taskCounts:[],quotaBlocks:[],fallbacks:[],epic:{id:"epic-1",title:"Release profile",criteria:"Two accepted tasks",used:2,limit:2,remaining:0,revision:1,sinceMs:1000,blocked:"Epic budget exhausted",unattributedTasks:[{id:"outside",title:"Unrelated work"}]},epicBudgets:{"epic-1":{limit:2,used:2,revision:1,sinceMs:1000}}};
+ const {slot,calls}=await mount({snapshots:[{...SNAPSHOT,resources}]});
+ const panel=within(await slot.findByRole("region",{name:"Epic budget"}));
+ expect(panel.getByText(/Release profile.*2\/2/)).toBeTruthy();
+ expect(panel.getByText(/Unrelated work/)).toBeTruthy();
+ expect(calls.some(c=>c.method==="epicBudget")).toBe(false);
+ fireEvent.click(panel.getByText("Configure epic budget"));
+ fireEvent.change(panel.getByLabelText("Total turn allowance"),{target:{value:"4"}});
+ fireEvent.change(panel.getByLabelText("Decision grounds"),{target:{value:"Two more checks agreed"}});
+ fireEvent.click(panel.getByText("Save epic budget"));
+ await panel.findByText("Epic budget saved; no model was started.");
+ expect(calls.find(c=>c.method==="epicBudget")?.input).toMatchObject({epicId:"epic-1",limit:4,expectedActiveEpicId:"epic-1",expectedRevision:1,expectedUsed:2,reason:"Two more checks agreed"});
+ expect(calls.some(c=>["tell","teamSpawn","sessionRotate"].includes(c.method))).toBe(false);slot.lifecycle.unmount();
 });
