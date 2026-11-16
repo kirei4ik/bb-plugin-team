@@ -11,6 +11,7 @@ function stopLabel(reason:string,ru:boolean):string {
  const task=reason.match(/Task attempt limit reached \(task:([^:]+): (\d+)\/(\d+)\)/);
  if(task)return ru?`Задача ${task[1]} достигла лимита: ${task[2]} из ${task[3]}. Нужно ваше решение.`:`Task ${task[1]} reached its limit: ${task[2]} of ${task[3]}. Your decision is needed.`;
  if(reason.startsWith("Team start limit"))return ru?"Исчерпан общий лимит запусков команды. Нужно ваше решение.":"Team start limit reached. Your decision is needed.";
+ if(reason === "rate-limit" || reason === "budget-exceeded" || reason.startsWith("No independent approved backup"))return ru?"Работа остановлена после отказа по квоте. Укажите решение ниже и разрешите следующий запуск; сброс квоты сам по себе не возобновляет работу.":"Work is paused after a quota failure. Record a decision below and allow the next start; a quota reset alone does not resume work.";
  return ru?"Новые ходы удерживаются. Откройте причину и выберите дальнейший подход.":"New turns are held. Inspect the cause and decide how to continue.";
 }
 /** Event-backed status; opening it calls neither a model nor an observer thread. */
@@ -67,6 +68,7 @@ export function ResourcePanel({snapshot,language,onChanged,onSelectRole}:{snapsh
     </div>;
    })}
    {state.quotaBlocks.map((q,i)=><p key={i}>{ru?"Исключённый пул квоты":"Excluded quota pool"}: {q.provider} · {q.hostId??"?"} · {q.resetAtMs?new Date(q.resetAtMs).toLocaleString():(ru?"reset неизвестен; нужна проверка":"reset unknown; inspection required")}</p>)}
+   {state.fallbacks.some(f=>!f.manualReleased&&(f.stage==="blocked"||f.stage==="error"))&&<p>{ru?"После остановки по квоте нужен явный выбор: укажите решение выше и нажмите «Разрешить следующий запуск с этим решением» у нужной задачи. Пределы и счётчики сохранятся.":"Quota recovery needs an explicit choice: record your decision above and allow the next start for the relevant task. Limits and counters remain intact."}</p>}
    {state.fallbacks.map(f=><p key={f.requestId}>{ru?"Замена после квоты":"Quota handoff"} · #{f.taskId??"—"} · {f.stage} · {f.selection?`${f.selection.provider}/${f.selection.model}`:"—"} · {f.reason}{f.newThreadId&&` → ${f.newThreadId}`}</p>)}
    <details><summary>{ru?"Последние 100 допусков запусков":"Last 100 start admissions"}</summary><ul className="flex flex-col gap-1">{state.attempts.map(a=><li key={a.id}>#{a.taskId??"—"} · {a.role} · <button onClick={()=>navigate.toThread(a.threadId)} className="underline">{a.threadId}</button> · {a.provider} / {a.model??(ru?"модель неизвестна":"model unknown")} · {outcome[a.outcome]??a.outcome} · {new Date(a.atMs).toLocaleString()} → {a.endedAtMs?new Date(a.endedAtMs).toLocaleString():"—"} · {a.tokens??"?"} tokens{a.reason&&` · ${a.reason}`}</li>)}</ul></details>
   </div>

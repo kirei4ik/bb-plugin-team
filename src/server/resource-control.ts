@@ -210,7 +210,12 @@ export class ResourceControl {
       // reservation is retained across another plugin's wait/restart.
       const reentry=active?.outcome==="reserved"&&(active.key===key||queued.some(id=>active.queuedIds.includes(id)));
       const holdingFallback=Object.values(state.fallbacks).find(f=>f.threadId===ctx.thread.id&&!f.manualReleased);
-      if(holdingFallback)return {action:"reject",message:`Team: old quota session is retired or held: ${holdingFallback.reason}`};
+      if(holdingFallback) {
+        const retired = holdingFallback.stage === "complete" && holdingFallback.newThreadId !== null && holdingFallback.newThreadId !== ctx.thread.id;
+        return {action:"reject",message:retired
+          ? "Team: this session was replaced after a quota failure. Open the employee's current session in Team."
+          : `Team: continuation is paused after a quota failure for task ${holdingFallback.taskId ?? holdingFallback.role}. Open Team → Limits, quotas and history, enter your decision and choose Allow next start with this decision. This does not require a new session or reset budgets. Reason: ${holdingFallback.reason}`};
+      }
       const pending=Object.values(state.fallbacks).find(f=>f.taskId!==null&&f.taskId===owner.taskId&&f.stage!=="complete"&&!f.manualReleased&&f.newThreadId!==ctx.thread.id);
       if(pending)return {action:"wait",reason:`Team is preserving task ${owner.taskId} during quota recovery: ${pending.reason}`};
       const limit=this.limit(state,reentry?active!.id:undefined);

@@ -188,3 +188,18 @@ it("fresh Ollama evidence clears only that upstream account, keeping OpenRouter 
  expect(await f.control.quotaExcluded(f.scope,{provider:"pi",model:"openrouter/free"})).toBe(true);
  expect((await f.control.inspect(f.scope)).starts).toBe(2);
 });
+
+it("quota reset requires a decision on the current session, not a replacement", async()=>{
+ const f=fixture();await f.control.admit(f.ctx());
+ const rate={providerId:"pi",status:"blocked",kind:"subscription-window",windows:[{providerKey:"w",status:"blocked",resetsAtMs:2000}]};
+ await f.control.failed(f.fail({rateLimits:rate as never}),[]);
+ f.tick();f.tick();
+ const held=await f.control.admit(f.ctx("dev","human-resume","human"));
+ expect(held.action).toBe("reject");expect((held as {message:string}).message).toContain("Allow next start");
+ expect((held as {message:string}).message).not.toContain("retired");
+ const before=await f.control.inspect(f.scope);
+ expect(before.quotaBlocks).toEqual([]);
+ await f.control.decide(f.scope,"User continues the same approved model after quota reset, within existing budget",undefined,"task-1");
+ const released=await f.control.inspect(f.scope);expect(released.starts).toBe(before.starts);expect(released.policy).toEqual(before.policy);
+ expect(await f.control.admit(f.ctx("dev","human-resume","human"))).toEqual({action:"proceed"});
+});

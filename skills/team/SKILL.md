@@ -431,3 +431,10 @@ inaccessible old state and environment differences require inspection.
 If all sessions for a role were archived, **Create missing** creates a new
 session and starts its model; it is a separate action, not read-only recovery.
 Creation refuses hidden/uncertain candidates rather than adding duplicates.
+
+A blocked quota recovery on the current session is different from a retired old
+session. If the quota reset but the saved decision hold remains, open **Limits,
+quotas and history**, record the decision for that task, then **Allow next start
+with this decision**. A reset does not itself authorize execution. This action
+keeps existing budgets and still checks provider capacity; no replacement is
+required merely to release a grounded current-session hold.
