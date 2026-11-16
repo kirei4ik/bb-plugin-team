@@ -524,6 +524,7 @@ export function createTaskTracker(
       title: string;
       note: string | null;
       status: TaskStatus;
+      parentId?: TaskId;
     },
   ): Promise<TeamTask> => {
     const { kind } = await getConfig(scope);
