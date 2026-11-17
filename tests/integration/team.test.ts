@@ -1,7 +1,7 @@
 // Тесты v0.2+: tell, живой status, пакеты работ, report, doctor, vars,
 // notifyOn, пауза, replace, stop, шаблоны init, @-меню, RPC панели.
 import { describe, expect, it } from "vitest";
-import { createFakePluginHost, makeThreadResponse } from "@get-bb/plugin-sdk/testing";
+import { createFakePluginHost, makeThreadResponse, makeMessageDispatchHookContext } from "@get-bb/plugin-sdk/testing";
 import plugin, {
   applyVars,
   excerpt,
@@ -1540,4 +1540,55 @@ it("edits an existing role profile without spawning, rejects stale saves, and su
  expect(spawns.find(row=>row.pluginMetadata.teamRole==="developer")!.prompt).toContain("future-tier");
  await harness.behavior.callRpc("rolePolicy",{...scope,policy:null,expectedRevision:reread.revision});
  expect(files.get("/ws/demo/.bb/team.yaml")).not.toContain("approved-backup");
+});
+
+
+describe("manual resource RPC authority",()=>{
+ const policy={taskAttempts:8,coordinationAttempts:40,teamStarts:null,tokens:null,minutes:null};
+ it("holds raw resource RPC mutations while an unmarked project agent is active",async()=>{
+  const f=makeHost({threads:[{id:"ordinary-agent",role:null,status:"active"}]});await plugin(f.bb);
+  try{
+   const methods:Array<[string,unknown]>=[
+    ["resources",{projectId:"proj_1",team:"main",reason:"Increase",policy}],
+    ["packageBudget",{projectId:"proj_1",team:"main",taskId:1,limit:9,expectedLimit:8,expectedUsed:0,reason:"Increase"}],
+    ["epicBudget",{projectId:"proj_1",team:"main",epicId:"epic-1",limit:9,expectedActiveEpicId:null,expectedRevision:0,expectedUsed:0,expectedScopeRevision:"a".repeat(64),reason:"Increase"}],
+    ["continueCoordination",{projectId:"proj_1",team:"main",taskId:1,expectedStarts:0,expectedUsed:0}],
+   ];
+   for(const [method,input]of methods)await expect(f.harness.behavior.callRpc(method,input)).rejects.toThrow(/Finish project agent/);
+   expect(await f.harness.behavior.callRpc("resources",{projectId:"proj_1",team:"main"})).toMatchObject({starts:0});
+   const added=await f.harness.behavior.runCli(["task","add","developer","A package","--project","demo"]);expect(added.exitCode).toBe(0);
+   const disguised=await f.harness.behavior.runCli(["budget","1","--limit","9","--expected-limit","8","--expected-used","0","--reason","Unset thread context","--project","demo"]);
+   expect(disguised.exitCode).not.toBe(0);expect(disguised.stderr).toMatch(/Finish project agent/);
+   f.threads.get("ordinary-agent")!.status="stopping";
+   await expect(f.harness.behavior.callRpc("resources",methods[0]![1])).rejects.toThrow(/Finish project agent/);
+   f.threads.get("ordinary-agent")!.status="idle";
+   await expect(f.harness.behavior.callRpc("resources",methods[0]![1],{experimental_caller:{kind:"plugin",pluginId:"other-plugin"}})).rejects.toThrow(/manual client/);
+   await expect(f.harness.behavior.callRpc("resources",methods[0]![1])).resolves.toMatchObject({policy});
+   f.threads.get("ordinary-agent")!.status="error";
+   await expect(f.harness.behavior.callRpc("resources",methods[0]![1])).resolves.toMatchObject({policy}); // Manual failure recovery remains available.
+  }finally{await f.harness.lifecycle.dispose();}
+ });
+ it("fails closed for a hidden active thread beyond the first page, an incomplete scan, or unavailable state",async()=>{
+  const f=makeHost();await plugin(f.bb);
+  try{
+   const input={projectId:"proj_1",team:"main",reason:"Change",policy};
+   const page=Array.from({length:200},(_,i)=>makeThreadResponse({id:`idle-${i}`,projectId:"proj_1",status:"idle"}));
+   f.harness.sdk.stub("threads.list",async({offset}:{offset?:number})=>offset?[makeThreadResponse({id:"hidden-active",projectId:"proj_1",status:"active"})]:page);
+   await expect(f.harness.behavior.callRpc("resources",input)).rejects.toThrow(/Finish project agent/);
+   f.harness.sdk.stub("threads.list",async()=>page);
+   await expect(f.harness.behavior.callRpc("resources",input)).rejects.toThrow(/incomplete/);
+   f.harness.sdk.stub("threads.list",async()=>{throw new Error("Host state unavailable");});
+   await expect(f.harness.behavior.callRpc("resources",input)).rejects.toThrow(/Host state unavailable/);
+  }finally{await f.harness.lifecycle.dispose();}
+ });
+ it("keeps outstanding reservations held even when the thread DTO is idle",async()=>{
+  const f=makeHost({threads:[{id:"thr_lead",role:"lead"},{id:"thr_dev",role:"developer",parentThreadId:"thr_lead"}]});await plugin(f.bb);
+  try{
+   const created=await f.harness.behavior.runCli(["task","add","developer","Profile","--send","--project","demo"]);expect(created.exitCode).toBe(0);
+   const ctx=makeMessageDispatchHookContext({thread:makeThreadResponse({id:"thr_dev",projectId:"proj_1",environmentId:"env_1",providerId:"pi",status:"idle"}),attempt:"start-turn",initiator:"agent",originPluginId:"team",requestedExecution:{providerId:"pi",model:null}});
+   expect((await f.harness.inspection.registrations.hooks["message.dispatch"]!(ctx)).action).toBe("proceed");
+   await expect(f.harness.behavior.callRpc("resources",{projectId:"proj_1",team:"main",reason:"Change",policy})).rejects.toThrow(/outstanding/);
+   await expect(f.harness.behavior.callRpc("packageBudget",{projectId:"proj_1",team:"main",taskId:1,limit:9,expectedLimit:8,expectedUsed:1,reason:"Change"})).rejects.toThrow(/outstanding/);
+  }finally{await f.harness.lifecycle.dispose();}
+ });
 });

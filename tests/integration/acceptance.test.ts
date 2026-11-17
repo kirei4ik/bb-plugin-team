@@ -348,7 +348,7 @@ describe("standalone Team workflow (real Git and Beads, no AI)", () => {
           const before=await cli(["budget",epic.id,"--epic"]);
           expect(before).toMatchObject({used:0,limit:null,revision:0,activeEpicId:null});
           const sendCount=sent.length;
-          await cli(["budget",epic.id,"--epic","--limit","3","--expected-epic","none","--expected-revision","0","--expected-used","0","--reason","User approved three total turns"]);
+          await cli(["budget",epic.id,"--epic","--limit","3","--expected-epic","none","--expected-revision","0","--expected-used","0","--expected-scope",before.scopeRevision,"--reason","User approved three total turns"]);
           expect(sent).toHaveLength(sendCount); // deterministic save starts no model
           const first=await cli(["task","add","dev","First epic child","--parent",epic.id,"--send"]);
           const second=await cli(["task","add","dev","Second epic child","--parent",epic.id]);
@@ -369,10 +369,17 @@ describe("standalone Team workflow (real Git and Beads, no AI)", () => {
           await harness.behavior.callRpc("packageBudget",{projectId:"proj_flow",team:"main",taskId:first.task.id,limit:9,expectedLimit:8,expectedUsed:2,reason:"Package increase must retain epic cap"});
           expect(sent.at(-1)?.text).toContain("Shared epic budget");
           expect(await hook(context("thr_lead","package extension cannot bypass epic"))).toMatchObject({action:"wait",reason:expect.stringContaining("Epic budget exhausted")});
-          const forbidden=await harness.behavior.runCli(["budget",epic.id,"--epic","--limit","8","--expected-epic",epic.id,"--expected-revision","1","--expected-used","3","--reason","Let me keep going","--project","flow"],{threadId:"thr_lead",projectId:"proj_flow"});
+          // External requirements edits invalidate the previously approved scope.
+          await bd(["update",epic.id,"--acceptance","Changed externally; human approval required"]);
+          expect(await hook(context("thr_lead","unapproved requirements"))).toMatchObject({action:"wait",reason:expect.stringContaining("scope")});
+          const changed=await cli(["budget",epic.id,"--epic"]);
+          expect(changed.scopeRevision).not.toBe(before.scopeRevision);
+          const stale=await harness.behavior.runCli(["budget",epic.id,"--epic","--limit","4","--expected-epic",epic.id,"--expected-revision","1","--expected-used","3","--expected-scope",before.scopeRevision,"--reason","Stale scope must fail","--project","flow"]);
+          expect(stale.exitCode).not.toBe(0);
+          const forbidden=await harness.behavior.runCli(["budget",epic.id,"--epic","--limit","8","--expected-epic",epic.id,"--expected-revision","1","--expected-used","3","--expected-scope",changed.scopeRevision,"--reason","Let me keep going","--project","flow"],{threadId:"thr_lead",projectId:"proj_flow"});
           expect(forbidden.exitCode).not.toBe(0);
           expect((await cli(["budget",epic.id,"--epic"])).limit).toBe(3);
-          await cli(["budget",epic.id,"--epic","--limit","4","--expected-epic",epic.id,"--expected-revision","1","--expected-used","3","--reason","Human approved one more check"]);
+          await cli(["budget",epic.id,"--epic","--limit","4","--expected-epic",epic.id,"--expected-revision","1","--expected-used","3","--expected-scope",changed.scopeRevision,"--reason","Human approved one more check"]);
           expect((await hook(context("thr_helper","one approved check"))).action).toBe("proceed");
           return;
         }

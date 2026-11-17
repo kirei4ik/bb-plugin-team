@@ -23,18 +23,24 @@ export const epicBudgetChangeSchema = z.object({
   expectedActiveEpicId: z.string().nullable(),
   expectedRevision: z.number().int().nonnegative(),
   expectedUsed: z.number().int().nonnegative(),
+  /** SHA256 fingerprint of the authoritative epic scope the human is approving. */
+  expectedScopeRevision: z.string().trim().min(1).max(200),
   reason: z.string().trim().min(1).max(4000),
 }).strict();
 export type EpicBudgetChange = z.infer<typeof epicBudgetChangeSchema>;
-interface EpicBudget {limit:number;revision:number;sinceMs:number}
+/** Authoritative epic scope projection returned by the tracker validator. */
+export interface EpicScope {title:string;criteria?:string;scopeRevision:string}
+interface EpicBudget {limit:number;revision:number;sinceMs:number;approvedScopeRevision?:string;observedScopeRevision?:string}
 export interface EpicBudgetSummary extends EpicBudget {
   id:string;used:number;remaining:number;title?:string;criteria?:string;blocked:string|null;
   unattributedTasks?:Array<{id:TaskId;title:string}>;
+  scopeMismatch?:string|null;
 }
 class ResourceConflict extends Error {}
 export interface ResourceOwner {projectId:string;team:string;role:string;taskId:TaskId|null;ownerThreadId:string;hostId:string|null;isLead?:boolean}
 export interface ResourceAttempt {
   epicId?:string;
+  epicScopeRevision?:string;
   userControl?:boolean;
   id:string;key:string;threadId:string;taskId:TaskId|null;role:string;provider:string;model:string|null;
   initiator:string;requestId:string|null;atMs:number;endedAtMs:number|null;
@@ -92,7 +98,7 @@ export class ResourceControl {
   private tail:Promise<unknown>=Promise.resolve();
   private snapshots = new WeakMap<ResourceState,string|null>();
   private enabledAt:number;
-  constructor(private bb:BbPluginApi,private resolve:(threadId:string)=>Promise<ResourceOwner|null>,private changed:(projectId:string)=>void,private now=Date.now, private validateEpic?:(owner:ResourceOwner,epicId:string)=>Promise<{title:string;criteria?:string}>) {
+  constructor(private bb:BbPluginApi,private resolve:(threadId:string)=>Promise<ResourceOwner|null>,private changed:(projectId:string)=>void,private now=Date.now, private validateEpic?:(owner:ResourceOwner,epicId:string)=>Promise<EpicScope>) {
     this.enabledAt=this.now();
     this.db=bb.storage.database();
     bb.storage.migrate(this.db, STORAGE_MIGRATIONS);
@@ -136,7 +142,8 @@ export class ResourceControl {
   }
   private attempt(state:ResourceState,thread:TrackedThread){return state.attempts.find(a=>a.id===thread.activeId);}
   private append(state:ResourceState,owner:ResourceOwner,id:string,key:string,provider:string,model:string|null,initiator:string):ResourceAttempt {
-    const attempt:ResourceAttempt={...(state.activeEpicId?{epicId:state.activeEpicId}:{}),id:randomUUID(),key,threadId:id,taskId:owner.taskId,role:owner.role,provider,model,initiator,requestId:null,atMs:this.now(),endedAtMs:null,outcome:"reserved",reason:null,tokens:null,queuedIds:[]};
+    const epicId=state.activeEpicId,epicScopeRevision=epicId?state.epicBudgets?.[epicId]?.approvedScopeRevision:undefined;
+    const attempt:ResourceAttempt={...(epicId?{epicId}:{}),...(epicScopeRevision?{epicScopeRevision}:{}),id:randomUUID(),key,threadId:id,taskId:owner.taskId,role:owner.role,provider,model,initiator,requestId:null,atMs:this.now(),endedAtMs:null,outcome:"reserved",reason:null,tokens:null,queuedIds:[]};
     if(owner.taskId!==null){state.taskCeilings??={};state.taskCeilings[taskKey(owner.taskId,owner.role)]??=owner.isLead?state.policy.coordinationAttempts??state.policy.taskAttempts:state.policy.taskAttempts;}
     state.attempts.push(attempt);state.threads[id]!.activeId=attempt.id;return attempt;
   }
@@ -190,7 +197,7 @@ export class ResourceControl {
                 if(state.activeEpicId&&!predatesEpics)state.epicUnattributed="An unreserved turn was observed during epic accounting; inspect its task attribution and record an epic budget decision";
                 const dto=await this.bb.sdk.threads.get({threadId:id});
                 active=this.append(state,thread.owner,id,`observed:${row.id}`,dto.providerId,null,"override/observed");
-                if(predatesEpics)delete active.epicId;
+                if(predatesEpics){delete active.epicId;delete active.epicScopeRevision;}
                 active.requestId=thread.requestId;active.atMs=row.createdAt;
               }
               active.outcome="running";
@@ -253,11 +260,21 @@ export class ResourceControl {
     const used=this.epicUsed(state,id,excluding);
     return used>=budget.limit?`Epic budget exhausted (${id}: ${used}/${budget.limit}); use Team → Epic budget or bb team budget ${id} --epic for a human decision`:null;
   }
+  private scopeMismatchReason(budget:EpicBudget|undefined):string|null{
+    if(!budget)return "Active epic has no finite budget; inspect Team resources";
+    if(!budget.approvedScopeRevision)return "Epic scope is not yet approved for this budget; a human must approve the current Beads revision before automatic work";
+    if(budget.observedScopeRevision&&budget.observedScopeRevision!==budget.approvedScopeRevision)return `Epic scope changed since approval (approved ${budget.approvedScopeRevision.slice(0,8)}, observed ${budget.observedScopeRevision.slice(0,8)}); a human must approve the new revision`;
+    return null;
+  }
   private async epicScope(state:ResourceState,owner:ResourceOwner):Promise<string|null>{
     if(!state.activeEpicId)return null;
+    const id=state.activeEpicId;
     try {
       if(!this.validateEpic)throw new Error("Epic membership validator unavailable");
-      await this.validateEpic(owner,state.activeEpicId);return null;
+      const observed=await this.validateEpic(owner,id);
+      const budget=Object.hasOwn(state.epicBudgets??{},id)?state.epicBudgets![id]:undefined;
+      if(budget)budget.observedScopeRevision=observed.scopeRevision;
+      return this.scopeMismatchReason(budget);
     } catch(error){return `Epic scope held: ${safeText(error instanceof Error?error.message:String(error))}`;}
   }
   /** Preflight only: admission reserves again, after a fresh authoritative scope check. */
@@ -267,7 +284,7 @@ export class ResourceControl {
       this.save(owner,s);if(reason)throw new Error(reason);
     });
   }
-  async setEpicBudget(owner:Pick<ResourceOwner,"projectId"|"team">,input:EpicBudgetChange,validate:()=>Promise<void>,record:()=>Promise<void>){
+  async setEpicBudget(owner:Pick<ResourceOwner,"projectId"|"team">,input:EpicBudgetChange,validate:()=>Promise<{scopeRevision:string}>,record:()=>Promise<void>){
     const change=epicBudgetChangeSchema.parse(input);
     return this.serial(async()=>{
       const s=this.load(owner);await this.syncAll(s);
@@ -276,8 +293,14 @@ export class ResourceControl {
       if((s.activeEpicId??null)!==change.expectedActiveEpicId||(prior?.revision??0)!==change.expectedRevision||used!==change.expectedUsed)
         throw new Error("Epic budget changed; refresh before saving");
       if(s.attempts.some(a=>!terminal(a)))throw new Error("Finish outstanding admissions before changing the epic budget");
-      await validate();await record();
-      s.epicBudgets={...s.epicBudgets,[change.epicId]:{limit:change.limit,revision:(prior?.revision??0)+1,sinceMs:prior?.sinceMs??this.now()}};
+      // A human approves the exact observed Beads scope revision. Verify before the
+      // tracker write and again after it, so a raced external change cannot slip in.
+      const before=await validate();
+      if(before.scopeRevision!==change.expectedScopeRevision)throw new Error("Epic scope changed before approval; refresh before saving");
+      await record();
+      const after=await validate();
+      if(after.scopeRevision!==change.expectedScopeRevision)throw new Error("Epic scope changed during approval; the tracker decision is recorded but the budget was not changed, re-read and re-approve");
+      s.epicBudgets={...s.epicBudgets,[change.epicId]:{limit:change.limit,revision:(prior?.revision??0)+1,sinceMs:prior?.sinceMs??this.now(),approvedScopeRevision:change.expectedScopeRevision,observedScopeRevision:change.expectedScopeRevision}};
       s.activeEpicId=change.epicId;delete s.epicUnattributed;
       // Ordinary quota/failure holds and shared token/time guards survive.
       s.blocked=this.limit(s);s.blockedAtMs=s.blocked?this.now():null;
@@ -306,7 +329,8 @@ export class ResourceControl {
     for(const a of state.attempts){const key=taskKey(a.taskId,a.role);if(a.taskId===null||visited.has(key)||state.finished.includes(key))continue;visited.add(key);const owner=state.threads[a.threadId]?.owner;if(!owner)continue;const reason=this.packageLimit(state,{...owner,taskId:a.taskId});if(reason)taskBlocks[taskKey(a.taskId,a.role)]=reason;}
     const epicBudgets=Object.fromEntries(Object.entries(state.epicBudgets??{}).map(([id,b])=>[id,{...b,used:this.epicUsed(state,id)}]));
     const id=state.activeEpicId,b=id?epicBudgets[id]:undefined;
-    const epic=id&&b?{...b,id,remaining:Math.max(0,b.limit-b.used),blocked:this.epicLimit(state)}:undefined;
+    const scopeMismatch=id&&b?this.scopeMismatchReason(b):null;
+    const epic=id&&b?{...b,id,remaining:Math.max(0,b.limit-b.used),blocked:scopeMismatch??this.epicLimit(state),scopeMismatch}:undefined;
     return {...(epic?{epic}:{}),epicBudgets,startBudgetScope:"package",taskBlocks,outcomeCounts,blockedAtMs:state.blockedAtMs,taskLimits:{...state.taskCeilings},quotaBlocks:this.quotas().filter(q=>!q.cleared).map(q=>({provider:q.provider,hostId:q.hostId,resetAtMs:q.until})),taskCounts:[...grouped.values()],sinceMs:state.sinceMs,policy:state.policy,starts:state.attempts.length,remainingStarts:null,reportedTokens:threads.some(t=>t.usageKnown)?threads.reduce((n,t)=>n+t.reported,0):null,usageCoverage:threads.some(t=>t.usageKnown)?"partial":"unavailable",blocked:state.blocked,holds:state.holds,attempts:state.attempts.slice(-100),fallbacks:Object.values(state.fallbacks).slice(-50)};
   }
   async admit(ctx:MessageDispatchHookContext):Promise<MessageDispatchHookDecision>{
@@ -384,17 +408,26 @@ export class ResourceControl {
   async quotaExcluded(owner:Pick<ResourceOwner,"hostId">,selection:ExecutionFallbackSelection){
     return this.serial(async()=>this.isBlocked(selection.provider,owner.hostId,selection.model));
   }
-  async inspect(owner:Pick<ResourceOwner,"projectId"|"team">){return this.serial(async()=>{const s=this.load(owner);await this.syncAll(s);this.save(owner,s);const summary=this.summary(s);summary.blocked??=this.limit(s);
-      if(summary.epic){
+  async inspect(owner:Pick<ResourceOwner,"projectId"|"team">){return this.serial(async()=>{const s=this.load(owner);await this.syncAll(s);
+      let summary=this.summary(s);summary.blocked??=this.limit(s);
+      const epicId=summary.epic?.id;
+      if(epicId!==undefined){
         try {
           if(!this.validateEpic)throw new Error("Epic membership validator unavailable");
-          Object.assign(summary.epic,await this.validateEpic({...owner,role:"",taskId:summary.epic.id,ownerThreadId:"",hostId:null,isLead:true},summary.epic.id));
-        } catch(error){summary.epic.blocked=`Epic scope held: ${safeText(error instanceof Error?error.message:String(error))}`;summary.blocked??=summary.epic.blocked;}
+          const observed=await this.validateEpic({...owner,role:"",taskId:epicId,ownerThreadId:"",hostId:null,isLead:true},epicId);
+          const budget=Object.hasOwn(s.epicBudgets??{},epicId)?s.epicBudgets![epicId]:undefined;
+          if(budget)budget.observedScopeRevision=observed.scopeRevision;
+          summary=this.summary(s);summary.blocked??=this.limit(s);
+          const epic=summary.epic;
+          if(epic){Object.assign(epic,{title:observed.title,...(observed.criteria!==undefined?{criteria:observed.criteria}:{})});if(epic.scopeMismatch)summary.blocked??=epic.scopeMismatch;}
+        } catch(error){const epic=summary.epic;if(epic){epic.blocked=`Epic scope held: ${safeText(error instanceof Error?error.message:String(error))}`;summary.blocked??=epic.blocked;}}
       }
-      return summary;});}
-  async decide(owner:Pick<ResourceOwner,"projectId"|"team">,reason:string,policy?:ResourcePolicy,taskId?:TaskId,role?:string,decisionSource:"tracker"|"capacity"="tracker"){
+      this.save(owner,s);return summary;});}
+  async decide(owner:Pick<ResourceOwner,"projectId"|"team">,reason:string,policy?:ResourcePolicy,taskId?:TaskId,role?:string,decisionSource:"tracker"|"capacity"="tracker",requireQuiescent=false){
     if(!reason.trim())throw new Error("A concrete manual resource decision is required");
-    return this.serial(async()=>{const s=this.load(owner);if(policy)s.policy={...resourcePolicySchema.parse(policy),teamStarts:null};
+    return this.serial(async()=>{const s=this.load(owner);
+      if(requireQuiescent){await this.syncAll(s);if(s.attempts.some(a=>!terminal(a)))throw new Error("Finish outstanding admissions before this decision");}
+      if(policy)s.policy={...resourcePolicySchema.parse(policy),teamStarts:null};
       if(taskId!==undefined||role){delete s.holds[taskKey(taskId??null,role??"")];for(const f of Object.values(s.fallbacks))if((taskId!==undefined?f.taskId===taskId:f.taskId===null&&f.role===role)&&(f.stage==="blocked"||f.stage==="error")){f.stage="error";f.manualReleased=true;}}
       const limit=this.limit(s);s.blocked=limit;s.blockedAtMs=limit?this.now():null;
       s.decisions.push({atMs:this.now(),reason:taskId!==undefined&&decisionSource==="tracker"?"Concrete task approach decision is recorded in the selected tracker":safeText(reason),taskId:taskId??null,policy:{...s.policy}});this.save(owner,s);return this.summary(s);
@@ -413,9 +446,10 @@ export class ResourceControl {
       this.save(owner,s);
     });
   }
-  async setPackageLimit(owner:ResourceOwner,limit:number,expectedLimit:number,expectedUsed:number,record:()=>Promise<void>){
+  async setPackageLimit(owner:ResourceOwner,limit:number,expectedLimit:number,expectedUsed:number,record:()=>Promise<void>,requireQuiescent=false){
     return this.serial(async()=>{
       const s=this.load(owner);await this.syncAll(s);
+      if(requireQuiescent&&s.attempts.some(a=>!terminal(a)))throw new Error("Finish outstanding admissions before changing resources");
       if(owner.taskId===null||!Number.isInteger(limit)||limit<1||limit>1000)throw new Error("Invalid package budget");
       const key=taskKey(owner.taskId,owner.role),used=this.taskUsed(s,owner.taskId);
       const current=s.taskCeilings?.[key]??(owner.isLead?s.policy.coordinationAttempts??s.policy.taskAttempts:s.policy.taskAttempts);
@@ -427,9 +461,10 @@ export class ResourceControl {
       this.save(owner,s);return this.summary(s);
     });
   }
-  async extendCoordination(owner:ResourceOwner,expectedStarts:number,expectedUsed:number,record:()=>Promise<void>){
+  async extendCoordination(owner:ResourceOwner,expectedStarts:number,expectedUsed:number,record:()=>Promise<void>,requireQuiescent=false){
     return this.serial(async()=>{
       const s=this.load(owner);await this.syncAll(s);
+      if(requireQuiescent&&s.attempts.some(a=>!terminal(a)))throw new Error("Finish outstanding admissions before changing resources");
       if(!owner.isLead||owner.taskId===null)throw new Error("Only an unfinished coordination task can receive this allowance");
       const key=taskKey(owner.taskId,owner.role);
       const count=s.attempts.filter(a=>taskKey(a.taskId,a.role)===key).length+(s.returns??[]).filter(r=>taskKey(r.taskId,r.role)===key).length;

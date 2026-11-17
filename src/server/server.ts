@@ -37,6 +37,7 @@ import {
   type BbPluginApi,
   type MessageDispatchHookContext,
   type MessageDispatchHookDecision,
+  type ExperimentalPluginRpcHandlerContext,
   type PluginMentionItem,
 } from "@get-bb/plugin-sdk";
 import { dump as dumpYaml, load as loadYaml } from "js-yaml";
@@ -478,6 +479,10 @@ export const rpcContract = defineRpcContract({
   roleControl: {
     input:z.object({projectId:projectIdSchema,team:teamSchema,role:z.string(),action:z.enum(["status","pause","resume","switch"]),expectedThreadId:z.string().optional(),selection:executionPolicySchema.shape.fallbacks.element.optional(),approveSelection:z.boolean().optional(),recoverFromWorkspace:z.boolean().optional(),expectedRecoveryRevision:z.string().optional()}).strict(),
     output:z.object({paused:z.boolean(),threadId:z.string().nullable(),fallbacks:z.array(executionPolicySchema.shape.fallbacks.element),actual:executionPolicySchema.shape.fallbacks.element.nullable().optional()}),
+  },
+  epicScope: {
+    input:z.object({projectId:projectIdSchema,team:teamSchema,epicId:z.string().trim().min(1).max(200)}).strict(),
+    output:z.object({id:z.string(),title:z.string(),description:z.string().nullable(),criteria:z.string().nullable(),scopeRevision:z.string()}),
   },
   epicBudget: {
     input:epicBudgetChangeSchema.extend({projectId:projectIdSchema,team:teamSchema}).strict(),
@@ -949,7 +954,7 @@ export default async function plugin(bb: BbPluginApi) {
   const resources=new ResourceControl(bb,resourceOwner,publishChange,Date.now,async(owner,epicId)=>{
     const {t}=await loadLang();const scope=await scopeFor(owner.projectId,owner.team,t);
     const epic=await tracker.validateEpic(scope,epicId,owner.taskId,owner.isLead);
-    return {title:epic.title,...(epic.criteria?{criteria:epic.criteria}:{})};
+    return {title:epic.title,...(epic.criteria?{criteria:epic.criteria}:{}),scopeRevision:epic.scopeRevision};
   });
   const quotaHost=bb.hosts.experimental_client({contract:hostContract});
   const quotaPending=new Map<string,Promise<OllamaUsage>>();
@@ -1392,18 +1397,35 @@ export default async function plugin(bb: BbPluginApi) {
     }catch{bb.log.warn("Budget saved; lead notification could not be delivered");return "unavailable" as const;}
   };
 
+  // RPC identifies app/CLI/agents alike as client. Refuse model-initiated
+  // mutations while any project turn/operation is live; never trust an input
+  // field claiming a human caller. Errored but inactive sessions remain
+  // recoverable through the existing manual decision panel.
+  const assertProjectResourceQuiescent=async(projectId:string)=>{
+    try {
+      const threads=await core.listProjectThreads(bb,projectId,true);
+      if(threads.some(thread=>!["idle","error"].includes(thread.status)||thread.hasPendingInteraction||
+        Object.entries(thread.activity??{}).some(([key,value])=>key.startsWith("active")&&typeof value==="number"&&value>0)))
+        throw new Error("Finish project agent turns and background operations before a manual RPC resource decision");
+    }catch(error){throw new experimental_PluginRpcRefusal({code:"conflict",message:error instanceof Error?error.message:"Project execution state could not be verified"});}
+  };
+  const assertManualResourceRpc=async(projectId:string,ctx:ExperimentalPluginRpcHandlerContext)=>{
+    if(ctx.experimental_caller.kind!=="client")throw new experimental_PluginRpcRefusal({code:"forbidden",message:"Resource decisions require a manual client action"});
+    await assertProjectResourceQuiescent(projectId);
+  };
+
   const changeEpicBudget=async(scope:Scope,input:EpicBudgetChange,t:Strings,callerThreadId?:string)=>withScopeLock(scope,async()=>{
     // This deterministic control is for humans. A model cannot raise its own cap.
     if(callerThreadId)throw new PluginCliError("Epic budgets require a manual UI or terminal decision outside an agent thread",{code:"user_approval_required"});
     const change=epicBudgetChangeSchema.parse(input);
     const result=await resources.setEpicBudget(scope,change,async()=>{
-      await tracker.validateEpic(scope,change.epicId);
-      const scan=await scanTeamThreads(bb,scope.projectId);
-      if(scan.rows.some(row=>row.team===scope.team&&RUNNING.includes(row.status)))
-        throw new PluginCliError("Finish active team turns before changing the epic budget",{code:"role_busy"});
+      const epic=await tracker.validateEpic(scope,change.epicId);
+      await assertProjectResourceQuiescent(scope.projectId);
+      return {scopeRevision:epic.scopeRevision};
     },async()=>{
       const epic=await tracker.validateEpic(scope,change.epicId);
-      const decisions=[epic.decisions,`Epic budget: limit ${change.limit}; revision ${change.expectedRevision} → ${change.expectedRevision+1}; ${change.expectedUsed} already used; manual decision. ${change.reason}`].filter(Boolean).join("\n\n");
+      if(epic.scopeRevision!==change.expectedScopeRevision)throw new Error("Epic scope changed; inspect and approve the current requirements first");
+      const decisions=[epic.decisions,`Epic budget: limit ${change.limit}; revision ${change.expectedRevision} → ${change.expectedRevision+1}; ${change.expectedUsed} already used; approved scope ${change.expectedScopeRevision}; manual decision. ${change.reason}`].filter(Boolean).join("\n\n");
       if(decisions.length>24000)throw new Error("Decision history is full");
       await tracker.update(scope,change.epicId,{decisions});
     });
@@ -1412,7 +1434,7 @@ export default async function plugin(bb: BbPluginApi) {
     return withResourceResults(result,(await readTasks(scope)).tasks);
   });
 
-  const changePackageBudget=async(scope:Scope,input:{taskId:TaskId;limit:number;expectedLimit:number;expectedUsed:number;reason:string},t:Strings,callerThreadId?:string)=>withScopeLock(scope,async()=>{
+  const changePackageBudget=async(scope:Scope,input:{taskId:TaskId;limit:number;expectedLimit:number;expectedUsed:number;reason:string},t:Strings,callerThreadId?:string,requireQuiescent=false)=>withScopeLock(scope,async()=>{
     const {taskId,limit,expectedLimit,expectedUsed}=input;
     const reason=input.reason.trim();if(!reason||reason.length>4000)throw new PluginCliError("State the user's concrete budget decision",{code:"invalid_value"});
     const task=(await readTasks(scope)).tasks.find(task=>task.id===taskId&&["todo","in-progress","review"].includes(task.status));
@@ -1420,6 +1442,7 @@ export default async function plugin(bb: BbPluginApi) {
     if(!task||!loaded?.config.roles.some(r=>r.name===task.role))throw new PluginCliError("Open package or assigned role changed; refresh",{code:"conflict"});
     const {caller}=await classifyCaller(scope,callerThreadId,t);
     if(caller==="executor")throw new PluginCliError("Only the user or lead can change a package budget",{code:"task_forbidden"});
+    if(caller==="manual"){await assertProjectResourceQuiescent(scope.projectId);requireQuiescent=true;}
     let approval="manual";
     if(caller==="lead"){
       const thread=await bb.sdk.threads.get({threadId:callerThreadId!});const attempt=await resources.userControlTurn(callerThreadId!);
@@ -1428,7 +1451,7 @@ export default async function plugin(bb: BbPluginApi) {
     }
     const decisions=[task.decisions,`Package start budget: ${expectedLimit} → ${limit}; already used ${expectedUsed}; ${approval}. ${reason}`].filter(Boolean).join("\n\n");
     if(decisions.length>24000)throw new PluginCliError("Decision history is full",{code:"conflict"});
-    const result=await resources.setPackageLimit({projectId:scope.projectId,team:scope.team,role:task.role,taskId,ownerThreadId:"",hostId:scope.hostId,isLead:task.role===lead},limit,expectedLimit,expectedUsed,async()=>{await tracker.update(scope,taskId,{decisions});});
+    const result=await resources.setPackageLimit({projectId:scope.projectId,team:scope.team,role:task.role,taskId,ownerThreadId:"",hostId:scope.hostId,isLead:task.role===lead},limit,expectedLimit,expectedUsed,async()=>{await tracker.update(scope,taskId,{decisions});},requireQuiescent);
     publishChange(scope.projectId);await bb.experimental_hooks.recheck("message.dispatch");
     if(limit>expectedLimit&&caller!=="lead")result.budgetNotice=await notifyBudgetIncrease(scope,task,expectedLimit,limit,expectedUsed,reason,t,result.epic);
     return result;
@@ -3514,7 +3537,8 @@ export default async function plugin(bb: BbPluginApi) {
     async roleRecovery({projectId,team,role,selection}) {
       const {t}=await loadLang();return inspectRoleRecovery(await scopeFor(projectId,team,t),role,selection);
     },
-    async continueCoordination({projectId,team,taskId,expectedStarts,expectedUsed}) {
+    async continueCoordination({projectId,team,taskId,expectedStarts,expectedUsed},ctx) {
+      await assertManualResourceRpc(projectId,ctx);
       const {t}=await loadLang();const scope=await scopeFor(projectId,team,t);
       return withScopeLock(scope,async()=>{
         const {lead,rows}=await teamContext(scope,t);const list=lead?rows.get(lead)??[]:[];
@@ -3524,7 +3548,7 @@ export default async function plugin(bb: BbPluginApi) {
         if(!owner||owner.taskId!==taskId)throw new experimental_PluginRpcRefusal({code:"conflict",message:"Coordination task is no longer bound"});
         const reason=currentLang==="ru"?`Пользователь разрешил до 4 дополнительных запусков руководителя по задаче «${task.title}»: проверить текущий результат, принять или вернуть конкретные замечания. Общие лимиты и квоты провайдеров не изменяются.`:`User allowed up to four additional lead starts for "${task.title}": inspect the current result, accept it or return concrete feedback. Other budgets and provider quotas are unchanged.`;
         const decisions=[task.decisions,reason].filter(Boolean).join("\n\n");if(decisions.length>24000)throw new experimental_PluginRpcRefusal({code:"conflict",message:"Decision history is full; inspect the task manually"});
-        const result=await resources.extendCoordination(owner,expectedStarts,expectedUsed,async()=>{await tracker.update(scope,taskId,{decisions});});
+        const result=await resources.extendCoordination(owner,expectedStarts,expectedUsed,async()=>{await tracker.update(scope,taskId,{decisions});},true);
         publishChange(projectId);await bb.experimental_hooks.recheck("message.dispatch");
         result.budgetNotice=await notifyBudgetIncrease(scope,task,expectedUsed,expectedUsed+4,expectedUsed,reason,t,result.epic);return result;
       });
@@ -3639,17 +3663,25 @@ export default async function plugin(bb: BbPluginApi) {
         return {paused:await isRolePaused(scope,roleName),threadId,fallbacks:configured.executionPolicy?.fallbacks??[],actual:actual.success?actual.data:null};
       });
     },
-    async epicBudget({projectId,team,...input}) {
+    async epicScope({projectId,team,epicId}) {
+      const {t}=await loadLang();const scope=await scopeFor(projectId,team,t);
+      const epic=await tracker.validateEpic(scope,epicId);
+      return {id:String(epic.id),title:epic.title,description:epic.note,criteria:epic.criteria??null,scopeRevision:epic.scopeRevision};
+    },
+    async epicBudget({projectId,team,...input},ctx) {
+      await assertManualResourceRpc(projectId,ctx);
       const {t}=await loadLang();const scope=await scopeFor(projectId,team,t);
       return changeEpicBudget(scope,input,t);
     },
-    async packageBudget({projectId,team,taskId,limit,expectedLimit,expectedUsed,reason}) {
+    async packageBudget({projectId,team,taskId,limit,expectedLimit,expectedUsed,reason},ctx) {
+      await assertManualResourceRpc(projectId,ctx);
       const {t}=await loadLang();const scope=await scopeFor(projectId,team,t);
-      return changePackageBudget(scope,{taskId,limit,expectedLimit,expectedUsed,reason},t);
+      return changePackageBudget(scope,{taskId,limit,expectedLimit,expectedUsed,reason},t,undefined,true);
     },
-    async resources({projectId,team,reason,role,policy,taskId}) {
+    async resources({projectId,team,reason,role,policy,taskId},ctx) {
       const {t}=await loadLang();const scope=await scopeFor(projectId,team,t);
       if(!reason){if(policy||taskId!==undefined||role)throw new experimental_PluginRpcRefusal({code:"invalid",message:"State the concrete resource decision"});return withResourceResults(await resources.inspect(scope),(await readTasks(scope)).tasks);}
+      await assertManualResourceRpc(projectId,ctx);
       if(taskId!==undefined){
         const task=(await readTasks(scope)).tasks.find(t=>t.id===taskId);if(!task)throw new experimental_PluginRpcRefusal({code:"not_found",message:"Task missing"});
         const intent=await readReplacementIntent(bb,scope.projectId,scope.team,task.role);
@@ -3657,7 +3689,7 @@ export default async function plugin(bb: BbPluginApi) {
         await tracker.review(scope,taskId,{decision:{decision:"changes-requested",reason,decidedBy:"manual",basis:"manual",atMs:Date.now()}});
       }
       if(policy){const {lead}=await teamContext(scope,t);await resources.pinPackages(scope,(await readTasks(scope)).tasks,lead);}
-      const result=await resources.decide(scope,reason,policy,taskId,role);publishChange(projectId);
+      const result=await resources.decide(scope,reason,policy,taskId,role,"tracker",true);publishChange(projectId);
       await bb.experimental_hooks.recheck("message.dispatch");return withResourceResults(result,(await readTasks(scope)).tasks);
     },
     async setVersioned({ projectId, team, versioned }) {
@@ -4129,7 +4161,7 @@ export default async function plugin(bb: BbPluginApi) {
         budget: cliCommand({
           summary:"Inspect or change a package budget; --epic selects a shared Beads epic budget",
           positionals:[{name:"id",required:true,description:"Work package ID"}],
-          options:{project:PROJECT_OPTION,team:TEAM_OPTION,json:JSON_OPTION,epic:{type:"boolean",description:"Inspect or set a shared Beads epic budget"},"expected-epic":{type:"string",description:"Current active epic ID, or none"},"expected-revision":{type:"string",description:"Selected epic budget revision, or 0 for a new budget"},limit:{type:"string",description:"Approved total allowance (packages 1..1000, epics 1..10000), including usage"},"expected-limit":{type:"string",description:"Current limit shown by budget"},"expected-used":{type:"string",description:"Current usage shown by budget"},reason:{type:"string",description:"User's explicit decision and grounds"}},
+          options:{project:PROJECT_OPTION,team:TEAM_OPTION,json:JSON_OPTION,epic:{type:"boolean",description:"Inspect or set a shared Beads epic budget"},"expected-epic":{type:"string",description:"Current active epic ID, or none"},"expected-revision":{type:"string",description:"Selected epic budget revision, or 0 for a new budget"},"expected-scope":{type:"string",description:"Exact scopeRevision inspected and approved by the human"},limit:{type:"string",description:"Approved total allowance (packages 1..1000, epics 1..10000), including usage"},"expected-limit":{type:"string",description:"Current limit shown by budget"},"expected-used":{type:"string",description:"Current usage shown by budget"},reason:{type:"string",description:"User's explicit decision and grounds"}},
           async run(input,ctx){
             const {t}=await loadLang();const scope=await resolveScope(input.options,ctx,t);
             if(input.options.epic){
@@ -4137,13 +4169,13 @@ export default async function plugin(bb: BbPluginApi) {
               let state=await resources.inspect(scope);
               if(input.options.limit!==undefined){
                 const expected=input.options["expected-epic"];
-                if(expected===undefined||input.options["expected-revision"]===undefined||input.options["expected-used"]===undefined)
-                  throw new PluginCliError("Inspect --epic first; supply --expected-epic, --expected-revision, --expected-used and --reason",{code:"invalid_value"});
-                state=await changeEpicBudget(scope,epicBudgetChangeSchema.parse({epicId,limit:Number(input.options.limit),expectedActiveEpicId:expected==="none"?null:expected,expectedRevision:Number(input.options["expected-revision"]),expectedUsed:Number(input.options["expected-used"]),reason:input.options.reason??""}),t,ctx.threadId);
+                if(expected===undefined||input.options["expected-revision"]===undefined||input.options["expected-used"]===undefined||input.options["expected-scope"]===undefined)
+                  throw new PluginCliError("Inspect --epic first; supply --expected-epic, --expected-revision, --expected-used, --expected-scope and --reason",{code:"invalid_value"});
+                state=await changeEpicBudget(scope,epicBudgetChangeSchema.parse({epicId,limit:Number(input.options.limit),expectedActiveEpicId:expected==="none"?null:expected,expectedRevision:Number(input.options["expected-revision"]),expectedUsed:Number(input.options["expected-used"]),reason:input.options.reason??"",expectedScopeRevision:input.options["expected-scope"]}),t,ctx.threadId);
               }
               const budget=state.epicBudgets?.[epicId];
-              const summary={epicId,title:epic.title,criteria:epic.criteria,activeEpicId:state.epic?.id??null,limit:budget?.limit??null,used:budget?.used??0,revision:budget?.revision??0,blocked:state.epic?.blocked??null};
-              return {exitCode:0,stdout:input.options.json?JSON.stringify(summary):`${epic.title} (${epicId}): ${summary.used}/${summary.limit??"unset"}; revision ${summary.revision}; active epic ${summary.activeEpicId??"none"}. ${summary.blocked??""}`};
+              const summary={epicId,title:epic.title,description:epic.note,criteria:epic.criteria,scopeRevision:epic.scopeRevision,activeEpicId:state.epic?.id??null,limit:budget?.limit??null,used:budget?.used??0,revision:budget?.revision??0,blocked:state.epic?.blocked??null};
+              return {exitCode:0,stdout:input.options.json?JSON.stringify(summary):`${epic.title} (${epicId}): ${summary.used}/${summary.limit??"unset"}; revision ${summary.revision}; active epic ${summary.activeEpicId??"none"}. Scope ${epic.scopeRevision}.\nRequirements: ${epic.note??"—"}\nCriteria: ${epic.criteria??"—"}\n${summary.blocked??""}`};
             }
             const taskId=parseTaskId(input.positionals.id!);
             const task=(await readTasks(scope)).tasks.find(task=>task.id===taskId);if(!task)throw new PluginCliError("Package not found",{code:"task_not_found"});

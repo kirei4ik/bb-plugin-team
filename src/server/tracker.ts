@@ -37,6 +37,7 @@
 // A closed issue without the dropped label is `done` by default. bd's
 // blocked/deferred statuses project to in-progress/todo and are never ready.
 
+import {createHash} from "node:crypto";
 import type { BbPluginApi } from "@get-bb/plugin-sdk";
 import type { Workspace } from "./core";
 import { hostContract } from "../shared/host-contract";
@@ -58,7 +59,7 @@ export interface TaskTracker {
   setConfig(workspace: Workspace, kind: TrackerKind | null): Promise<void>;
   read(scope: TrackerScope): Promise<TaskStore>;
   /** Authoritative scope check; never infer hierarchy from ids or titles. */
-  validateEpic(scope: TrackerScope, epicId: string, taskId?: TaskId | null, isLead?: boolean): Promise<TeamTask>;
+  validateEpic(scope: TrackerScope, epicId: string, taskId?: TaskId | null, isLead?: boolean): Promise<TeamTask & {scopeRevision:string}>;
   add(
     scope: TrackerScope,
     input: {
@@ -837,7 +838,15 @@ export function createTaskTracker(
             throw new Error("Task is not an open direct child of the active epic");
         }
       }
-      return projectIssue(epic);
+      // Only the approved requirements and identity define scope. Operational
+      // notes, budget decisions and status updates must not invalidate consent.
+      const scopeRevision=createHash("sha256").update(JSON.stringify({
+        projectId:scope.projectId,hostId:scope.hostId,path:scope.path,team:scope.team,
+        id:epic.id,type:epic.issue_type,parent:epic.parent??null,
+        title:epic.title??"",description:epic.description??"",criteria:epic.acceptance_criteria??"",
+        teamLabels:(epic.labels??[]).filter(label=>label.startsWith(TEAM_LABEL_PREFIX)).sort(),
+      })).digest("hex");
+      return {...projectIssue(epic),scopeRevision};
     },
     getConfig,
     setConfig,

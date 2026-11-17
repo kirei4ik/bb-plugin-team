@@ -277,6 +277,7 @@ async function mount(
         roleRecovery: (input:{role:string;selection?:unknown})=>{
           log("roleRecovery")(input);return {threadId:roleThreads.get(input.role)??"thr_d",taskId:7,taskTitle:"Implement profile",environmentId:"env_1",actual:actualModels.get(input.role)??{provider:"codex",model:"gpt-4",reasoningLevel:"none"},revision:"preview-1",blockers:[],quota:"unknown",...options.recovery};
         },
+        epicScope:(input:unknown)=>{log("epicScope")(input);return {id:"epic-1",title:"Release profile",description:"Deliver profile",criteria:"Two accepted tasks",scopeRevision:"a".repeat(64)};},
         epicBudget:(input:unknown)=>{log("epicBudget")(input);return snapshots[0]!.resources!;},
         packageBudget:(input:unknown)=>{log("packageBudget")(input);return snapshots[0]!.resources!;},
         continueCoordination:(input:{taskId:string|number;expectedStarts:number;expectedUsed:number})=>{
@@ -1173,10 +1174,13 @@ it("shows the shared epic allowance and saves a checked human decision without m
  expect(panel.getByText(/Unrelated work/)).toBeTruthy();
  expect(calls.some(c=>c.method==="epicBudget")).toBe(false);
  fireEvent.click(panel.getByText("Configure epic budget"));
+ expect((panel.getByText("Save epic budget") as HTMLButtonElement).disabled).toBe(true);
+ fireEvent.click(panel.getByText("Read epic requirements"));
+ fireEvent.click(await panel.findByLabelText("Approve these requirements and criteria"));
  fireEvent.change(panel.getByLabelText("Total turn allowance"),{target:{value:"4"}});
  fireEvent.change(panel.getByLabelText("Decision grounds"),{target:{value:"Two more checks agreed"}});
  fireEvent.click(panel.getByText("Save epic budget"));
  await panel.findByText("Epic budget saved; no model was started.");
- expect(calls.find(c=>c.method==="epicBudget")?.input).toMatchObject({epicId:"epic-1",limit:4,expectedActiveEpicId:"epic-1",expectedRevision:1,expectedUsed:2,reason:"Two more checks agreed"});
+ expect(calls.find(c=>c.method==="epicBudget")?.input).toMatchObject({epicId:"epic-1",limit:4,expectedActiveEpicId:"epic-1",expectedRevision:1,expectedUsed:2,expectedScopeRevision:"a".repeat(64),reason:"Two more checks agreed"});
  expect(calls.some(c=>["tell","teamSpawn","sessionRotate"].includes(c.method))).toBe(false);slot.lifecycle.unmount();
 });

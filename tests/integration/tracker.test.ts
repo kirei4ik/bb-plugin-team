@@ -480,7 +480,12 @@ describe("task tracker", () => {
       expect(projected?.issueType).toBe("task");
       expect(projected?.parentId).toBe(epic.id);
       expect(child.parentId).toBe(epic.id);
-      expect((await tracker.validateEpic(scope,epic.id,child.id,false)).id).toBe(epic.id);
+      const approved=await tracker.validateEpic(scope,epic.id,child.id,false);
+      expect(approved.id).toBe(epic.id);expect(approved.scopeRevision).toMatch(/^[a-f0-9]{64}$/);
+      await tracker.update(scope,epic.id,{decisions:"Budget decision without scope change"});
+      expect((await tracker.validateEpic(scope,epic.id)).scopeRevision).toBe(approved.scopeRevision);
+      await bd(repo,["update",epic.id,"--acceptance","A changed requirement"]);
+      expect((await tracker.validateEpic(scope,epic.id)).scopeRevision).not.toBe(approved.scopeRevision);
       await expect(tracker.validateEpic(scope,epic.id,null,true)).rejects.toThrow(/explicitly assigned/);
       await expect(tracker.validateEpic(scope,epic.id,plain.id,false)).rejects.toThrow(/direct child/);
       await expect(tracker.validateEpic(scope,epic.id,epic.id,false)).rejects.toThrow(/Only the lead/);
