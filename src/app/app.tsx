@@ -19,6 +19,8 @@ import {
 import type { rpcContract } from "../server/server";
 import { RoleSessionCard } from "./role-session-card";
 import {RoleContinuationControls} from "./continuation-controls";
+import {LeadTeamSummary,LeadTeamDetails,LeadTeamCard,useLeadTeamVisible} from "./lead-team-context";
+import { TeamOverview } from "./team-overview";
 import { ResourcePanel } from "./resource-panel";
 import { ReviewForm } from "./review-form";
 import {
@@ -1388,7 +1390,8 @@ function TeamBlock({
       </div>
       {expanded && (
         <>
-          {!!snapshot.bindingIssues?.length && <Notice tone="error">
+          <TeamOverview snapshot={snapshot} language={language}/>
+          {!!snapshot.bindingIssues?.length && <details className="rounded border border-border p-2 text-sm"><summary>{language==="ru"?"Восстановление сессий":"Session recovery"} ({snapshot.bindingIssues.length})</summary><Notice tone="error">
             <strong>{language === "ru" ? "Команда требует восстановления сессий" : "Team sessions need recovery"}</strong>
             <p>{language === "ru" ? "Сообщение руководителю само по себе не устраняет эту остановку. Сначала восстановите сотрудников ниже. Лимиты и задачи сохранятся." : "Messaging the lead cannot repair this stop. Restore the employees below first. Tasks and budgets are preserved."}</p>
             {snapshot.bindingIssues.map(issue => <div key={issue.role} className="mt-2">
@@ -1403,7 +1406,7 @@ function TeamBlock({
                 (language === "ru" ? "прежняя сессия архивирована, действующей нет. Используйте «Создать недостающих» ниже — это запустит модель." : "The former session is archived; there is no live session. Use Create missing below — this starts the model.") :
                 (language === "ru" ? "автоматическое восстановление небезопасно: несколько сессий, незавершённая замена или недоступное окружение. Нужна проверка; повторное создание заблокировано." : "Recovery is unsafe: multiple sessions, an unfinished replacement or inaccessible environment. Inspect before continuing; duplicate creation is blocked.")}
             </div>)}
-          </Notice>}
+          </Notice></details>}
           {snapshot.configError && <Notice tone="error">{l.configError(snapshot.configError)}</Notice>}
           {!snapshot.configSource && <Notice>{l.noConfig}</Notice>}
           {templateId !== null && (
@@ -1444,7 +1447,9 @@ function TeamBlock({
               onCancel={() => onAdding(false)}
             />
           )}
+          <details className="rounded-md border border-border p-3 text-sm"><summary>{language==="ru"?"Решения, лимиты и диагностика":"Decisions, limits and diagnostics"}</summary>
           <ResourcePanel snapshot={snapshot} language={language} onSelectRole={role=>onSelect({team,role})} onChanged={async()=>{await onAction(async()=>language==="ru"?"Решение по ресурсам сохранено.":"Resource decision saved.");}}/>
+          </details>
           <div className="flex flex-col">
             {lead && roleRow(lead, 0)}
             {executors.map((role, index) => roleRow(role, lead ? 1 : 0, index === executors.length - 1))}
@@ -2440,6 +2445,8 @@ function TemplatesSettings() {
 }
 
 export default definePluginApp((app) => {
+  app.slots.experimental_threadContextSegment({id:"lead-team",title:"Team",group:"2_team",summary:LeadTeamSummary,details:LeadTeamDetails,useVisible:useLeadTeamVisible});
+  app.slots.experimental_threadContextCardSection({id:"lead-team",title:"Team",group:"1_related",order:40,component:LeadTeamCard});
   app.slots.navPanel({
     id: "team",
     title: "Team",

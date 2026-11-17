@@ -3,7 +3,7 @@ import {createHash} from "node:crypto";
 import {createFakePluginHost,makeThreadResponse} from "@get-bb/plugin-sdk/testing";
 import type {MessageDispatchHookContext,PluginTurnFailedEvent,ThreadEventRow} from "@get-bb/plugin-sdk";
 import {verifyQuotaBoundary,type WorkCheckpoint} from "../../src/server/checkpoint";
-import {ResourceControl,DEFAULT_RESOURCE_POLICY,type ResourceOwner} from "../../src/server/resource-control";
+import {ResourceControl,DEFAULT_RESOURCE_POLICY,withResourceResults,type ResourceOwner} from "../../src/server/resource-control";
 function fixture(validateEpic?:(owner:ResourceOwner,epicId:string)=>Promise<{title:string;criteria?:string;scopeRevision:string}>){
  let now=1000;const events=new Map<string,ThreadEventRow[]>();const owners=new Map<string,ResourceOwner>();
  const base={projectId:"p",team:"main",role:"dev",taskId:"task-1",ownerThreadId:"dev",hostId:"host"};
@@ -490,4 +490,17 @@ it("native Codex recovery refuses unrelated host exclusions without partial rele
 it("native recovery refuses outstanding admissions before checking capacity",async()=>{
  const f=fixture();await f.control.admit(f.ctx());let verified=false;
  await expect(f.control.recoverCodexCapacity(f.scope,async()=>{verified=true;})).rejects.toThrow("outstanding");expect(verified).toBe(false);
+});
+
+
+it("epic progress separates closed tasks from recorded acceptance and excludes foreign work",async()=>{
+ const f=fixture();const base={role:"dev",note:null,createdAtMs:0,updatedAtMs:0};
+ const decision={decision:"accept" as const,reason:"Checked the evidence",decidedBy:"manual" as const,basis:"manual" as const,atMs:1};
+ const summary=withResourceResults({...await f.control.inspect(f.scope),epic:{id:"epic",used:3,limit:10,remaining:7,revision:1,sinceMs:0,blocked:null}},[
+  {...base,id:"epic",title:"Goal",status:"done",review:{version:1,decisions:[decision]}},
+  {...base,id:"a",title:"Accepted child",parentId:"epic",status:"done",review:{version:1,decisions:[decision]}},
+  {...base,id:"b",title:"Legacy closed",parentId:"epic",status:"done"},
+  {...base,id:"c",title:"Foreign accepted",parentId:"other",status:"done",review:{version:1,decisions:[decision]}},
+ ]);
+ expect(summary.epic).toMatchObject({trackerStatus:"done",acceptanceReason:"Checked the evidence",progress:{total:2,done:2,accepted:1,review:0,working:0,queued:0}});
 });

@@ -35,6 +35,8 @@ bb-plugin-team/
 | --- | --- |
 | Команды CLI, RPC, события BB | `src/server/server.ts` |
 | Панель Team и настройки | `src/app/app.tsx` |
+| Компактная сводка команды/эпика | `src/app/team-overview.tsx` |
+| Сводка и навигация в треде руководителя | `src/app/lead-team-context.tsx` |
 | Хостовые операции Beads, Git, чтение квот | `src/host/host.ts` |
 | Контракт RPC с рабочим хостом | `src/shared/host-contract.ts` |
 | Чтение конфига команды и подготовка окружения | `src/server/core.ts` |

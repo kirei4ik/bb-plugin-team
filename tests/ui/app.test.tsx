@@ -380,7 +380,7 @@ describe("панель Team: дерево команд", () => {
       { ...SNAPSHOT.roles[1]!, executionState: { kind: "error", taskId: 7, errorCode: "spawn_uncertain", errorMessage: "The host disconnected during creation.", safeAction: "Inspect the prepared candidate before retrying.", atMs: 0 } },
     ] }] });
     expect(await slot.findByText("Awaiting acceptance or decision")).toBeTruthy();
-    expect(slot.getByText("Needs attention")).toBeTruthy();
+    expect(slot.getAllByText("Needs attention").length).toBeGreaterThan(0);
     expect(slot.getByRole("alert").textContent).toContain("Inspect the prepared candidate before retrying.");
     expect(slot.getByRole("alert").textContent).toContain("The host disconnected during creation.");
     slot.lifecycle.unmount();
@@ -415,13 +415,15 @@ describe("панель Team: дерево команд", () => {
     const app = await loadPluginApp(() => import("../../src/app/app"));
     expect(app.navPanels.map((panel) => panel.path)).toEqual(["team"]);
     expect(app.settingsSections.map((section) => section.id)).toEqual(["templates"]);
+    expect(app.threadContextSegments.map(section=>section.id)).toContain("lead-team");
+    expect(app.threadContextCardSections.map(section=>section.id)).toContain("lead-team");
   });
 
   it("без базы Beads: баннер и кнопка создают базу через trackerPrepare", async () => {
     const { slot, calls } = await mount({ snapshots: [{ ...SNAPSHOT, trackerError: { code: "beads_absent", message: "bd list failed (exit 1) in /ws/demo: Error: no beads database found" } }] });
     await slot.findByText("The Beads database does not exist yet — packages cannot be stored.");
     expect(slot.getByText(/no beads database found/)).toBeTruthy();
-    expect(slot.getByText(/Login form/)).toBeTruthy(); // the team still renders
+    expect(slot.getAllByText(/Login form/).length).toBeGreaterThan(0); // overview and role tree render the same current task
     fireEvent.click(slot.getByText("Create database"));
     await slot.findByText("Beads database created.");
     expect(calls.find((c) => c.method === "trackerPrepare")?.input).toEqual({ projectId: "proj_1", team: "main" });
@@ -485,8 +487,8 @@ describe("панель Team: дерево команд", () => {
     // The role starts unset, so open the picker first.
     fireEvent.click(slot.getAllByText("Select model")[0]!);
     await slot.findByLabelText("Provider ID");
-    fireEvent.change(slot.getByLabelText("Provider ID"), { target: { value: "pi" } });
-    fireEvent.change(slot.getByLabelText("Model"), { target: { value: "qwen3" } });
+    await act(async()=>{fireEvent.change(slot.getByLabelText("Provider ID"), { target: { value: "pi" } });});
+    await act(async()=>{fireEvent.change(slot.getByLabelText("Model"), { target: { value: "qwen3" } });});
     fireEvent.click(slot.getByText("Apply execution selection"));
     fireEvent.click(slot.getByText("Add"));
     await slot.findByText('Role "junior" added.');
@@ -1183,4 +1185,14 @@ it("shows the shared epic allowance and saves a checked human decision without m
  await panel.findByText("Epic budget saved; no model was started.");
  expect(calls.find(c=>c.method==="epicBudget")?.input).toMatchObject({epicId:"epic-1",limit:4,expectedActiveEpicId:"epic-1",expectedRevision:1,expectedUsed:2,expectedScopeRevision:"a".repeat(64),reason:"Two more checks agreed"});
  expect(calls.some(c=>["tell","teamSpawn","sessionRotate"].includes(c.method))).toBe(false);slot.lifecycle.unmount();
+});
+
+it("keeps compact overview visible and resource forms collapsed until requested",async()=>{
+ const {slot,calls}=await mount();
+ await slot.findByText("Decisions, limits and diagnostics");
+ const details=slot.getByText("Decisions, limits and diagnostics").closest("details")!;
+ expect(details.open).toBe(false);
+ fireEvent.click(slot.getByText("Decisions, limits and diagnostics"));expect(details.open).toBe(true);
+ expect(calls.some(c=>["roleControl","resources","teamPause","teamTell"].includes(c.method))).toBe(false);
+ slot.lifecycle.unmount();
 });

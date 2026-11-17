@@ -5,7 +5,7 @@ import {resourceQueueExplanation,packageResourceBlock,boundedDispatchDecision} f
 import {sessionRecoverySchema,sessionRecoveryActionSchema,type SessionRecovery} from "../shared/session-recovery";
 import {executionJournal, JOURNAL_RETENTION_DAYS, JOURNAL_MAX_EVENTS} from "./execution-journal";
 import {openRouterUsageSchema,emptyOpenRouter,openRouterHeadroom,isOpenRouterModel,quotaSourceSchema,type OpenRouterUsage,type QuotaSource} from "../shared/openrouter-usage";
-import { queuedFingerprint, deferredKey, deferredContinuationSchema, readDeferred, scheduleDeferred, cancelDeferred } from "./deferred-continuation";
+import { queuedFingerprint, deferredKey, deferredContinuationSchema, readDeferred, scheduleDeferred, cancelDeferred, inspectDeferred } from "./deferred-continuation";
 import { recoveryViewSchema, manualExecutionApprovalSchema, type RecoveryView, type RecoveryBlocker } from "../shared/recovery-view";
 import { hostContract } from "../shared/host-contract";
 import { ollamaUsageSchema, isOllamaCloud, exhaustedOllama, quotaHeadroom, quotaPolicySchema, DEFAULT_QUOTA_POLICY, type OllamaUsage } from "../shared/ollama-usage";
@@ -2701,6 +2701,7 @@ export default async function plugin(bb: BbPluginApi) {
       leadRole: lead,
       paused,
       roles: withExecutionState,
+      continuations:(await Promise.all(withExecutionState.map(role=>inspectDeferred(bb,scope.projectId,scope.team,role.name,role.threads.length===1?role.threads[0]!.threadId:null)))).filter((view):view is NonNullable<typeof view>=>view!==null),
       executionEvents: executionJournal(bb).list(scope.projectId,scope.team).slice(0,100),
       generatedAtMs: Date.now(),
       tracker: (await tracker.getConfig(scope)).kind,

@@ -35,6 +35,8 @@ export interface EpicBudgetSummary extends EpicBudget {
   id:string;used:number;remaining:number;title?:string;criteria?:string;blocked:string|null;
   unattributedTasks?:Array<{id:TaskId;title:string}>;
   scopeMismatch?:string|null;
+  trackerStatus?:TeamTask["status"];acceptanceReason?:string|null;
+  progress?:{total:number;done:number;accepted:number;review:number;working:number;queued:number};
 }
 class ResourceConflict extends Error {}
 export interface ResourceOwner {projectId:string;team:string;role:string;taskId:TaskId|null;ownerThreadId:string;hostId:string|null;isLead?:boolean}
@@ -563,6 +565,11 @@ export class ResourceControl {
 /** Result projection is read from the chosen tracker, never stored in the ledger. */
 export function withResourceResults(summary:ResourceSummary,tasks:TeamTask[]):ResourceSummary {
  const closed=tasks.filter(t=>t.status==="done");
+ if(summary.epic){
+  const epic=tasks.find(t=>t.id===summary.epic!.id),children=tasks.filter(t=>t.parentId===summary.epic!.id);
+  const accepted=(t:TeamTask)=>t.status==="done"&&t.review?.decisions.at(-1)?.decision==="accept";
+  summary={...summary,epic:{...summary.epic,...(epic?{trackerStatus:epic.status,acceptanceReason:accepted(epic)?epic.review!.decisions.at(-1)!.reason:null}:{}),progress:{total:children.length,done:children.filter(t=>t.status==="done").length,accepted:children.filter(accepted).length,review:children.filter(t=>t.status==="review").length,working:children.filter(t=>t.status==="in-progress").length,queued:children.filter(t=>t.status==="todo").length}}};
+ }
  if(summary.epic)summary={...summary,epic:{...summary.epic,unattributedTasks:tasks.filter(t=>["todo","in-progress","review"].includes(t.status)&&t.id!==summary.epic!.id&&t.parentId!==summary.epic!.id).map(t=>({id:t.id,title:t.title}))}};
  return {...summary,results:{accepted:closed.length,review:tasks.filter(t=>t.status==="review").length,reports:tasks.filter(t=>t.review?.submission).length,recent:closed.slice(-20).map(t=>({id:t.id,title:t.title,result:t.review?.submission?.result??t.result??null,checks:(t.review?.submission?.checks??[]).map(c=>({what:c.what,result:c.result??null,notApplicable:c.notApplicable??null})),acceptanceReason:t.review?.decisions.at(-1)?.reason??null}))}};
 }
