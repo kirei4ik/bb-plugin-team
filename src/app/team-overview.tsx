@@ -44,6 +44,10 @@ export function TeamOverview({
   const roles = snapshot.roles;
   const bindingIssues = snapshot.bindingIssues ?? [];
   const tasks = roles.flatMap((role) => role.tasks);
+  const lead=roles.find(r=>r.lead),leadTask=lead?currentTask(lead.tasks):null;
+  const leadCount=leadTask?resources?.taskCounts.find(c=>c.taskId===leadTask.id):undefined;
+  const leadUsed=leadCount?leadCount.starts+leadCount.returns:null;
+  const leadLimit=leadTask&&resources?(resources.taskLimits?.[`task:${leadTask.id}`]??resources.policy.coordinationAttempts??resources.policy.taskAttempts):null;
   const running = (role: SnapshotRole) =>
     role.threads.some((thread) => (RUNNING as readonly string[]).includes(thread.status));
 
@@ -168,7 +172,7 @@ export function TeamOverview({
     <section aria-label={ru ? "Обзор команды" : "Team overview"} className="flex flex-col gap-3 text-sm">
       <header className="flex flex-wrap items-center gap-2">
         <strong>{snapshot.teamTitle ?? snapshot.team}</strong>
-        <span className="text-muted-foreground">{snapshot.team}</span>
+        {snapshot.teamTitle&&<span className="text-muted-foreground">{snapshot.team}</span>}
         {snapshot.paused && (
           <span className="rounded-full bg-secondary px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-secondary-foreground">
             {ru ? "пауза" : "paused"}
@@ -255,6 +259,7 @@ export function TeamOverview({
               : ""}{" "}
             · {openTasks} {ru ? "открытых задач" : "open packages"}
           </p>
+          {leadUsed!==null&&leadLimit!==null&&<p>{ru?"Пакет руководителя":"Lead package"}: {leadUsed}/{leadLimit} · {ru?"остаток":"remaining"} {Math.max(0,leadLimit-leadUsed)}</p>}
           <p className="text-muted-foreground">
             {ru
               ? "Активного эпика нет; действуют прежние лимиты пакетов."

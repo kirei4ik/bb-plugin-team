@@ -422,3 +422,9 @@ it("does not present an unavailable tracker scope as freshly approved",()=>{
  const snapshot=makeSnapshot({resources:makeResources({epic:{id:"epic",title:"Goal",limit:10,used:1,remaining:9,revision:1,sinceMs:0,approvedScopeRevision:"saved",observedScopeRevision:"saved",blocked:"Epic scope held: Beads unavailable"}})});
  const s=render(snapshot);expect(s.getByText(/Requirements unavailable/)).toBeTruthy();expect(s.queryByText("Approved scope")).toBeNull();expect(s.getByText(/requirements could not be verified/)).toBeTruthy();
 });
+
+
+it("shows the existing lead package allowance without inventing an epic or resetting returns",()=>{
+ const s=render(makeSnapshot({roles:[makeRole("lead",{lead:true,tasks:[makeTask("coord","lead","Coordinate","in-progress")]})],resources:makeResources({policy:{taskAttempts:8,coordinationAttempts:40,teamStarts:null,tokens:null,minutes:null},taskLimits:{"task:coord":8},taskCounts:[{taskId:"coord",role:"lead",starts:5,returns:2}]})}));
+ expect(s.getByText("Lead package: 7/8 · remaining 1")).toBeTruthy();expect(s.getByText(/No active epic/)).toBeTruthy();
+});
