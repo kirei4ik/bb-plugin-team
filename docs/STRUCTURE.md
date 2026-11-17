@@ -35,13 +35,15 @@ bb-plugin-team/
 | --- | --- |
 | Команды CLI, RPC, события BB | `src/server/server.ts` |
 | Панель Team и настройки | `src/app/app.tsx` |
+| Компактная сводка команды/эпика | `src/app/team-overview.tsx` |
+| Сводка и навигация в треде руководителя | `src/app/lead-team-context.tsx` |
 | Хостовые операции Beads, Git, чтение квот | `src/host/host.ts` |
 | Контракт RPC с рабочим хостом | `src/shared/host-contract.ts` |
 | Чтение конфига команды и подготовка окружения | `src/server/core.ts` |
 | Выбранный трекер и встроенные задачи | `src/server/tracker.ts`, `tasks.ts` |
 | Смена сессии и передача состояния | `src/server/sessions.ts`, `checkpoint.ts` |
 | Отложенное продолжение через очередь BB | `src/server/deferred-continuation.ts` |
-| Учёт запусков и ограничения | `src/server/resource-control.ts` |
+| Учёт запусков и ограничения | `src/server/resource-control.ts`, [бюджет эпика](EPIC-BUDGET.md) |
 | Квоты Ollama/OpenRouter | `src/shared/*-usage.ts` — схемы; `src/host/*-usage-host.ts` — чтение |
 | Шаблоны, промпты, язык | `src/shared/templates.ts`, `messages.ts`, `strings.ts` |
 | Состояние панели и общие типы | `src/shared/snapshot.ts` |

@@ -37,6 +37,7 @@
 // A closed issue without the dropped label is `done` by default. bd's
 // blocked/deferred statuses project to in-progress/todo and are never ready.
 
+import {createHash} from "node:crypto";
 import type { BbPluginApi } from "@get-bb/plugin-sdk";
 import type { Workspace } from "./core";
 import { hostContract } from "../shared/host-contract";
@@ -57,6 +58,8 @@ export interface TaskTracker {
   ): Promise<{ kind: TrackerKind; override: TrackerKind | null }>;
   setConfig(workspace: Workspace, kind: TrackerKind | null): Promise<void>;
   read(scope: TrackerScope): Promise<TaskStore>;
+  /** Authoritative scope check; never infer hierarchy from ids or titles. */
+  validateEpic(scope: TrackerScope, epicId: string, taskId?: TaskId | null, isLead?: boolean): Promise<TeamTask & {scopeRevision:string}>;
   add(
     scope: TrackerScope,
     input: {
@@ -64,6 +67,8 @@ export interface TaskTracker {
       title: string;
       note: string | null;
       status: TaskStatus;
+      /** Optional Beads epic parent. Unsupported by the built-in tracker. */
+      parentId?: TaskId;
     },
   ): Promise<TeamTask>;
   update(
@@ -160,6 +165,9 @@ interface BdIssue {
   created_at?: string;
   updated_at?: string;
   priority?: number;
+  issue_type?: string;
+  parent?: string | null;
+  dependencies?: Array<{id?:string;depends_on_id?:string;type?:string;dependency_type?:string}>;
   acceptance_criteria?: string;
   design?: string;
   notes?: string;
@@ -216,6 +224,8 @@ const projectIssue = (issue: BdIssue): TeamTask => {
     if (review) task.review = review;
   }
   if (typeof issue.priority === "number") task.priority = issue.priority;
+  if (issue.issue_type) task.issueType = issue.issue_type;
+  if (typeof issue.parent === "string" && issue.parent.length > 0) task.parentId = issue.parent;
   if (issue.acceptance_criteria) task.criteria = issue.acceptance_criteria;
   if (issue.design) task.decisions = issue.design;
   if (issue.notes) task.result = issue.notes;
@@ -518,10 +528,12 @@ export function createTaskTracker(
       title: string;
       note: string | null;
       status: TaskStatus;
+      parentId?: TaskId;
     },
   ): Promise<TeamTask> => {
     const { kind } = await getConfig(scope);
     if (kind === "builtin") {
+      if (input.parentId !== undefined) throw new Error("Epic parent requires Beads; the built-in tracker has no parent-child model");
       return withLock(scope, async () => {
         const store = await builtinRead(scope);
         const result = addTask(store, input, Date.now());
@@ -529,6 +541,16 @@ export function createTaskTracker(
         options.publish(scope.projectId);
         return result.task;
       });
+    }
+    // Validate the parent's identity before creating a child. The task title
+    // or a hierarchical-looking id is not evidence of epic membership.
+    if (input.parentId !== undefined) {
+      const parent = await showIssue(scope, input.parentId);
+      if (parent.issue_type !== "epic") throw new Error("The selected parent is not a Beads epic");
+      if ((parent.labels ?? []).filter(label => label.startsWith(TEAM_LABEL_PREFIX)).length !== 1 ||
+          !(parent.labels ?? []).includes(`${TEAM_LABEL_PREFIX}${scope.team}`))
+        throw new Error("The selected epic belongs to another Team or is not assigned to this Team");
+      if (parent.status === "closed") throw new Error("Cannot create work under a closed epic");
     }
     const args = [
       "create",
@@ -541,8 +563,12 @@ export function createTaskTracker(
       `${TEAM_LABEL_PREFIX}${scope.team}`,
     ];
     if (input.note !== null) args.push("-d", input.note);
+    if (input.parentId !== undefined) args.push("--parent", String(input.parentId));
     args.push(...createStatusArgs(input.status));
-    const task = projectIssue(await bdOne(scope, args));
+    const created = await bdOne(scope, args);
+    // bd create may omit parent even when list/show expose it. Read the
+    // authoritative relation rather than copying input or inferring the id.
+    const task = projectIssue(input.parentId === undefined ? created : await showIssue(scope, created.id));
     options.publish(scope.projectId);
     return task;
   };
@@ -789,6 +815,39 @@ export function createTaskTracker(
   };
 
   return {
+    validateEpic: async (scope, epicId, taskId, isLead) => {
+      if ((await getConfig(scope)).kind !== "beads") throw new Error("Epic budgets require Beads; no built-in fallback");
+      const checkTeam = (issue: BdIssue) => {
+        const labels = (issue.labels ?? []).filter(label => label.startsWith(TEAM_LABEL_PREFIX));
+        if (labels.length !== 1 || labels[0] !== `${TEAM_LABEL_PREFIX}${scope.team}`)
+          throw new Error("Epic scope has missing, foreign or ambiguous Team labels");
+      };
+      const epic = await showIssue(scope, epicId);
+      checkTeam(epic);
+      if (epic.id !== epicId || epic.issue_type !== "epic" || epic.parent || !["open","in_progress","blocked","deferred"].includes(epic.status??""))
+        throw new Error("Select an open Beads epic belonging to this Team");
+      if (taskId !== undefined) {
+        if (taskId === null) throw new Error("Epic scope requires an explicitly assigned task");
+        if (taskId === epicId) {
+          if (!isLead) throw new Error("Only the lead may coordinate on the epic itself");
+        } else {
+          const child = await showIssue(scope, taskId);
+          checkTeam(child);
+          const parents=(child.dependencies??[]).filter(dep=>(dep.dependency_type??dep.type)==="parent-child").map(dep=>dep.id??dep.depends_on_id);
+          if (child.id !== taskId || child.parent !== epicId || parents.some(id=>id!==epicId) || child.issue_type === "epic" || !["open","in_progress","blocked","deferred"].includes(child.status??""))
+            throw new Error("Task is not an open direct child of the active epic");
+        }
+      }
+      // Only the approved requirements and identity define scope. Operational
+      // notes, budget decisions and status updates must not invalidate consent.
+      const scopeRevision=createHash("sha256").update(JSON.stringify({
+        projectId:scope.projectId,hostId:scope.hostId,path:scope.path,team:scope.team,
+        id:epic.id,type:epic.issue_type,parent:epic.parent??null,
+        title:epic.title??"",description:epic.description??"",criteria:epic.acceptance_criteria??"",
+        teamLabels:(epic.labels??[]).filter(label=>label.startsWith(TEAM_LABEL_PREFIX)).sort(),
+      })).digest("hex");
+      return {...projectIssue(epic),scopeRevision};
+    },
     getConfig,
     setConfig,
     read,

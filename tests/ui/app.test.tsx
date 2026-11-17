@@ -277,6 +277,8 @@ async function mount(
         roleRecovery: (input:{role:string;selection?:unknown})=>{
           log("roleRecovery")(input);return {threadId:roleThreads.get(input.role)??"thr_d",taskId:7,taskTitle:"Implement profile",environmentId:"env_1",actual:actualModels.get(input.role)??{provider:"codex",model:"gpt-4",reasoningLevel:"none"},revision:"preview-1",blockers:[],quota:"unknown",...options.recovery};
         },
+        epicScope:(input:unknown)=>{log("epicScope")(input);return {id:"epic-1",title:"Release profile",description:"Deliver profile",criteria:"Two accepted tasks",scopeRevision:"a".repeat(64)};},
+        epicBudget:(input:unknown)=>{log("epicBudget")(input);return snapshots[0]!.resources!;},
         packageBudget:(input:unknown)=>{log("packageBudget")(input);return snapshots[0]!.resources!;},
         continueCoordination:(input:{taskId:string|number;expectedStarts:number;expectedUsed:number})=>{
           log("continueCoordination")(input);const current=snapshots[0]!.resources!;snapshots=snapshots.map(s=>({...s,resources:{...current,blocked:null}}));return {...current,blocked:null};
@@ -378,7 +380,7 @@ describe("панель Team: дерево команд", () => {
       { ...SNAPSHOT.roles[1]!, executionState: { kind: "error", taskId: 7, errorCode: "spawn_uncertain", errorMessage: "The host disconnected during creation.", safeAction: "Inspect the prepared candidate before retrying.", atMs: 0 } },
     ] }] });
     expect(await slot.findByText("Awaiting acceptance or decision")).toBeTruthy();
-    expect(slot.getByText("Needs attention")).toBeTruthy();
+    expect(slot.getAllByText("Needs attention").length).toBeGreaterThan(0);
     expect(slot.getByRole("alert").textContent).toContain("Inspect the prepared candidate before retrying.");
     expect(slot.getByRole("alert").textContent).toContain("The host disconnected during creation.");
     slot.lifecycle.unmount();
@@ -413,13 +415,15 @@ describe("панель Team: дерево команд", () => {
     const app = await loadPluginApp(() => import("../../src/app/app"));
     expect(app.navPanels.map((panel) => panel.path)).toEqual(["team"]);
     expect(app.settingsSections.map((section) => section.id)).toEqual(["templates"]);
+    expect(app.threadContextSegments.map(section=>section.id)).toContain("lead-team");
+    expect(app.threadContextCardSections.map(section=>section.id)).toContain("lead-team");
   });
 
   it("без базы Beads: баннер и кнопка создают базу через trackerPrepare", async () => {
     const { slot, calls } = await mount({ snapshots: [{ ...SNAPSHOT, trackerError: { code: "beads_absent", message: "bd list failed (exit 1) in /ws/demo: Error: no beads database found" } }] });
     await slot.findByText("The Beads database does not exist yet — packages cannot be stored.");
     expect(slot.getByText(/no beads database found/)).toBeTruthy();
-    expect(slot.getByText(/Login form/)).toBeTruthy(); // the team still renders
+    expect(slot.getAllByText(/Login form/).length).toBeGreaterThan(0); // overview and role tree render the same current task
     fireEvent.click(slot.getByText("Create database"));
     await slot.findByText("Beads database created.");
     expect(calls.find((c) => c.method === "trackerPrepare")?.input).toEqual({ projectId: "proj_1", team: "main" });
@@ -483,8 +487,8 @@ describe("панель Team: дерево команд", () => {
     // The role starts unset, so open the picker first.
     fireEvent.click(slot.getAllByText("Select model")[0]!);
     await slot.findByLabelText("Provider ID");
-    fireEvent.change(slot.getByLabelText("Provider ID"), { target: { value: "pi" } });
-    fireEvent.change(slot.getByLabelText("Model"), { target: { value: "qwen3" } });
+    await act(async()=>{fireEvent.change(slot.getByLabelText("Provider ID"), { target: { value: "pi" } });});
+    await act(async()=>{fireEvent.change(slot.getByLabelText("Model"), { target: { value: "qwen3" } });});
     fireEvent.click(slot.getByText("Apply execution selection"));
     fireEvent.click(slot.getByText("Add"));
     await slot.findByText('Role "junior" added.');
@@ -1161,4 +1165,34 @@ it("a delayed response cannot show another project's packages after navigation",
  await act(async()=>{finishOld({projectName:"Old project",snapshots:[{...SNAPSHOT,projectId:"old"}],language:"en"});});
  expect(slot.queryByText("Old project")).toBeNull();expect(slot.queryByText("Login form")).toBeNull();
  expect(slot.getByRole("heading",{name:"New project"})).toBeTruthy();slot.lifecycle.unmount();
+});
+
+
+it("shows the shared epic allowance and saves a checked human decision without model actions",async()=>{
+ const resources:ResourceSummary={sinceMs:0,policy:{taskAttempts:8,teamStarts:null,tokens:null,minutes:null},starts:2,remainingStarts:null,reportedTokens:null,usageCoverage:"unavailable",blocked:null,holds:{},attempts:[],taskCounts:[],quotaBlocks:[],fallbacks:[],epic:{id:"epic-1",title:"Release profile",criteria:"Two accepted tasks",used:2,limit:2,remaining:0,revision:1,sinceMs:1000,blocked:"Epic budget exhausted",unattributedTasks:[{id:"outside",title:"Unrelated work"}]},epicBudgets:{"epic-1":{limit:2,used:2,revision:1,sinceMs:1000}}};
+ const {slot,calls}=await mount({snapshots:[{...SNAPSHOT,resources}]});
+ const panel=within(await slot.findByRole("region",{name:"Epic budget"}));
+ expect(panel.getByText(/Release profile.*2\/2/)).toBeTruthy();
+ expect(panel.getByText(/Unrelated work/)).toBeTruthy();
+ expect(calls.some(c=>c.method==="epicBudget")).toBe(false);
+ fireEvent.click(panel.getByText("Configure epic budget"));
+ expect((panel.getByText("Save epic budget") as HTMLButtonElement).disabled).toBe(true);
+ fireEvent.click(panel.getByText("Read epic requirements"));
+ fireEvent.click(await panel.findByLabelText("Approve these requirements and criteria"));
+ fireEvent.change(panel.getByLabelText("Total turn allowance"),{target:{value:"4"}});
+ fireEvent.change(panel.getByLabelText("Decision grounds"),{target:{value:"Two more checks agreed"}});
+ fireEvent.click(panel.getByText("Save epic budget"));
+ await panel.findByText("Epic budget saved; no model was started.");
+ expect(calls.find(c=>c.method==="epicBudget")?.input).toMatchObject({epicId:"epic-1",limit:4,expectedActiveEpicId:"epic-1",expectedRevision:1,expectedUsed:2,expectedScopeRevision:"a".repeat(64),reason:"Two more checks agreed"});
+ expect(calls.some(c=>["tell","teamSpawn","sessionRotate"].includes(c.method))).toBe(false);slot.lifecycle.unmount();
+});
+
+it("keeps compact overview visible and resource forms collapsed until requested",async()=>{
+ const {slot,calls}=await mount();
+ await slot.findByText("Decisions, limits and diagnostics");
+ const details=slot.getByText("Decisions, limits and diagnostics").closest("details")!;
+ expect(details.open).toBe(false);
+ fireEvent.click(slot.getByText("Decisions, limits and diagnostics"));expect(details.open).toBe(true);
+ expect(calls.some(c=>["roleControl","resources","teamPause","teamTell"].includes(c.method))).toBe(false);
+ slot.lifecycle.unmount();
 });

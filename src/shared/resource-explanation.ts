@@ -1,3 +1,4 @@
+import type {MessageDispatchHookDecision} from "@get-bb/plugin-sdk";
 import type {ResourceSummary} from "../server/resource-control";
 import type {Language} from "./snapshot";
 
@@ -20,4 +21,11 @@ export function resourceQueueExplanation(reason:string,language:Language):string
 /** Global resource guards plus only the selected package's allowance. */
 export function packageResourceBlock(summary:ResourceSummary,taskId:string|number|null|undefined):string|null {
  return summary.blocked??(taskId==null?null:summary.taskBlocks?.[`task:${taskId}`]??null);
+}
+
+
+/** BB validates queue reasons at 200 characters; full diagnostics stay in Team. */
+export function boundedDispatchDecision(decision:MessageDispatchHookDecision):MessageDispatchHookDecision {
+ if(decision.action!=="wait"||decision.reason.length<=200)return decision;
+ return {...decision,reason:decision.reason.slice(0,199)+"…"};
 }

@@ -220,11 +220,13 @@ receives all roles' profiles. Existing sessions are not rewritten on save.
 
 Use work titles in messages to the user, with IDs only as references. Never
 answer with a bare code such as `r20`. Check current `bb team report` before
-claiming a budget stop: the total number of starts is statistics, not a 100 cap.
+claiming a budget stop: total starts are statistics, while an explicitly selected
+epic has its own shared finite cap.
 
 The user can approve a named package's allowance in the lead chat, including a
 queued message. Direct user messages to the canonical lead can pass its package
-cap for discussion; their starts are still counted. Worker messages, automated
+cap for discussion; their starts are still counted. The shared epic cap is never
+waived, including for this discussion. Worker messages, automated
 turns/retries, manual pauses, quotas, shared token/time limits and failure/partial
 handoff holds are not waived. A mixed queue group is eligible only if it contains
 an actual user-authored, non-plugin, non-retry row.
@@ -251,6 +253,66 @@ is queued input, it is rechecked rather than duplicated; a running lead is not
 interrupted. The form reports when a notification could not be delivered. An
 old answer remains historical: new messages/reports contain current state.
 
+### Shared Beads epic budget
+
+An epic budget is opt-in and finite. Tasks and hierarchy remain in Beads; Team
+stores only the binding, decisions' technical references and admission ledger.
+The lead coordinates on the epic itself, with its Beads assignee set to the lead
+role. Executors use direct children; helpers inherit their owner's task. Every
+admission consumes the same epic allowance, alongside existing package limits.
+New children, retries, review rework, model changes and session rotation retain
+spend. A review return consumes an epic unit when its next turn is admitted;
+the separate package return counter is unchanged. This limits turns, not money
+or model requests inside a turn. BB Send-now bypasses hooks; observed unreserved
+turns are counted and hold further admissions for a manual attribution decision.
+
+Use Team → Epic budget, or these commands **in a manual terminal outside an
+agent thread**. First create/select a real Beads epic with exactly one
+`bb-team:<team>` label. This control never creates an epic implicitly.
+
+```sh
+bb team budget <epic-id> --epic --json
+# Use activeEpicId (or none), revision and used from that response:
+bb team budget <epic-id> --epic --limit <total> --expected-epic <active-id-or-none> --expected-revision <revision> --expected-used <used> --expected-scope <scopeRevision> --reason '<human decision>'
+bb team task add <role> '<title>' --parent <epic-id>
+```
+
+Inspect the requirements and criteria returned by the first command. The second
+command must include the exact displayed `scopeRevision`. In the UI, use **Read
+epic requirements**, inspect the text, and explicitly approve those requirements
+and criteria before Save. The stored revision covers the epic's identity, title,
+description and acceptance criteria; operational notes and budget decisions do
+not change it. An external requirements edit holds dispatch/admission until the
+human approves the new revision. Old epic budgets without a revision are held
+for explicit approval; no spending is reset.
+
+The limit is 1..10000 admission units. Existing reservations/turns must finish
+before activation, switching or changing a budget. Decisions are recorded in
+Beads before the budget changes; stale state or a failed tracker write refuses
+the update. Saving sends no message or new dispatch request. Inspect the state
+before manually continuing work. The supported agent-thread CLI refuses changes to this shared budget, including
+from the lead during a user conversation. Manual resource changes also require
+that no project turn/background operation or outstanding admission is live.
+Direct-user-control lead chat keeps its existing package-only exception. Increasing a
+package budget cannot bypass the epic cap, quota, failure or scope hold.
+
+Closed/foreign/ambiguous epics, unrelated tasks and unavailable Beads hold new
+admissions. Dispatch and admission both check membership; an external Beads edit
+can race a read, but it cannot rewrite already charged epic IDs. Nested epics
+and automatic planning are not supported. Built-in tracking explicitly refuses
+epic activation. Teams without a selected epic keep the previous behavior.
+Switching to another epic preserves each epic's history. This first slice does
+not expose a command to clear an active binding or switch it to built-in.
+
+RPC authority boundary: BB SDK reports browser, CLI and agent RPC as the same
+`client` kind. Team therefore rejects mutation calls from other plugins and
+holds manual resource RPC while project turns/background operations or resource
+reservations are live. Full scans fail closed on errors/truncation. An inactive
+errored session can still receive a human recovery decision. This prevents normal
+active agent RPC/CLI escalation; it is not authentication of a human against
+arbitrary host code. A host operator or detached program sharing local BB access
+remains trusted. No claim of cryptographic client isolation is made.
+
 ### Finite execution budgets per work package
 
 Each work package has its own finite allowance: by default 8 units for an
@@ -259,7 +321,8 @@ processing a new message until a response or stop, potentially using several
 actions and model requests. Start admissions (including reservations), helper
 starts and review returns count toward the same task ID across models and
 sessions. A distinct package has a separate allowance; exhausting one package
-does not stop other packages. The cumulative team start count is statistics only.
+does not stop other packages unless they share an exhausted epic budget. The
+cumulative team start count is statistics only.
 
 The main panel shows each open package's usage and editable limit. A grounded
 change is saved in the selected tracker, with a stale-form check; it never resets

@@ -574,6 +574,7 @@ const THREAD_SCAN_MAX = 5000;
 export async function listProjectThreads(
   bb: BbPluginApi,
   projectId: string,
+  requireComplete = false,
 ): Promise<ThreadDto[]> {
   const all: ThreadDto[] = [];
   for (let offset = 0; offset < THREAD_SCAN_MAX; offset += THREAD_PAGE) {
@@ -585,6 +586,7 @@ export async function listProjectThreads(
     });
     all.push(...page);
     if (page.length < THREAD_PAGE) break;
+    if(requireComplete&&offset+THREAD_PAGE>=THREAD_SCAN_MAX)throw new Error("Project thread scan is incomplete; resource changes are held");
   }
   return all.filter((thread) => thread.archivedAt === null);
 }

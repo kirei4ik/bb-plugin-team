@@ -108,6 +108,24 @@ describe("host entry", () => {
       ).toContain(issue.id);
     });
 
+    it("allows a child issue under a Beads epic without relaxing other host flags", async () => {
+      const epicResult = await call<{ ok: boolean; stdout: string }>("bd", {
+        cwd: repo,
+        args: ["create", "Host epic", "--type", "epic", "-l", "bb-team:host"],
+      });
+      expect(epicResult.ok).toBe(true);
+      const epic = JSON.parse(epicResult.stdout) as { id: string };
+      const childResult = await call<{ ok: boolean; stdout: string }>("bd", {
+        cwd: repo,
+        args: ["create", "Host child", "--type", "task", "--parent", epic.id, "-l", "bb-team:host"],
+      });
+      expect(childResult.ok).toBe(true);
+      const child = JSON.parse(childResult.stdout) as { id: string };
+      expect(child.id).toBeTruthy();
+      // Unknown flags must still be rejected before invoking bd.
+      await expect(call("bd", { cwd: repo, args: ["create", "Bad", "--db", "/tmp/external"] })).rejects.toThrow();
+    });
+
     it("reports a nonzero exit explicitly (no auto-init, no fallback)", async () => {
       const dir = await tempDir("host-bd-empty-");
       dirs.push(dir);

@@ -1,7 +1,7 @@
 import {createHash} from "node:crypto";
 import {z} from "zod";
 import type {BbPluginApi} from "@get-bb/plugin-sdk";
-import type {TaskId} from "../shared/snapshot";
+import type {TaskId,ContinuationView} from "../shared/snapshot";
 
 export const deferredContinuationSchema=z.object({
  threadId:z.string(),taskId:z.union([z.string(),z.number()]).nullable(),sendAt:z.number().finite(),
@@ -15,6 +15,24 @@ export async function readDeferred(bb:BbPluginApi,key:string):Promise<DeferredCo
  const raw=await bb.storage.kv.get(key);if(raw==null)return null;
  return deferredContinuationSchema.parse(raw); // damaged intent must not allow a duplicate
 }
+/** Reads the source queue without changing intent, messages or dispatch. */
+export async function inspectDeferred(bb:BbPluginApi,projectId:string,team:string,role:string,currentThreadId:string|null):Promise<ContinuationView|null>{
+ const unknown:ContinuationView={role,threadId:currentThreadId??"",taskId:null,sendAt:null,stage:"needs-decision",queuedMessageId:null,queueState:null,queueSendAt:null,source:"bb-queue",reason:"Continuation state could not be verified; inspect the thread queue"};
+ try {
+  const record=await readDeferred(bb,deferredKey(projectId,team,role));if(!record)return null;
+  // Return only the public projection; fingerprints and message content stay server-side.
+  const {threadId,taskId,sendAt,stage,queuedMessageId,reason}=record;
+  const result:ContinuationView={role,threadId,taskId,sendAt,stage,queuedMessageId,reason,source:"bb-queue",queueState:null,queueSendAt:null};
+  const queue=await bb.sdk.threads.queuedMessages.list({threadId});
+  const row=queuedMessageId?queue.find(q=>q.id===queuedMessageId):undefined;
+  if(row){result.queueState=row.state;result.queueSendAt=row.sendAt;}
+  if(threadId!==currentThreadId||stage!=="released"&&(!row||!["queued","scheduled","waiting"].includes(row.state)||record.fingerprint!==null&&queuedFingerprint(row)!==record.fingerprint||stage==="scheduled"&&row.sendAt!==sendAt)){
+   result.stage="needs-decision";result.reason="Continuation or native queue changed; inspect before continuing";
+  }
+  return result;
+ }catch{return unknown;}
+}
+
 // State/retry timestamps can change while core waits; the actual input and
 // execution selection must stay exactly the ones the user deferred.
 export function queuedFingerprint(row:Record<string,unknown>){

@@ -1,16 +1,16 @@
 import { inspectBindings, repairBinding } from "./bindings";
 import { executionDiagnostic } from "../shared/execution-diagnostic";
 import {executionEventSchema} from "../shared/execution-event";
-import {resourceQueueExplanation,packageResourceBlock} from "../shared/resource-explanation";
+import {resourceQueueExplanation,packageResourceBlock,boundedDispatchDecision} from "../shared/resource-explanation";
 import {sessionRecoverySchema,sessionRecoveryActionSchema,type SessionRecovery} from "../shared/session-recovery";
 import {executionJournal, JOURNAL_RETENTION_DAYS, JOURNAL_MAX_EVENTS} from "./execution-journal";
 import {openRouterUsageSchema,emptyOpenRouter,openRouterHeadroom,isOpenRouterModel,quotaSourceSchema,type OpenRouterUsage,type QuotaSource} from "../shared/openrouter-usage";
-import { queuedFingerprint, deferredKey, deferredContinuationSchema, readDeferred, scheduleDeferred, cancelDeferred } from "./deferred-continuation";
+import { queuedFingerprint, deferredKey, deferredContinuationSchema, readDeferred, scheduleDeferred, cancelDeferred, inspectDeferred } from "./deferred-continuation";
 import { recoveryViewSchema, manualExecutionApprovalSchema, type RecoveryView, type RecoveryBlocker } from "../shared/recovery-view";
 import { hostContract } from "../shared/host-contract";
 import { ollamaUsageSchema, isOllamaCloud, exhaustedOllama, quotaHeadroom, quotaPolicySchema, DEFAULT_QUOTA_POLICY, type OllamaUsage } from "../shared/ollama-usage";
 import { verifyQuotaBoundary } from "./checkpoint";
-import { ResourceControl, resourcePolicySchema, withResourceResults, confirmedQuota, independentQuotaSelection, type ResourceOwner, type ResourceSummary } from "./resource-control";
+import { ResourceControl, epicBudgetChangeSchema, type EpicBudgetChange, resourcePolicySchema, withResourceResults, confirmedQuota, independentQuotaSelection, type ResourceOwner, type ResourceSummary } from "./resource-control";
 import { executionPolicySchema, withExecutionProfile, type ExecutionFallbackSelection } from "../shared/execution-policy";
 // bb-plugin-team — role-based agent teams for a project.
 //
@@ -35,6 +35,9 @@ import {
   defineRpcContract,
   experimental_PluginRpcRefusal,
   type BbPluginApi,
+  type MessageDispatchHookContext,
+  type MessageDispatchHookDecision,
+  type ExperimentalPluginRpcHandlerContext,
   type PluginMentionItem,
 } from "@get-bb/plugin-sdk";
 import { dump as dumpYaml, load as loadYaml } from "js-yaml";
@@ -477,6 +480,14 @@ export const rpcContract = defineRpcContract({
     input:z.object({projectId:projectIdSchema,team:teamSchema,role:z.string(),action:z.enum(["status","pause","resume","switch"]),expectedThreadId:z.string().optional(),selection:executionPolicySchema.shape.fallbacks.element.optional(),approveSelection:z.boolean().optional(),recoverFromWorkspace:z.boolean().optional(),expectedRecoveryRevision:z.string().optional()}).strict(),
     output:z.object({paused:z.boolean(),threadId:z.string().nullable(),fallbacks:z.array(executionPolicySchema.shape.fallbacks.element),actual:executionPolicySchema.shape.fallbacks.element.nullable().optional()}),
   },
+  epicScope: {
+    input:z.object({projectId:projectIdSchema,team:teamSchema,epicId:z.string().trim().min(1).max(200)}).strict(),
+    output:z.object({id:z.string(),title:z.string(),description:z.string().nullable(),criteria:z.string().nullable(),scopeRevision:z.string()}),
+  },
+  epicBudget: {
+    input:epicBudgetChangeSchema.extend({projectId:projectIdSchema,team:teamSchema}).strict(),
+    output:z.custom<ResourceSummary>(),
+  },
   packageBudget: {
     input:z.object({projectId:projectIdSchema,team:teamSchema,taskId:z.union([z.string().min(1).max(200),z.number().int().positive()]),limit:z.number().int().min(1).max(1000),expectedLimit:z.number().int().min(1).max(1000),expectedUsed:z.number().int().nonnegative(),reason:z.string().trim().min(1).max(4000)}).strict(),
     output:z.custom<ResourceSummary>(),
@@ -509,6 +520,7 @@ export const rpcContract = defineRpcContract({
         title: z.string().min(1).max(300),
         note: z.string().max(2000).optional(),
         send: z.boolean(),
+        parentId:z.string().min(1).max(200).optional(),
       })
       .strict(),
     output: z.object({ task: taskSchema, sentTo: z.string().nullable(), sendError: z.string().nullable() }),
@@ -886,6 +898,7 @@ export default async function plugin(bb: BbPluginApi) {
       }
       for (const team of await allTeams(workspace, scan)) {
         const scope = {...workspace, team};
+        if((await resources.inspect(scope)).epic)throw new PluginCliError("Active epic requires Beads; changing tracker cannot bypass its budget",{code:"epic_scope"});
         // Missing database is still an explicit error on reads, but it must not
         // prevent the human from explicitly selecting the built-in tracker.
         let tasks: TaskStore;
@@ -938,7 +951,11 @@ export default async function plugin(bb: BbPluginApi) {
     const isLead=core.semanticChecks(loaded.config,t).lead.name===mark.role;
     return {projectId:first.projectId,team:mark.team,role:mark.role,taskId:bound??null,ownerThreadId,hostId,isLead};
   };
-  const resources=new ResourceControl(bb,resourceOwner,publishChange);
+  const resources=new ResourceControl(bb,resourceOwner,publishChange,Date.now,async(owner,epicId)=>{
+    const {t}=await loadLang();const scope=await scopeFor(owner.projectId,owner.team,t);
+    const epic=await tracker.validateEpic(scope,epicId,owner.taskId,owner.isLead);
+    return {title:epic.title,...(epic.criteria?{criteria:epic.criteria}:{}),scopeRevision:epic.scopeRevision};
+  });
   const quotaHost=bb.hosts.experimental_client({contract:hostContract});
   const quotaPending=new Map<string,Promise<OllamaUsage>>();
   const cloudUsage=async(hostId:string,refresh=false):Promise<OllamaUsage>=>{
@@ -1022,7 +1039,7 @@ export default async function plugin(bb: BbPluginApi) {
     return parsed.success?parsed.data:DEFAULT_QUOTA_POLICY;
   };
 
-  bb.experimental_hooks.on("message.dispatch", async (ctx) => {
+  const dispatchMessage = async (ctx:MessageDispatchHookContext):Promise<MessageDispatchHookDecision> => {
     const meta = await bb.sdk.threads.getPluginMetadata({threadId:ctx.thread.id}) as Record<string,unknown>;
     if (meta.teamReplacement === true) return {action:"wait" as const,reason:"Team is preparing this replacement session; the initial prompt stays queued until the role switch completes."};
     const mark=readTeamMark(meta);
@@ -1097,7 +1114,8 @@ export default async function plugin(bb: BbPluginApi) {
       await bb.storage.kv.set(key,{...scheduled,stage:"released",reason:null});publishChange(ctx.thread.projectId);
     }
     return admission.action==="wait"?{...admission,reason:resourceQueueExplanation(admission.reason,currentLang)}:admission;
-  });
+  };
+  bb.experimental_hooks.on("message.dispatch",async ctx=>boundedDispatchDecision(await dispatchMessage(ctx)));
 
   /** Team context: config (if any), lead, role threads and helpers. */
   const teamContext = async (scope: Scope, t: Strings) => {
@@ -1220,6 +1238,7 @@ export default async function plugin(bb: BbPluginApi) {
   };
   const deliverPackage = async (scope: Scope, task: TeamTask, target: TeamThreadRow, lead: string | null, senderThreadId?: string) => {
     await assertRoleAvailable(scope, task.role);
+    await resources.assertDispatch({...scope,role:task.role,taskId:task.id,ownerThreadId:target.threadId,isLead:task.role===lead});
     const key = executionKey(scope, task.id);
     const prior = await bb.storage.kv.get<{ delivery: string }>(key);
     if (prior) throw new PluginCliError(`Task ${task.id} already has a delivery record (${prior.delivery}); inspect its thread before sending another message`, { code: "delivery_exists" });
@@ -1278,13 +1297,14 @@ export default async function plugin(bb: BbPluginApi) {
     const target = rows.get(role)?.[0];
     if (!target || RUNNING.includes(target.status)) return;
     if (await bb.storage.kv.get(sessionTaskKey(scope,target.threadId)) !== undefined) return;
+    await resources.assertDispatch({...scope,role,taskId:next.id,ownerThreadId:target.threadId,isLead:role===lead});
     const {task} = await tracker.update(scope, next.id, {status: "in-progress"});
     await deliverPackage(scope, task, target, lead);
   };
 
   const addPackage = async (
     scope: Scope,
-    input: { role: string; title: string; note: string | null; send: boolean },
+    input: { role: string; title: string; note: string | null; send: boolean; parentId?:string },
     t: Strings, m: Messages, senderThreadId?: string,
   ): Promise<{ task: TeamTask; sentTo: string | null; busy: TeamTask[]; sendError: string | null }> =>
     withScopeLock(scope, async () => {
@@ -1298,11 +1318,14 @@ export default async function plugin(bb: BbPluginApi) {
       const busy = busyTasks(await readTasks(scope), input.role);
       const consumed = target ? await bb.storage.kv.get(sessionTaskKey(scope,target.threadId)) : undefined;
       const send = input.send && target && consumed === undefined && busy.length === 0 && !RUNNING.includes(target.status) && !(await readPause(scope));
-      const task = await tracker.add(scope, {...input, status: send ? "in-progress" : "todo"});
+      const task = await tracker.add(scope, {...input, status: "todo"});
       await resources.pinPackages(scope,[task],lead);
       let sentTo: string | null = null, sendError: string | null = null;
       if (send && target) {
-        try { await deliverPackage(scope, task, target, lead, senderThreadId); sentTo = target.threadId; }
+        try {
+          await resources.assertDispatch({...scope,role:task.role,taskId:task.id,ownerThreadId:target.threadId,isLead:task.role===lead});
+          Object.assign(task,(await tracker.update(scope,task.id,{status:"in-progress"})).task);
+          await deliverPackage(scope, task, target, lead, senderThreadId); sentTo = target.threadId; }
         catch (error) { sendError = (error as Error).message; }
       }
       // A new package can make replacing a consumed session worthwhile;
@@ -1362,19 +1385,56 @@ export default async function plugin(bb: BbPluginApi) {
     return { caller: "executor", callerRole: mark.role };
   };
 
-  const notifyBudgetIncrease=async(scope:Scope,task:TeamTask,oldLimit:number,limit:number,used:number,reason:string,t:Strings)=>{
+  const notifyBudgetIncrease=async(scope:Scope,task:TeamTask,oldLimit:number,limit:number,used:number,reason:string,t:Strings,epic?:ResourceSummary["epic"])=>{
     try{
       const {rows,lead}=await teamContext(scope,t);const targets=lead?rows.get(lead)??[]:[];
       if(targets.length!==1)return "unavailable" as const;
       if(targets[0]!.status!=="idle")return "busy" as const;
       const threadId=targets[0]!.threadId;
       if((await bb.sdk.threads.queuedMessages.list({threadId})).length)return "queued" as const;
-      const text=currentLang==="ru"?`Пользователь изменил лимит пакета «${task.title}» (${task.id}): ${oldLimit} → ${limit}, учтено ${used}. Основание: ${reason}. Общего лимита запусков команды нет; прежнее 100/100 больше не ограничивает работу. Сначала проверь актуальный bb team report, затем продолжи только разрешённую работу в пределах пакетов и квот. В ответе называй работы по названию, а не только ID.`:`The user changed "${task.title}" (${task.id}) allowance: ${oldLimit} → ${limit}, ${used} used. Grounds: ${reason}. There is no team-wide start cap. Check current bb team report, then continue authorized work within package budgets and quotas. Use work titles in replies, not bare IDs.`;
+      const text=currentLang==="ru"?`Пользователь изменил лимит пакета «${task.title}» (${task.id}): ${oldLimit} → ${limit}, учтено ${used}. Основание: ${reason}. ${epic?`Общий бюджет эпика «${epic.id}»: ${epic.used}/${epic.limit}; он продолжает действовать.`:"Общего лимита запусков команды нет; прежнее 100/100 больше не ограничивает работу."} Сначала проверь актуальный bb team report, затем продолжи только разрешённую работу в пределах пакетов и квот. В ответе называй работы по названию, а не только ID.`:`The user changed "${task.title}" (${task.id}) allowance: ${oldLimit} → ${limit}, ${used} used. Grounds: ${reason}. ${epic?`Shared epic budget ${epic.id}: ${epic.used}/${epic.limit}; it still applies.`:"There is no team-wide start cap."} Check current bb team report, then continue authorized work within package budgets and quotas. Use work titles in replies, not bare IDs.`;
       await bb.sdk.threads.send({threadId,originPluginId:bb.pluginId,mode:"auto",input:[{type:"text",text,mentions:[]}]});return "sent" as const;
     }catch{bb.log.warn("Budget saved; lead notification could not be delivered");return "unavailable" as const;}
   };
 
-  const changePackageBudget=async(scope:Scope,input:{taskId:TaskId;limit:number;expectedLimit:number;expectedUsed:number;reason:string},t:Strings,callerThreadId?:string)=>withScopeLock(scope,async()=>{
+  // RPC identifies app/CLI/agents alike as client. Refuse model-initiated
+  // mutations while any project turn/operation is live; never trust an input
+  // field claiming a human caller. Errored but inactive sessions remain
+  // recoverable through the existing manual decision panel.
+  const assertProjectResourceQuiescent=async(projectId:string)=>{
+    try {
+      const threads=await core.listProjectThreads(bb,projectId,true);
+      if(threads.some(thread=>!["idle","error"].includes(thread.status)||thread.hasPendingInteraction||
+        Object.entries(thread.activity??{}).some(([key,value])=>key.startsWith("active")&&typeof value==="number"&&value>0)))
+        throw new Error("Finish project agent turns and background operations before a manual RPC resource decision");
+    }catch(error){throw new experimental_PluginRpcRefusal({code:"conflict",message:error instanceof Error?error.message:"Project execution state could not be verified"});}
+  };
+  const assertManualResourceRpc=async(projectId:string,ctx:ExperimentalPluginRpcHandlerContext)=>{
+    if(ctx.experimental_caller.kind!=="client")throw new experimental_PluginRpcRefusal({code:"forbidden",message:"Resource decisions require a manual client action"});
+    await assertProjectResourceQuiescent(projectId);
+  };
+
+  const changeEpicBudget=async(scope:Scope,input:EpicBudgetChange,t:Strings,callerThreadId?:string)=>withScopeLock(scope,async()=>{
+    // This deterministic control is for humans. A model cannot raise its own cap.
+    if(callerThreadId)throw new PluginCliError("Epic budgets require a manual UI or terminal decision outside an agent thread",{code:"user_approval_required"});
+    const change=epicBudgetChangeSchema.parse(input);
+    const result=await resources.setEpicBudget(scope,change,async()=>{
+      const epic=await tracker.validateEpic(scope,change.epicId);
+      await assertProjectResourceQuiescent(scope.projectId);
+      return {scopeRevision:epic.scopeRevision};
+    },async()=>{
+      const epic=await tracker.validateEpic(scope,change.epicId);
+      if(epic.scopeRevision!==change.expectedScopeRevision)throw new Error("Epic scope changed; inspect and approve the current requirements first");
+      const decisions=[epic.decisions,`Epic budget: limit ${change.limit}; revision ${change.expectedRevision} → ${change.expectedRevision+1}; ${change.expectedUsed} already used; approved scope ${change.expectedScopeRevision}; manual decision. ${change.reason}`].filter(Boolean).join("\n\n");
+      if(decisions.length>24000)throw new Error("Decision history is full");
+      await tracker.update(scope,change.epicId,{decisions});
+    });
+    publishChange(scope.projectId);
+    // Deliberately no new message, dispatch or recheck here: saving starts no model.
+    return withResourceResults(result,(await readTasks(scope)).tasks);
+  });
+
+  const changePackageBudget=async(scope:Scope,input:{taskId:TaskId;limit:number;expectedLimit:number;expectedUsed:number;reason:string},t:Strings,callerThreadId?:string,requireQuiescent=false)=>withScopeLock(scope,async()=>{
     const {taskId,limit,expectedLimit,expectedUsed}=input;
     const reason=input.reason.trim();if(!reason||reason.length>4000)throw new PluginCliError("State the user's concrete budget decision",{code:"invalid_value"});
     const task=(await readTasks(scope)).tasks.find(task=>task.id===taskId&&["todo","in-progress","review"].includes(task.status));
@@ -1382,6 +1442,7 @@ export default async function plugin(bb: BbPluginApi) {
     if(!task||!loaded?.config.roles.some(r=>r.name===task.role))throw new PluginCliError("Open package or assigned role changed; refresh",{code:"conflict"});
     const {caller}=await classifyCaller(scope,callerThreadId,t);
     if(caller==="executor")throw new PluginCliError("Only the user or lead can change a package budget",{code:"task_forbidden"});
+    if(caller==="manual"){await assertProjectResourceQuiescent(scope.projectId);requireQuiescent=true;}
     let approval="manual";
     if(caller==="lead"){
       const thread=await bb.sdk.threads.get({threadId:callerThreadId!});const attempt=await resources.userControlTurn(callerThreadId!);
@@ -1390,9 +1451,9 @@ export default async function plugin(bb: BbPluginApi) {
     }
     const decisions=[task.decisions,`Package start budget: ${expectedLimit} → ${limit}; already used ${expectedUsed}; ${approval}. ${reason}`].filter(Boolean).join("\n\n");
     if(decisions.length>24000)throw new PluginCliError("Decision history is full",{code:"conflict"});
-    const result=await resources.setPackageLimit({projectId:scope.projectId,team:scope.team,role:task.role,taskId,ownerThreadId:"",hostId:scope.hostId,isLead:task.role===lead},limit,expectedLimit,expectedUsed,async()=>{await tracker.update(scope,taskId,{decisions});});
+    const result=await resources.setPackageLimit({projectId:scope.projectId,team:scope.team,role:task.role,taskId,ownerThreadId:"",hostId:scope.hostId,isLead:task.role===lead},limit,expectedLimit,expectedUsed,async()=>{await tracker.update(scope,taskId,{decisions});},requireQuiescent);
     publishChange(scope.projectId);await bb.experimental_hooks.recheck("message.dispatch");
-    if(limit>expectedLimit&&caller!=="lead")result.budgetNotice=await notifyBudgetIncrease(scope,task,expectedLimit,limit,expectedUsed,reason,t);
+    if(limit>expectedLimit&&caller!=="lead")result.budgetNotice=await notifyBudgetIncrease(scope,task,expectedLimit,limit,expectedUsed,reason,t,result.epic);
     return result;
   });
 
@@ -1475,6 +1536,10 @@ export default async function plugin(bb: BbPluginApi) {
           const assigned = await bb.storage.kv.get<TaskId>(sessionTaskKey(scope,reworkTarget.threadId));
           if (assigned != null && assigned !== id) throw new PluginCliError("This employee session belongs to another task; resolve its assignment before requesting rework",{code:"session_consumed"});
         }
+      }
+      if(patch.status==="in-progress"&&previous.status==="todo"){
+        const {rows,lead}=await teamContext(scope,t);const target=rows.get(previous.role)?.[0];
+        if(target)await resources.assertDispatch({...scope,role:previous.role,taskId:id,ownerThreadId:target.threadId,isLead:previous.role===lead});
       }
       if (gate.submission || gate.decision) {
         await tracker.review(scope, id, {
@@ -2636,6 +2701,7 @@ export default async function plugin(bb: BbPluginApi) {
       leadRole: lead,
       paused,
       roles: withExecutionState,
+      continuations:(await Promise.all(withExecutionState.map(role=>inspectDeferred(bb,scope.projectId,scope.team,role.name,role.threads.length===1?role.threads[0]!.threadId:null)))).filter((view):view is NonNullable<typeof view>=>view!==null),
       executionEvents: executionJournal(bb).list(scope.projectId,scope.team).slice(0,100),
       generatedAtMs: Date.now(),
       tracker: (await tracker.getConfig(scope)).kind,
@@ -3472,7 +3538,8 @@ export default async function plugin(bb: BbPluginApi) {
     async roleRecovery({projectId,team,role,selection}) {
       const {t}=await loadLang();return inspectRoleRecovery(await scopeFor(projectId,team,t),role,selection);
     },
-    async continueCoordination({projectId,team,taskId,expectedStarts,expectedUsed}) {
+    async continueCoordination({projectId,team,taskId,expectedStarts,expectedUsed},ctx) {
+      await assertManualResourceRpc(projectId,ctx);
       const {t}=await loadLang();const scope=await scopeFor(projectId,team,t);
       return withScopeLock(scope,async()=>{
         const {lead,rows}=await teamContext(scope,t);const list=lead?rows.get(lead)??[]:[];
@@ -3482,12 +3549,12 @@ export default async function plugin(bb: BbPluginApi) {
         if(!owner||owner.taskId!==taskId)throw new experimental_PluginRpcRefusal({code:"conflict",message:"Coordination task is no longer bound"});
         const reason=currentLang==="ru"?`Пользователь разрешил до 4 дополнительных запусков руководителя по задаче «${task.title}»: проверить текущий результат, принять или вернуть конкретные замечания. Общие лимиты и квоты провайдеров не изменяются.`:`User allowed up to four additional lead starts for "${task.title}": inspect the current result, accept it or return concrete feedback. Other budgets and provider quotas are unchanged.`;
         const decisions=[task.decisions,reason].filter(Boolean).join("\n\n");if(decisions.length>24000)throw new experimental_PluginRpcRefusal({code:"conflict",message:"Decision history is full; inspect the task manually"});
-        const result=await resources.extendCoordination(owner,expectedStarts,expectedUsed,async()=>{await tracker.update(scope,taskId,{decisions});});
+        const result=await resources.extendCoordination(owner,expectedStarts,expectedUsed,async()=>{await tracker.update(scope,taskId,{decisions});},true);
         publishChange(projectId);await bb.experimental_hooks.recheck("message.dispatch");
-        result.budgetNotice=await notifyBudgetIncrease(scope,task,expectedUsed,expectedUsed+4,expectedUsed,reason,t);return result;
+        result.budgetNotice=await notifyBudgetIncrease(scope,task,expectedUsed,expectedUsed+4,expectedUsed,reason,t,result.epic);return result;
       });
     },
-    async roleControl({projectId,team,role:roleName,action,expectedThreadId,selection:requestedSelection,approveSelection,recoverFromWorkspace,expectedRecoveryRevision}) {
+    async roleControl({projectId,team,role:roleName,action,expectedThreadId,selection:requestedSelection,approveSelection,recoverFromWorkspace,expectedRecoveryRevision},ctx) {
       const {t}=await loadLang();const scope=await scopeFor(projectId,team,t);
       return withScopeLock(scope,async()=>{
         const {loaded,rows}=await teamContext(scope,t);
@@ -3510,6 +3577,22 @@ export default async function plugin(bb: BbPluginApi) {
               if(owner){await resources.confirmOpenRouterCapacity(owner,actual.provider,actual.model);if(hold)await resources.decide(owner,"User resumed after a fresh OpenRouter quota check",undefined,owner.taskId??undefined,owner.role,"capacity");}
             }
             await bb.storage.kv.delete(routerWaitKey({...scope,role:roleName}));
+          }
+          if(actual.provider==="codex"){
+            const owner=await resourceOwner(threadId!);const summary=await resources.inspect(scope);
+            const hold=owner?summary.holds[owner.taskId===null?`role:${owner.role}`:`task:${owner.taskId}`]:undefined;
+            if(owner&&hold&&["rate-limit","budget-exceeded"].includes(hold)){
+              await assertManualResourceRpc(projectId,ctx);
+              await resources.recoverCodexCapacity(owner,async()=>{
+                if(!owner.hostId)throw new Error("Codex execution host is unknown");
+                const env=await bb.sdk.projects.machineEnvironment({projectId});
+                if([...env.variables,...env.inheritedVariables].some(v=>/^(CODEX_|OPENAI_|HOME$|XDG_)/i.test(v.name)))throw new Error("Codex credential/environment overrides require independent capacity verification");
+                const usage=(await bb.sdk.system.usageLimits({hostId:owner.hostId,providerId:"codex",refresh:true})).codex;
+                const threshold=(await readQuotaPolicy(scope)).pauseBelowPercent;
+                if(!usage||usage.status!=="ok"||!usage.windows.length||usage.windows.some(w=>!Number.isFinite(w.usedPercent)||w.usedPercent<0||w.usedPercent>100||100-w.usedPercent<=threshold))throw new Error("Fresh Codex quota is low or unknown; wait for all limiting windows to reset");
+                await assertManualResourceRpc(projectId,ctx);
+              });
+            }
           }
           if(isOllamaCloud(actual.provider,actual.model)){
             const owner=await resourceOwner(threadId!);const summary=await resources.inspect(scope);
@@ -3597,13 +3680,25 @@ export default async function plugin(bb: BbPluginApi) {
         return {paused:await isRolePaused(scope,roleName),threadId,fallbacks:configured.executionPolicy?.fallbacks??[],actual:actual.success?actual.data:null};
       });
     },
-    async packageBudget({projectId,team,taskId,limit,expectedLimit,expectedUsed,reason}) {
+    async epicScope({projectId,team,epicId}) {
       const {t}=await loadLang();const scope=await scopeFor(projectId,team,t);
-      return changePackageBudget(scope,{taskId,limit,expectedLimit,expectedUsed,reason},t);
+      const epic=await tracker.validateEpic(scope,epicId);
+      return {id:String(epic.id),title:epic.title,description:epic.note,criteria:epic.criteria??null,scopeRevision:epic.scopeRevision};
     },
-    async resources({projectId,team,reason,role,policy,taskId}) {
+    async epicBudget({projectId,team,...input},ctx) {
+      await assertManualResourceRpc(projectId,ctx);
+      const {t}=await loadLang();const scope=await scopeFor(projectId,team,t);
+      return changeEpicBudget(scope,input,t);
+    },
+    async packageBudget({projectId,team,taskId,limit,expectedLimit,expectedUsed,reason},ctx) {
+      await assertManualResourceRpc(projectId,ctx);
+      const {t}=await loadLang();const scope=await scopeFor(projectId,team,t);
+      return changePackageBudget(scope,{taskId,limit,expectedLimit,expectedUsed,reason},t,undefined,true);
+    },
+    async resources({projectId,team,reason,role,policy,taskId},ctx) {
       const {t}=await loadLang();const scope=await scopeFor(projectId,team,t);
       if(!reason){if(policy||taskId!==undefined||role)throw new experimental_PluginRpcRefusal({code:"invalid",message:"State the concrete resource decision"});return withResourceResults(await resources.inspect(scope),(await readTasks(scope)).tasks);}
+      await assertManualResourceRpc(projectId,ctx);
       if(taskId!==undefined){
         const task=(await readTasks(scope)).tasks.find(t=>t.id===taskId);if(!task)throw new experimental_PluginRpcRefusal({code:"not_found",message:"Task missing"});
         const intent=await readReplacementIntent(bb,scope.projectId,scope.team,task.role);
@@ -3611,7 +3706,7 @@ export default async function plugin(bb: BbPluginApi) {
         await tracker.review(scope,taskId,{decision:{decision:"changes-requested",reason,decidedBy:"manual",basis:"manual",atMs:Date.now()}});
       }
       if(policy){const {lead}=await teamContext(scope,t);await resources.pinPackages(scope,(await readTasks(scope)).tasks,lead);}
-      const result=await resources.decide(scope,reason,policy,taskId,role);publishChange(projectId);
+      const result=await resources.decide(scope,reason,policy,taskId,role,"tracker",true);publishChange(projectId);
       await bb.experimental_hooks.recheck("message.dispatch");return withResourceResults(result,(await readTasks(scope)).tasks);
     },
     async setVersioned({ projectId, team, versioned }) {
@@ -3631,10 +3726,10 @@ export default async function plugin(bb: BbPluginApi) {
         paused: (await readPause(scope)) !== null,
       };
     },
-    async taskAdd({ projectId, team, role, title, note, send }) {
+    async taskAdd({ projectId, team, role, title, note, send, parentId }) {
       const { t, m } = await loadLang();
       const scope = await scopeFor(projectId, team, t);
-      const result = await addPackage(scope, { role, title, note: note ?? null, send }, t, m);
+      const result = await addPackage(scope, { role, title, note: note ?? null, send, parentId }, t, m);
       return { task: result.task, sentTo: result.sentTo, sendError: result.sendError };
     },
     async taskUpdate({ projectId, team, id, status, review, acceptReason, returnReason, expectedSubmissionId }) {
@@ -4081,11 +4176,25 @@ export default async function plugin(bb: BbPluginApi) {
         }),
 
         budget: cliCommand({
-          summary:"Inspect a work package budget or record the user's approved limit from chat",
+          summary:"Inspect or change a package budget; --epic selects a shared Beads epic budget",
           positionals:[{name:"id",required:true,description:"Work package ID"}],
-          options:{project:PROJECT_OPTION,team:TEAM_OPTION,json:JSON_OPTION,limit:{type:"string",description:"Approved total allowance (1..1000), including already used starts"},"expected-limit":{type:"string",description:"Current limit shown by budget"},"expected-used":{type:"string",description:"Current usage shown by budget"},reason:{type:"string",description:"User's explicit decision and grounds"}},
+          options:{project:PROJECT_OPTION,team:TEAM_OPTION,json:JSON_OPTION,epic:{type:"boolean",description:"Inspect or set a shared Beads epic budget"},"expected-epic":{type:"string",description:"Current active epic ID, or none"},"expected-revision":{type:"string",description:"Selected epic budget revision, or 0 for a new budget"},"expected-scope":{type:"string",description:"Exact scopeRevision inspected and approved by the human"},limit:{type:"string",description:"Approved total allowance (packages 1..1000, epics 1..10000), including usage"},"expected-limit":{type:"string",description:"Current limit shown by budget"},"expected-used":{type:"string",description:"Current usage shown by budget"},reason:{type:"string",description:"User's explicit decision and grounds"}},
           async run(input,ctx){
-            const {t}=await loadLang();const scope=await resolveScope(input.options,ctx,t);const taskId=parseTaskId(input.positionals.id!);
+            const {t}=await loadLang();const scope=await resolveScope(input.options,ctx,t);
+            if(input.options.epic){
+              const epicId=input.positionals.id!;const epic=await tracker.validateEpic(scope,epicId);
+              let state=await resources.inspect(scope);
+              if(input.options.limit!==undefined){
+                const expected=input.options["expected-epic"];
+                if(expected===undefined||input.options["expected-revision"]===undefined||input.options["expected-used"]===undefined||input.options["expected-scope"]===undefined)
+                  throw new PluginCliError("Inspect --epic first; supply --expected-epic, --expected-revision, --expected-used, --expected-scope and --reason",{code:"invalid_value"});
+                state=await changeEpicBudget(scope,epicBudgetChangeSchema.parse({epicId,limit:Number(input.options.limit),expectedActiveEpicId:expected==="none"?null:expected,expectedRevision:Number(input.options["expected-revision"]),expectedUsed:Number(input.options["expected-used"]),reason:input.options.reason??"",expectedScopeRevision:input.options["expected-scope"]}),t,ctx.threadId);
+              }
+              const budget=state.epicBudgets?.[epicId];
+              const summary={epicId,title:epic.title,description:epic.note,criteria:epic.criteria,scopeRevision:epic.scopeRevision,activeEpicId:state.epic?.id??null,limit:budget?.limit??null,used:budget?.used??0,revision:budget?.revision??0,blocked:state.epic?.blocked??null};
+              return {exitCode:0,stdout:input.options.json?JSON.stringify(summary):`${epic.title} (${epicId}): ${summary.used}/${summary.limit??"unset"}; revision ${summary.revision}; active epic ${summary.activeEpicId??"none"}. Scope ${epic.scopeRevision}.\nRequirements: ${epic.note??"—"}\nCriteria: ${epic.criteria??"—"}\n${summary.blocked??""}`};
+            }
+            const taskId=parseTaskId(input.positionals.id!);
             const task=(await readTasks(scope)).tasks.find(task=>task.id===taskId);if(!task)throw new PluginCliError("Package not found",{code:"task_not_found"});
             const {lead}=await teamContext(scope,t);await resources.pinPackages(scope,[task],lead);
             const before=await resources.inspect(scope),used=before.taskCounts.filter(c=>c.taskId===taskId).reduce((n,c)=>n+c.starts+c.returns,0);
@@ -4096,8 +4205,8 @@ export default async function plugin(bb: BbPluginApi) {
               if(!Number.isInteger(limit)||limit<1||limit>1000||!Number.isInteger(expectedLimit)||expectedLimit<1||!Number.isInteger(expectedUsed)||expectedUsed<0)throw new PluginCliError("Use budget first, then provide --limit, --expected-limit, --expected-used and --reason",{code:"invalid_value"});
               result=await changePackageBudget(scope,{taskId,limit,expectedLimit,expectedUsed,reason:input.options.reason??""},t,ctx.threadId);
             }
-            const summary={taskId,title:task.title,used,limit:result.taskLimits?.[`task:${taskId}`]??current,sharedStartCap:null,blocked:packageResourceBlock(result,taskId)};
-            return {exitCode:0,stdout:input.options.json?JSON.stringify(summary):`${task.title} (#${taskId}): ${used}/${summary.limit}. ${currentLang==="ru"?"Общего лимита запусков команды нет; расход пакета сохранён.":"No shared start cap; package usage is retained."}`};
+            const summary={taskId,title:task.title,used,limit:result.taskLimits?.[`task:${taskId}`]??current,sharedStartCap:result.epic?.limit??null,epic:result.epic,blocked:result.epic?.blocked??packageResourceBlock(result,taskId)};
+            return {exitCode:0,stdout:input.options.json?JSON.stringify(summary):`${task.title} (#${taskId}): ${used}/${summary.limit}. ${result.epic?`Epic ${result.epic.id}: ${result.epic.used}/${result.epic.limit}`:(currentLang==="ru"?"Общего лимита запусков команды нет; расход пакета сохранён.":"No shared start cap; package usage is retained.")}`};
           },
         }),
 
@@ -4191,6 +4300,7 @@ export default async function plugin(bb: BbPluginApi) {
               description: "Details sent with the package; --note-stdin reads them from stdin",
               stdin: true,
             },
+            parent: {type:"string",description:"Explicit Beads epic parent ID"},
             send: { type: "boolean", description: "Send it to the role's thread and mark it in-progress" },
             json: JSON_OPTION,
           },
@@ -4204,6 +4314,7 @@ export default async function plugin(bb: BbPluginApi) {
                 title: (input.positionals.title as string[]).join(" "),
                 note: input.options.note ?? null,
                 send: input.options.send,
+                parentId:input.options.parent,
               },
               t,
               m,

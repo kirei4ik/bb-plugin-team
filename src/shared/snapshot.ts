@@ -28,6 +28,10 @@ export interface TeamTask {
   decisions?: string;
   result?: string;
   dependencies?: TaskId[];
+  /** Only projected when the selected tracker exposes an explicit Beads parent. */
+  parentId?: TaskId;
+  /** Beads-native issue type; older built-in work packages leave this absent. */
+  issueType?: string;
   /** bbt-iwi.2: review submission + acceptance decisions, stored only in the selected tracker. */
   review?: TaskReviewRecord;
 }
@@ -69,7 +73,16 @@ export interface BindingIssue {
   state: "repairable" | "missing" | "ambiguous" | "blocked";
 }
 
+/** Read-only projection of the existing continuation intent and native BB queue. */
+export interface ContinuationView {
+  role:string;threadId:string;taskId:TaskId|null;sendAt:number|null;
+  stage:"preparing"|"scheduled"|"needs-decision"|"released";
+  queuedMessageId:string|null;queueState:string|null;queueSendAt:number|null;
+  source:"bb-queue";reason:string|null;
+}
+
 export interface TeamSnapshot {
+  continuations?:ContinuationView[];
   /** Bounded technical history; full diagnostic export uses executionHistory RPC. */
   executionEvents?: ExecutionEvent[];
   bindingIssues?: BindingIssue[];

@@ -1,6 +1,6 @@
 import {describe,it,expect,vi} from "vitest";
 import {createFakePluginHost} from "@get-bb/plugin-sdk/testing";
-import {scheduleDeferred,readDeferred,cancelDeferred,deferredKey} from "../../src/server/deferred-continuation";
+import {scheduleDeferred,readDeferred,cancelDeferred,deferredKey,inspectDeferred} from "../../src/server/deferred-continuation";
 import {quotaHeadroom,parseOllamaBalance} from "../../src/shared/ollama-usage";
 
 const key=deferredKey("proj_1","main","lead");
@@ -57,5 +57,28 @@ describe("shared quota headroom",()=>{
   expect(quotaHeadroom(undefined)).toMatchObject({unknown:true,held:false,remainingPercent:null});
   const u=parseOllamaBalance({included:{weekly:{remaining_percent:9}}},1);expect(quotaHeadroom({...u,status:"unavailable"})).toMatchObject({unknown:true,held:true});
   expect(quotaHeadroom(u,{pauseBelowPercent:0}).held).toBe(false);
+ });
+});
+
+
+describe("read-only continuation snapshot",()=>{
+ it("reports the source queue and detects external changes without mutating or retrying",async()=>{
+  const f=fixture();try{
+   await scheduleDeferred(f.bb,key,{threadId:"thr_a",taskId:"task_a",failed:true,sendAt:120_000},0);
+   expect(await inspectDeferred(f.bb,"proj_1","main","lead","thr_a")).toMatchObject({stage:"scheduled",source:"bb-queue",queueState:"scheduled",queueSendAt:120_000});
+   const saved=await readDeferred(f.bb,key);f.rows()[0]!.sendAt=180_000;
+   expect(await inspectDeferred(f.bb,"proj_1","main","lead","thr_a")).toMatchObject({stage:"needs-decision",queueSendAt:180_000});
+   expect(await readDeferred(f.bb,key)).toEqual(saved);expect(f.retry).toHaveBeenCalledTimes(1);expect(f.update).not.toHaveBeenCalled();
+   f.set([]);expect(await inspectDeferred(f.bb,"proj_1","main","lead","thr_a")).toMatchObject({stage:"needs-decision",queueState:null});
+  }finally{await f.harness.lifecycle.dispose();}
+ });
+ it("distinguishes released intent from an observed start and preserves stale-session uncertainty",async()=>{
+  const f=fixture();try{
+   const r=await scheduleDeferred(f.bb,key,{threadId:"thr_a",taskId:null,failed:true,sendAt:120_000},0);
+   await f.bb.storage.kv.set(key,{...r,stage:"released"});f.set([]);
+   expect(await inspectDeferred(f.bb,"proj_1","main","lead","thr_a")).toMatchObject({stage:"released",queueState:null});
+   expect(await inspectDeferred(f.bb,"proj_1","main","lead","new-session")).toMatchObject({stage:"needs-decision"});
+   await f.bb.storage.kv.set(key,{broken:true});expect(await inspectDeferred(f.bb,"proj_1","main","lead","thr_a")).toMatchObject({stage:"needs-decision",sendAt:null});
+  }finally{await f.harness.lifecycle.dispose();}
  });
 });

@@ -147,6 +147,15 @@ describe("task tracker", () => {
       expect(raw?.tasks.map((task) => task.id)).toEqual([7, 8]);
     });
 
+    it("refuses an epic parent in the built-in tracker instead of silently losing the link", async () => {
+      const scope = scopeOf(workspaceOf("p1", "/ws/demo"), "alpha");
+      await expect(tracker.add(scope, {
+        role: "dev", title: "Child", note: null, status: "todo", parentId: "epic-1",
+      })).rejects.toThrow(/requires Beads/);
+      expect((await tracker.read(scope)).tasks).toHaveLength(0);
+      await expect(tracker.validateEpic(scope,"epic-1")).rejects.toThrow(/require Beads/);
+    });
+
     it("update returns previous, remove deletes", async () => {
       const workspace = workspaceOf("p1", "/ws/demo");
       const scope = scopeOf(workspace, "alpha");
@@ -453,6 +462,40 @@ describe("task tracker", () => {
     });
     beforeEach(() => {
       defaultKind = "beads";
+    });
+
+    it("creates a child only under an open epic assigned to this Team", async () => {
+      const scope = scopeOf(workspaceOf("epic-contract", repo), "epic-contract");
+      const epic = await bd(repo, ["create", "Epic scope", "--type", "epic", "-l", "bb-team:epic-contract"]) as {id:string};
+      const other = await bd(repo, ["create", "Another Team epic", "--type", "epic", "-l", "bb-team:other-team"]) as {id:string};
+      const ambiguous = await bd(repo, ["create", "Ambiguous epic", "--type", "epic", "-l", "bb-team:epic-contract,bb-team:other-team"]) as {id:string};
+      const plain = await tracker.add(scope, {role:"dev",title:"Not an epic",note:null,status:"todo"});
+      await expect(tracker.add(scope, {role:"dev",title:"Ambiguous team",note:null,status:"todo",parentId:ambiguous.id})).rejects.toThrow(/another Team/);
+      await expect(tracker.add(scope, {role:"dev",title:"Outside team",note:null,status:"todo",parentId:other.id})).rejects.toThrow(/another Team/);
+      await expect(tracker.add(scope, {role:"dev",title:"Invalid parent",note:null,status:"todo",parentId:plain.id})).rejects.toThrow(/not a Beads epic/);
+      const child = await tracker.add(scope, {role:"dev",title:"Epic child",note:null,status:"todo",parentId:epic.id});
+      const actual = await bd(repo, ["list", "--all", "--parent", epic.id]) as Array<{id:string}>;
+      expect(actual.map(row=>row.id)).toContain(String(child.id));
+      const projected = (await tracker.read(scope)).tasks.find(task=>task.id===child.id);
+      expect(projected?.issueType).toBe("task");
+      expect(projected?.parentId).toBe(epic.id);
+      expect(child.parentId).toBe(epic.id);
+      const approved=await tracker.validateEpic(scope,epic.id,child.id,false);
+      expect(approved.id).toBe(epic.id);expect(approved.scopeRevision).toMatch(/^[a-f0-9]{64}$/);
+      await tracker.update(scope,epic.id,{decisions:"Budget decision without scope change"});
+      expect((await tracker.validateEpic(scope,epic.id)).scopeRevision).toBe(approved.scopeRevision);
+      await bd(repo,["update",epic.id,"--acceptance","A changed requirement"]);
+      expect((await tracker.validateEpic(scope,epic.id)).scopeRevision).not.toBe(approved.scopeRevision);
+      await expect(tracker.validateEpic(scope,epic.id,null,true)).rejects.toThrow(/explicitly assigned/);
+      await expect(tracker.validateEpic(scope,epic.id,plain.id,false)).rejects.toThrow(/direct child/);
+      await expect(tracker.validateEpic(scope,epic.id,epic.id,false)).rejects.toThrow(/Only the lead/);
+      expect((await tracker.validateEpic(scope,epic.id,epic.id,true)).issueType).toBe("epic");
+      await expect(tracker.validateEpic(scope,ambiguous.id)).rejects.toThrow(/ambiguous/);
+      const labels = (await bd(repo, ["show", String(child.id)]) as Array<{labels:string[]}>)[0]!.labels;
+      expect(labels.filter(label => label.startsWith("bb-team:"))).toEqual(["bb-team:epic-contract"]);
+      await bd(repo, ["update", String(child.id), "--status", "closed"]);
+      await bd(repo, ["update", epic.id, "--status", "closed"]);
+      await expect(tracker.add(scope, {role:"dev",title:"Closed epic child",note:null,status:"todo",parentId:epic.id})).rejects.toThrow(/closed epic/);
     });
 
     it("stores manual recovery and resource decisions in Beads design without changing the description",async()=>{
