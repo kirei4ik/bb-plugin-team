@@ -1,7 +1,7 @@
 import { inspectBindings, repairBinding } from "./bindings";
 import { executionDiagnostic } from "../shared/execution-diagnostic";
 import {executionEventSchema} from "../shared/execution-event";
-import {resourceQueueExplanation,packageResourceBlock} from "../shared/resource-explanation";
+import {resourceQueueExplanation,packageResourceBlock,boundedDispatchDecision} from "../shared/resource-explanation";
 import {sessionRecoverySchema,sessionRecoveryActionSchema,type SessionRecovery} from "../shared/session-recovery";
 import {executionJournal, JOURNAL_RETENTION_DAYS, JOURNAL_MAX_EVENTS} from "./execution-journal";
 import {openRouterUsageSchema,emptyOpenRouter,openRouterHeadroom,isOpenRouterModel,quotaSourceSchema,type OpenRouterUsage,type QuotaSource} from "../shared/openrouter-usage";
@@ -35,6 +35,8 @@ import {
   defineRpcContract,
   experimental_PluginRpcRefusal,
   type BbPluginApi,
+  type MessageDispatchHookContext,
+  type MessageDispatchHookDecision,
   type PluginMentionItem,
 } from "@get-bb/plugin-sdk";
 import { dump as dumpYaml, load as loadYaml } from "js-yaml";
@@ -1032,7 +1034,7 @@ export default async function plugin(bb: BbPluginApi) {
     return parsed.success?parsed.data:DEFAULT_QUOTA_POLICY;
   };
 
-  bb.experimental_hooks.on("message.dispatch", async (ctx) => {
+  const dispatchMessage = async (ctx:MessageDispatchHookContext):Promise<MessageDispatchHookDecision> => {
     const meta = await bb.sdk.threads.getPluginMetadata({threadId:ctx.thread.id}) as Record<string,unknown>;
     if (meta.teamReplacement === true) return {action:"wait" as const,reason:"Team is preparing this replacement session; the initial prompt stays queued until the role switch completes."};
     const mark=readTeamMark(meta);
@@ -1107,7 +1109,8 @@ export default async function plugin(bb: BbPluginApi) {
       await bb.storage.kv.set(key,{...scheduled,stage:"released",reason:null});publishChange(ctx.thread.projectId);
     }
     return admission.action==="wait"?{...admission,reason:resourceQueueExplanation(admission.reason,currentLang)}:admission;
-  });
+  };
+  bb.experimental_hooks.on("message.dispatch",async ctx=>boundedDispatchDecision(await dispatchMessage(ctx)));
 
   /** Team context: config (if any), lead, role threads and helpers. */
   const teamContext = async (scope: Scope, t: Strings) => {
