@@ -399,6 +399,27 @@ export class ResourceControl {
       if(q.hostId===owner.hostId&&q.provider===provider&&requests.has(q.requestId))this.db.prepare("UPDATE team_resource_quota SET data=? WHERE id=?").run(JSON.stringify({...q,cleared:true}),row.id);
     }
   });}
+  // A fresh native Codex check authorizes only this failed session/package.
+  // Verification runs under the admission lock; no counters or other holds reset.
+  async recoverCodexCapacity(owner:ResourceOwner,verify:()=>Promise<void>){return this.serial(async()=>{
+    const s=this.load(owner);await this.syncAll(s);
+    if(s.attempts.some(a=>!terminal(a)))throw new Error("Finish outstanding admissions before recovery");
+    await verify();
+    const requests=new Set(s.attempts.filter(a=>a.threadId===owner.ownerThreadId&&a.taskId===owner.taskId&&a.provider==="codex"&&a.outcome==="failed").map(a=>a.requestId));
+    this.db.transaction(()=>{
+    for(const row of this.db.prepare("SELECT id,data FROM team_resource_quota").all() as Array<{id:string;data:string}>){
+      const q=JSON.parse(row.data) as Quota;
+      if(q.hostId===owner.hostId&&q.provider==="codex"&&requests.has(q.requestId))this.db.prepare("UPDATE team_resource_quota SET data=? WHERE id=?").run(JSON.stringify({...q,cleared:true}),row.id);
+    }
+    if(this.isBlocked("codex",owner.hostId))throw new Error("Another unresolved Codex quota exclusion remains; inspect its session before resuming");
+    const key=taskKey(owner.taskId,owner.role);
+    if(["rate-limit","budget-exceeded"].includes(s.holds[key]??""))delete s.holds[key];
+    for(const f of Object.values(s.fallbacks))if(requests.has(f.requestId)&&f.threadId===owner.ownerThreadId&&(f.stage==="blocked"||f.stage==="error")){f.stage="error";f.manualReleased=true;}
+    s.decisions.push({atMs:this.now(),reason:"Manual resume after a fresh native Codex quota check for this session",taskId:owner.taskId,policy:{...s.policy}});
+    this.save(owner,s);
+    })();
+    this.changed(owner.projectId);
+  });}
   async confirmOllamaCapacity(hostId:string){return this.serial(async()=>{
     for(const row of this.db.prepare("SELECT id,data FROM team_resource_quota").all() as Array<{id:string;data:string}>){
       const q=JSON.parse(row.data) as Quota;

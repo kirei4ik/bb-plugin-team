@@ -69,7 +69,7 @@ interface Fixture {
   dispose: () => Promise<void>;
 }
 
-async function setup(opts: { spawnFailures?: number; fallbacks?:ExecutionFallbackSelection[] } = {}): Promise<Fixture> {
+async function setup(opts: { spawnFailures?: number; fallbacks?:ExecutionFallbackSelection[]; codexUsage?:unknown; codexEnv?:string[] } = {}): Promise<Fixture> {
   const root = await mkdtemp(join(tmpdir(), "team-auto-"));
   const checkout = join(root, "project");
   const worktree = join(root, "task");
@@ -88,7 +88,7 @@ async function setup(opts: { spawnFailures?: number; fallbacks?:ExecutionFallbac
     await mkdir(join(checkout, ".bb", "teams"), { recursive: true });
     await writeFile(
       join(checkout, ".bb", "teams", "main.yaml"),
-      "version: 1\nroles:\n  - name: lead\n    lead: true\n    prompt: Coordinate the work.\n  - name: dev\n    prompt: Implement the package.\n"+(opts.fallbacks?`    provider: pi\n    model: ollama-cloud/original\n    executionPolicy: ${JSON.stringify({noAdditionalCost:true,fallbacks:opts.fallbacks})}\n`:""),
+      "version: 1\nroles:\n  - name: lead\n    lead: true\n    prompt: Coordinate the work.\n  - name: dev\n    prompt: Implement the package.\n"+(opts.codexUsage?"    provider: codex\n    model: default\n":"")+(opts.fallbacks?`    provider: pi\n    model: ollama-cloud/original\n    executionPolicy: ${JSON.stringify({noAdditionalCost:true,fallbacks:opts.fallbacks})}\n`:""),
     );
     await writeFile(join(worktree, "profile.ts"), "export const profile = 2; // unfinished\n");
     await writeFile(join(worktree, "checkpoint.json"), JSON.stringify(content));
@@ -100,7 +100,7 @@ async function setup(opts: { spawnFailures?: number; fallbacks?:ExecutionFallbac
       ["thr_lead", "lead", null],
       ["thr_dev", "dev", "thr_lead"],
     ] as const)
-      threads.set(id, { id, parentThreadId: parent, archivedAt: null, status: "idle", metadata: { teamName: "main", teamRole: role } });
+      threads.set(id, { id, parentThreadId: parent, archivedAt: null, status: "idle", providerId:opts.codexUsage?"codex":undefined, metadata: { teamName: "main", teamRole: role } });
     const response = (id: string) => {
       const t = threads.get(id)!;
       const bg = background.get(id);
@@ -154,9 +154,10 @@ async function setup(opts: { spawnFailures?: number; fallbacks?:ExecutionFallbac
       settings: { defaultTracker: "builtin", teamSection: false, roster: false },
       experimental_callHostRpc: (call) => call.method==="ollamaUsage"?Promise.resolve({status:"unavailable",checkedAtMs:Date.now(),windows:[],reason:"host_unavailable"}):host.experimental_call(call.method as never, call.input as never, { signal: call.signal }),
       sdk: {
-        system: { config: async () => ({ primaryHostId: "host_local" }) },
+        system: { config: async () => ({ primaryHostId: "host_local" }), usageLimits:async(args)=>{expect(args).toMatchObject({hostId:"host_local",providerId:"codex",refresh:true});return {codex:opts.codexUsage} as never;} },
         providers:{list:async()=>[{id:"pi",enabled:true},{id:"opencode2",enabled:true}] as never,models:async()=>({providers:[{id:"pi",available:true},{id:"opencode2",available:true}],models:[{id:"approved/free",model:"approved/free",defaultReasoningEffort:"low",supportedReasoningEfforts:[{reasoningEffort:"low"}]}],modelLoadError:null}) as never},
         projects: {
+          machineEnvironment:async()=>({variables:(opts.codexEnv??[]).map(name=>({name,note:null,secret:true,value:null})),inheritedVariables:[],builtInGit:{status:"disabled",statusMessage:""}}),
           list: async () => [
             {
               id: "proj_flow",
@@ -1327,4 +1328,33 @@ it("an increase with an empty lead queue notifies the lead using the package tit
   expect(f.sent).toHaveLength(before+1);expect(f.sent.at(-1)).toMatchObject({threadId:"thr_lead",text:expect.stringContaining('"Coordinate profile"')});
   expect(f.sent.at(-1)?.text).toContain("no team-wide start cap");
  }finally{await f.dispose();}
+});
+
+
+describe("manual native Codex quota recovery",()=>{
+  it("releases a failed session after fresh capacity without replacing it or resetting spend",async()=>{
+    const f=await setup({codexUsage:{status:"ok",windows:[{label:"Session",usedPercent:36,resetsAt:null},{label:"Weekly",usedPercent:64,resetsAt:null}]}});
+    try {
+      await f.cli(["task","add","dev","Resume existing work","--send"]);f.setQueued("thr_dev",false);await f.quota();const before=await f.resources();expect(before.holds["task:1"]).toBe("budget-exceeded");
+      await f.control({action:"resume",expectedThreadId:"thr_dev"});
+      const after=await f.resources();expect(after.starts).toBe(before.starts);expect(after.policy).toEqual(before.policy);
+      expect(after.holds["task:1"]).toBeUndefined();expect(after.quotaBlocks).toEqual([]);
+      expect(after.fallbacks[0]).toMatchObject({manualReleased:true,newThreadId:null});expect(f.spawnCalls()).toBe(0);
+      expect(await f.startAttempt("thr_dev","explicit-retry")).toMatchObject({action:"proceed"});
+      expect((await f.resources()).starts).toBe(before.starts+1);
+    }finally{await f.dispose();}
+  });
+  for(const [name,usage,env] of [
+    ["weekly at threshold",{status:"ok",windows:[{usedPercent:1},{usedPercent:90}]},[]],
+    ["missing windows",{status:"ok",windows:[]},[]],
+    ["unavailable",{status:"error"},[]],
+    ["invalid percentage",{status:"ok",windows:[{usedPercent:NaN}]},[]],
+    ["credential override",{status:"ok",windows:[{usedPercent:1}]},["CODEX_HOME"]],
+  ] as const)it(`keeps the hold when ${name}`,async()=>{
+    const f=await setup({codexUsage:usage,codexEnv:[...env]});try{
+      await f.cli(["task","add","dev","Resume existing work","--send"]);f.setQueued("thr_dev",false);await f.quota();const before=await f.resources();
+      await expect(f.control({action:"resume",expectedThreadId:"thr_dev"})).rejects.toThrow();
+      const after=await f.resources();expect(after.holds).toEqual(before.holds);expect(after.quotaBlocks).toEqual(before.quotaBlocks);expect(after.starts).toBe(before.starts);
+    }finally{await f.dispose();}
+  });
 });

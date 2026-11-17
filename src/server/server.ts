@@ -3553,7 +3553,7 @@ export default async function plugin(bb: BbPluginApi) {
         result.budgetNotice=await notifyBudgetIncrease(scope,task,expectedUsed,expectedUsed+4,expectedUsed,reason,t,result.epic);return result;
       });
     },
-    async roleControl({projectId,team,role:roleName,action,expectedThreadId,selection:requestedSelection,approveSelection,recoverFromWorkspace,expectedRecoveryRevision}) {
+    async roleControl({projectId,team,role:roleName,action,expectedThreadId,selection:requestedSelection,approveSelection,recoverFromWorkspace,expectedRecoveryRevision},ctx) {
       const {t}=await loadLang();const scope=await scopeFor(projectId,team,t);
       return withScopeLock(scope,async()=>{
         const {loaded,rows}=await teamContext(scope,t);
@@ -3576,6 +3576,22 @@ export default async function plugin(bb: BbPluginApi) {
               if(owner){await resources.confirmOpenRouterCapacity(owner,actual.provider,actual.model);if(hold)await resources.decide(owner,"User resumed after a fresh OpenRouter quota check",undefined,owner.taskId??undefined,owner.role,"capacity");}
             }
             await bb.storage.kv.delete(routerWaitKey({...scope,role:roleName}));
+          }
+          if(actual.provider==="codex"){
+            const owner=await resourceOwner(threadId!);const summary=await resources.inspect(scope);
+            const hold=owner?summary.holds[owner.taskId===null?`role:${owner.role}`:`task:${owner.taskId}`]:undefined;
+            if(owner&&hold&&["rate-limit","budget-exceeded"].includes(hold)){
+              await assertManualResourceRpc(projectId,ctx);
+              await resources.recoverCodexCapacity(owner,async()=>{
+                if(!owner.hostId)throw new Error("Codex execution host is unknown");
+                const env=await bb.sdk.projects.machineEnvironment({projectId});
+                if([...env.variables,...env.inheritedVariables].some(v=>/^(CODEX_|OPENAI_|HOME$|XDG_)/i.test(v.name)))throw new Error("Codex credential/environment overrides require independent capacity verification");
+                const usage=(await bb.sdk.system.usageLimits({hostId:owner.hostId,providerId:"codex",refresh:true})).codex;
+                const threshold=(await readQuotaPolicy(scope)).pauseBelowPercent;
+                if(!usage||usage.status!=="ok"||!usage.windows.length||usage.windows.some(w=>!Number.isFinite(w.usedPercent)||w.usedPercent<0||w.usedPercent>100||100-w.usedPercent<=threshold))throw new Error("Fresh Codex quota is low or unknown; wait for all limiting windows to reset");
+                await assertManualResourceRpc(projectId,ctx);
+              });
+            }
           }
           if(isOllamaCloud(actual.provider,actual.model)){
             const owner=await resourceOwner(threadId!);const summary=await resources.inspect(scope);

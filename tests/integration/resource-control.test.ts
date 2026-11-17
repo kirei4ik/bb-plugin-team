@@ -473,3 +473,21 @@ describe("shared epic admission budget",()=>{
   expect("criteria" in (s.epic??{})).toBe(false);
  });
 });
+
+it("native Codex recovery refuses unrelated host exclusions without partial release",async()=>{
+ const f=fixture();
+ const codex=(id:string)=>({...f.ctx(id,id),requestedExecution:{...f.ctx().requestedExecution,providerId:"codex"}});
+ for(const id of ["dev","other"])expect(await f.control.admit(codex(id))).toMatchObject({action:"proceed"});
+ for(const id of ["dev","other"])await f.control.failed(f.fail({threadId:id,requestId:`failed-${id}`}),[]);
+ const before=await f.control.inspect(f.scope);
+ await expect(f.control.recoverCodexCapacity(f.scope,async()=>{throw new Error("capacity unknown");})).rejects.toThrow("capacity unknown");
+ await expect(f.control.recoverCodexCapacity(f.scope,async()=>{})).rejects.toThrow("Another unresolved Codex");
+ f.restart();const after=await f.control.inspect(f.scope);
+ expect(after.starts).toBe(before.starts);expect(after.holds).toEqual(before.holds);expect(after.quotaBlocks).toEqual(before.quotaBlocks);
+ expect(after.fallbacks).toEqual(before.fallbacks);
+});
+
+it("native recovery refuses outstanding admissions before checking capacity",async()=>{
+ const f=fixture();await f.control.admit(f.ctx());let verified=false;
+ await expect(f.control.recoverCodexCapacity(f.scope,async()=>{verified=true;})).rejects.toThrow("outstanding");expect(verified).toBe(false);
+});
